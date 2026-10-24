@@ -1,0 +1,96 @@
+// The privilege broker's allowlist + argument validator — the security boundary.
+// These cases ARE the security property: only known verbs with safe args pass.
+
+#include "xserver/priv_ops.h"
+#include <gtest/gtest.h>
+
+using namespace fbx::xserver::privops;
+
+TEST(PrivOps, KnownVerbs) {
+    EXPECT_TRUE(knownVerb(kResolvConfWrite));
+    EXPECT_TRUE(knownVerb(kAudioDefaultUnit));
+    EXPECT_FALSE(knownVerb("resolvconf.read"));
+    EXPECT_FALSE(knownVerb("exec"));
+    EXPECT_FALSE(knownVerb(""));
+}
+
+TEST(PrivOps, UnknownVerbAlwaysRejected) {
+    EXPECT_FALSE(validateOp("reboot", ""));
+    EXPECT_FALSE(validateOp("rm", "-rf /"));
+    EXPECT_FALSE(validateOp("", "anything"));
+}
+
+// ── resolvconf.write ──────────────────────────────────────────────────────────
+
+TEST(PrivOps, ResolvConfAcceptsNameserverLines) {
+    EXPECT_TRUE(validateOp(kResolvConfWrite, "nameserver 1.1.1.1\n"));
+    EXPECT_TRUE(validateOp(kResolvConfWrite,
+                           "# written by com.freebsdx.DnsConfig\n"
+                           "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"));
+    EXPECT_TRUE(validateOp(kResolvConfWrite, "nameserver 2606:4700:4700::1111\n"));
+}
+
+TEST(PrivOps, ResolvConfRejectsNonNameserverDirectives) {
+    // Only comments + nameserver lines allowed — no options/search/etc.
+    EXPECT_FALSE(validateOp(kResolvConfWrite, "options rotate\n"));
+    EXPECT_FALSE(validateOp(kResolvConfWrite, "search evil.example\n"));
+    EXPECT_FALSE(validateOp(kResolvConfWrite, "nameserver 1.1.1.1\noptions ndots:5\n"));
+}
+
+TEST(PrivOps, ResolvConfRejectsInjectionAndJunk) {
+    EXPECT_FALSE(validateOp(kResolvConfWrite, "nameserver 1.1.1.1; rm -rf /\n"));  // space+junk
+    EXPECT_FALSE(validateOp(kResolvConfWrite, "nameserver \n"));                    // empty field
+    EXPECT_FALSE(validateOp(kResolvConfWrite, ""));                                 // empty body
+    EXPECT_FALSE(validateOp(kResolvConfWrite, std::string(5000, 'x')));             // oversized
+}
+
+// ── audio.default_unit ──────────────────────────────────────────────────────────
+
+TEST(PrivOps, AudioUnitAcceptsSmallIntegers) {
+    EXPECT_TRUE(validateOp(kAudioDefaultUnit, "0"));
+    EXPECT_TRUE(validateOp(kAudioDefaultUnit, "1"));
+    EXPECT_TRUE(validateOp(kAudioDefaultUnit, "63"));
+    EXPECT_TRUE(validateOp(kAudioDefaultUnit, "999"));
+}
+
+TEST(PrivOps, AudioUnitRejectsNonNumericOrOversized) {
+    EXPECT_FALSE(validateOp(kAudioDefaultUnit, ""));
+    EXPECT_FALSE(validateOp(kAudioDefaultUnit, "1a"));
+    EXPECT_FALSE(validateOp(kAudioDefaultUnit, "-1"));
+    EXPECT_FALSE(validateOp(kAudioDefaultUnit, "1000"));     // 4 digits
+    EXPECT_FALSE(validateOp(kAudioDefaultUnit, "1;reboot"));
+}
+
+// ── firewall.enable ──────────────────────────────────────────────────────────
+
+TEST(PrivOps, FirewallEnableAcceptsOnlyZeroOrOne) {
+    EXPECT_TRUE(knownVerb(kFirewallEnable));
+    EXPECT_TRUE(validateOp(kFirewallEnable, "0"));
+    EXPECT_TRUE(validateOp(kFirewallEnable, "1"));
+}
+
+TEST(PrivOps, FirewallEnableRejectsAnythingElse) {
+    EXPECT_FALSE(validateOp(kFirewallEnable, ""));
+    EXPECT_FALSE(validateOp(kFirewallEnable, "2"));
+    EXPECT_FALSE(validateOp(kFirewallEnable, "-e"));         // can't smuggle a flag
+    EXPECT_FALSE(validateOp(kFirewallEnable, "1 -f /etc/evil"));
+    EXPECT_FALSE(validateOp(kFirewallEnable, "true"));
+}
+
+// ── kmod.unload ──────────────────────────────────────────────────────────────
+
+TEST(PrivOps, KmodUnloadAcceptsModuleNames) {
+    EXPECT_TRUE(knownVerb(kKmodUnload));
+    EXPECT_TRUE(validateOp(kKmodUnload, "ichsmb.ko"));
+    EXPECT_TRUE(validateOp(kKmodUnload, "if_em"));
+    EXPECT_TRUE(validateOp(kKmodUnload, "cpufreq"));
+}
+
+TEST(PrivOps, KmodUnloadRejectsFlagsAndInjection) {
+    EXPECT_FALSE(validateOp(kKmodUnload, ""));
+    EXPECT_FALSE(validateOp(kKmodUnload, "-f"));             // can't start with a flag
+    EXPECT_FALSE(validateOp(kKmodUnload, "a b"));            // space
+    EXPECT_FALSE(validateOp(kKmodUnload, "mod;reboot"));     // shell-ish
+    EXPECT_FALSE(validateOp(kKmodUnload, "../../boot/kernel")); // slash
+    EXPECT_FALSE(validateOp(kKmodUnload, std::string(65, 'a'))); // too long
+}
