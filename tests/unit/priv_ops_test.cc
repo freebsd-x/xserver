@@ -94,3 +94,55 @@ TEST(PrivOps, KmodUnloadRejectsFlagsAndInjection) {
     EXPECT_FALSE(validateOp(kKmodUnload, "../../boot/kernel")); // slash
     EXPECT_FALSE(validateOp(kKmodUnload, std::string(65, 'a'))); // too long
 }
+
+// ── service.start / service.stop ─────────────────────────────────────────────
+
+TEST(PrivOps, ServiceControlAcceptsRcNames) {
+    EXPECT_TRUE(knownVerb(kServiceStart));
+    EXPECT_TRUE(knownVerb(kServiceStop));
+    EXPECT_TRUE(validateOp(kServiceStart, "sshd"));
+    EXPECT_TRUE(validateOp(kServiceStop, "ntpd"));
+    EXPECT_TRUE(validateOp(kServiceStop, "hostid_save"));
+}
+
+TEST(PrivOps, ServiceControlRejectsSessionCriticalAndInjection) {
+    // Stopping these from a panel would kill the desktop session itself.
+    EXPECT_FALSE(validateOp(kServiceStop, "xsessiond"));
+    EXPECT_FALSE(validateOp(kServiceStop, "seatd"));
+    EXPECT_FALSE(validateOp(kServiceStart, "xsessiond"));
+    EXPECT_FALSE(validateOp(kServiceStop, ""));
+    EXPECT_FALSE(validateOp(kServiceStop, "-j"));             // flag
+    EXPECT_FALSE(validateOp(kServiceStop, "sshd onerestart")); // extra argv
+    EXPECT_FALSE(validateOp(kServiceStop, "../../bin/sh"));
+    EXPECT_FALSE(validateOp(kServiceStop, "sshd.old"));       // no '.' in rc names
+    EXPECT_FALSE(validateOp(kServiceStop, std::string(33, 'a')));
+}
+
+// ── zfs.scrub / be.activate / be.destroy ─────────────────────────────────────
+
+TEST(PrivOps, ZfsAndBeAcceptRealNames) {
+    EXPECT_TRUE(validateOp(kZfsScrub, "zroot"));
+    EXPECT_TRUE(validateOp(kBeActivate, "15.1-RELEASE-p3_2026-10-26_213713"));
+    EXPECT_TRUE(validateOp(kBeDestroy, "default"));
+}
+
+TEST(PrivOps, ZfsAndBeRejectDatasetPathsAndFlags) {
+    EXPECT_FALSE(validateOp(kBeDestroy, "zroot/ROOT/default"));  // no dataset paths
+    EXPECT_FALSE(validateOp(kBeDestroy, "-F"));
+    EXPECT_FALSE(validateOp(kBeDestroy, "default@snap"));
+    EXPECT_FALSE(validateOp(kZfsScrub, "-s"));                 // would stop a scrub
+    EXPECT_FALSE(validateOp(kZfsScrub, "zroot tank"));
+    EXPECT_FALSE(validateOp(kBeActivate, ""));
+}
+
+// ── jail.remove ──────────────────────────────────────────────────────────────
+
+TEST(PrivOps, JailRemoveOnlyPositiveJids) {
+    EXPECT_TRUE(validateOp(kJailRemove, "3"));
+    EXPECT_TRUE(validateOp(kJailRemove, "123456789"));
+    EXPECT_FALSE(validateOp(kJailRemove, "0"));
+    EXPECT_FALSE(validateOp(kJailRemove, "07"));
+    EXPECT_FALSE(validateOp(kJailRemove, "-a"));               // jail -r -a would remove all
+    EXPECT_FALSE(validateOp(kJailRemove, "web"));
+    EXPECT_FALSE(validateOp(kJailRemove, "1234567890"));
+}

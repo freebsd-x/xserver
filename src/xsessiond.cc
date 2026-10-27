@@ -247,6 +247,34 @@ int32_t perform_privileged(const std::string& verb, const std::string& arg) {
         if (::waitpid(pid, &status, 0) < 0) return -errno;
         return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -EIO;
     }
+    if (verb == kServiceStart || verb == kServiceStop || verb == kZfsScrub ||
+        verb == kBeActivate   || verb == kBeDestroy  || verb == kJailRemove) {
+        // FIXED program + subcommand per verb; the validated name/jid is passed as
+        // its own argv element (no shell, can't be a flag — see validateOp).
+        const char* path = nullptr;
+        std::vector<const char*> argv;
+        if (verb == kServiceStart || verb == kServiceStop) {
+            path = "/usr/sbin/service";
+            argv = { "service", arg.c_str(), verb == kServiceStart ? "start" : "stop" };
+        } else if (verb == kZfsScrub) {
+            path = "/sbin/zpool";
+            argv = { "zpool", "scrub", arg.c_str() };
+        } else if (verb == kBeActivate || verb == kBeDestroy) {
+            path = "/sbin/bectl";
+            argv = { "bectl", verb == kBeActivate ? "activate" : "destroy", arg.c_str() };
+        } else {
+            path = "/usr/sbin/jail";
+            argv = { "jail", "-r", arg.c_str() };
+        }
+        argv.push_back(nullptr);
+        pid_t pid = 0;
+        int rc = ::posix_spawn(&pid, path, nullptr, nullptr,
+                               const_cast<char* const*>(argv.data()), environ);
+        if (rc != 0) return -rc;
+        int status = 0;
+        if (::waitpid(pid, &status, 0) < 0) return -errno;
+        return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -EIO;
+    }
     return -EINVAL;
 }
 

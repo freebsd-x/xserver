@@ -22,6 +22,7 @@
 #include "xserver/usb_service.h"
 #include "xserver/smart_service.h"
 #include "xserver/kmod_service.h"
+#include "xserver/sysadmin_services.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -891,6 +892,127 @@ TEST_F(ServiceRoundtrip, KernelModulesListFraming) {
     EXPECT_EQ(kp.count_, std::min<uint32_t>(kp.total_, 3u));
     EXPECT_NE(kp.entries_[0].name_[0], '\0');              // first module is named
     EXPECT_GT(kp.entries_[0].size_kb_, 0u);                // and has a size
+}
+
+// ── System-admin services (Services/Jails/ZfsPools/BootEnv/NTP) ──────────────
+// Lists come from real base-system tools, so contents depend on the box; assert
+// framing + per-page invariants. Mutations use the stub broker (always
+// unreachable), so they must still ack on the same transaction and never act.
+
+template <typename Page>
+void expectPageInvariants(const Page& pg, uint32_t page) {
+    EXPECT_EQ(pg.page_, page);
+    uint32_t start = page * 3;
+    uint32_t want = pg.total_ > start ? std::min<uint32_t>(pg.total_ - start, 3u) : 0u;
+    EXPECT_EQ(pg.count_, want);
+    EXPECT_EQ(pg.has_more_, (start + pg.count_ < pg.total_) ? 1u : 0u);
+}
+
+TEST_F(ServiceRoundtrip, ServicesListFraming) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.Services",
+                              static_cast<uint32_t>(ServiceOpcode::ListServices),
+                              0x73000001, &page, sizeof(page));
+    RcServicesService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.Services",
+                                static_cast<uint32_t>(ServiceOpcode::ListServices), 0x73000001);
+    ServicePage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    expectPageInvariants(pg, 0);
+    for (uint32_t i = 0; i < pg.count_; ++i) {
+        std::string state(pg.entries_[i].state_);
+        EXPECT_NE(pg.entries_[i].name_[0], '\0');
+        EXPECT_TRUE(state == "running" || state == "stopped") << state;
+        EXPECT_EQ(state == "running", pg.entries_[i].pid_ != 0);
+    }
+}
+
+TEST_F(ServiceRoundtrip, ServicesStopSessionCriticalIsAckedNotActed) {
+    auto p = makePipe();
+    ServiceRequest r{};
+    std::strncpy(r.name_, "seatd", sizeof(r.name_) - 1);
+    XBusMessage req = makeReq("com.freebsdx.Services",
+                              static_cast<uint32_t>(ServiceOpcode::StopService),
+                              0x73000002, &r, sizeof(r));
+    RcServicesService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.Services",
+              static_cast<uint32_t>(ServiceOpcode::StopService), 0x73000002);
+}
+
+TEST_F(ServiceRoundtrip, JailsListFraming) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.Jails",
+                              static_cast<uint32_t>(JailOpcode::ListJails),
+                              0x6a000001, &page, sizeof(page));
+    JailsService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.Jails",
+                                static_cast<uint32_t>(JailOpcode::ListJails), 0x6a000001);
+    JailPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    expectPageInvariants(pg, 0);
+}
+
+TEST_F(ServiceRoundtrip, ZfsPoolsListFraming) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.ZfsPools",
+                              static_cast<uint32_t>(ZfsOpcode::ListPools),
+                              0x7a000001, &page, sizeof(page));
+    ZfsPoolsService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.ZfsPools",
+                                static_cast<uint32_t>(ZfsOpcode::ListPools), 0x7a000001);
+    ZfsPoolPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    expectPageInvariants(pg, 0);
+    for (uint32_t i = 0; i < pg.count_; ++i) {
+        EXPECT_NE(pg.entries_[i].name_[0], '\0');
+        EXPECT_NE(pg.entries_[i].health_[0], '\0');
+        EXPECT_LE(pg.entries_[i].used_bytes_, pg.entries_[i].total_bytes_);
+    }
+}
+
+TEST_F(ServiceRoundtrip, BootEnvListWalksAllPages) {
+    // Walk every page the way the shell does; exactly one BE is booted when any
+    // are listed.
+    auto p = makePipe();
+    uint32_t walked = 0, booted = 0, total = 0;
+    for (uint32_t page = 0;; ++page) {
+        uint32_t tid = 0x62000000 + page;
+        XBusMessage req = makeReq("com.freebsdx.BootEnv",
+                                  static_cast<uint32_t>(BeOpcode::ListBE), tid, &page, sizeof(page));
+        BootEnvService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.BootEnv",
+                                    static_cast<uint32_t>(BeOpcode::ListBE), tid);
+        BePage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        expectPageInvariants(pg, page);
+        total = pg.total_;
+        for (uint32_t i = 0; i < pg.count_; ++i) {
+            EXPECT_NE(pg.entries_[i].name_[0], '\0');
+            booted += pg.entries_[i].active_;
+        }
+        walked += pg.count_;
+        if (!pg.has_more_) break;
+        ASSERT_LT(page, 1000u);
+    }
+    EXPECT_EQ(walked, total);
+    if (total > 0) EXPECT_EQ(booted, 1u);
+}
+
+TEST_F(ServiceRoundtrip, NtpGetStateFraming) {
+    auto p = makePipe();
+    XBusMessage req = makeReq("com.freebsdx.NTP",
+                              static_cast<uint32_t>(NtpOpcode::GetState), 0x6e000001, nullptr, 0);
+    NtpService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.NTP",
+                                static_cast<uint32_t>(NtpOpcode::GetState), 0x6e000001);
+    NtpState st{};
+    std::memcpy(&st, rep.payload_, sizeof(st));
+    EXPECT_LE(st.enabled_, 1u);
+    EXPECT_LE(st.synced_, st.enabled_);           // can't be synced with ntpd down
+    EXPECT_EQ(st.server_[sizeof(st.server_) - 1], '\0');
 }
 
 // ── Smart: ListDrives returns a well-framed SmartPage ─────────────────────────

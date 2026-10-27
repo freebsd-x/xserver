@@ -16,10 +16,40 @@ inline constexpr const char* kResolvConfWrite  = "resolvconf.write";   // arg = 
 inline constexpr const char* kAudioDefaultUnit = "audio.default_unit"; // arg = pcm unit number
 inline constexpr const char* kFirewallEnable   = "firewall.enable";    // arg = "1" (enable) / "0" (disable)
 inline constexpr const char* kKmodUnload       = "kmod.unload";        // arg = module name
+inline constexpr const char* kServiceStart     = "service.start";      // arg = rc script name
+inline constexpr const char* kServiceStop      = "service.stop";       // arg = rc script name
+inline constexpr const char* kZfsScrub         = "zfs.scrub";          // arg = pool name
+inline constexpr const char* kBeActivate       = "be.activate";        // arg = boot environment name
+inline constexpr const char* kBeDestroy        = "be.destroy";         // arg = boot environment name
+inline constexpr const char* kJailRemove       = "jail.remove";        // arg = decimal jid
 
 inline bool knownVerb(std::string_view v) noexcept {
     return v == kResolvConfWrite || v == kAudioDefaultUnit ||
-           v == kFirewallEnable  || v == kKmodUnload;
+           v == kFirewallEnable  || v == kKmodUnload ||
+           v == kServiceStart    || v == kServiceStop ||
+           v == kZfsScrub        || v == kBeActivate || v == kBeDestroy ||
+           v == kJailRemove;
+}
+
+// A name passed to a root command as its own argv element: 1..max chars from
+// [A-Za-z0-9_-] plus `extra`, starting with an alphanumeric so it can never be
+// read as a flag. No '/', whitespace or shell metacharacters.
+inline bool safeName(std::string_view arg, size_t max, std::string_view extra) noexcept {
+    if (arg.empty() || arg.size() > max) return false;
+    auto alnum = [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    };
+    if (!alnum(arg.front())) return false;
+    for (char c : arg)
+        if (!alnum(c) && c != '_' && c != '-' && extra.find(c) == std::string_view::npos)
+            return false;
+    return true;
+}
+
+// rc services the desktop session itself depends on. Stopping (or restarting)
+// them from a Settings panel would kill the session, so the broker refuses.
+inline bool sessionCriticalService(std::string_view name) noexcept {
+    return name == "xsessiond" || name == "seatd";
 }
 
 // True only when `verb` is known AND `arg` is safe for it. This is the gate the
@@ -69,6 +99,22 @@ inline bool validateOp(std::string_view verb, std::string_view arg) noexcept {
                       (c >= 'A' && c <= 'Z') || c == '.' || c == '_' || c == '-';
             if (!ok) return false;
         }
+        return true;
+    }
+    if (verb == kServiceStart || verb == kServiceStop) {
+        // An rc(8) script name; the daemon runs FIXED `service <name> start|stop`.
+        return safeName(arg, 32, "") && !sessionCriticalService(arg);
+    }
+    if (verb == kZfsScrub || verb == kBeActivate || verb == kBeDestroy) {
+        // ZFS pool / boot environment names: also '.' and ':' (e.g.
+        // "15.1-RELEASE-p3_2026-10-26_213713"). Never '/', so a BE argument
+        // can't name a dataset path.
+        return safeName(arg, 64, ".:");
+    }
+    if (verb == kJailRemove) {
+        // A positive decimal jid (≤9 digits).
+        if (arg.empty() || arg.size() > 9 || arg == "0" || arg.front() == '0') return false;
+        for (char c : arg) if (c < '0' || c > '9') return false;
         return true;
     }
     return false;   // unknown verb

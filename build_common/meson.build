@@ -199,6 +199,7 @@ xbus_service_srcs = files(
   '../src/usb_service.cc',
   '../src/smart_service.cc',
   '../src/kmod_service.cc',
+  '../src/sysadmin_services.cc',
   '../src/battery_health_service.cc',
   '../src/audio_output_service.cc',
   '../src/gpu_monitor_service.cc',

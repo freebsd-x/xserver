@@ -57,6 +57,7 @@
 #include "xserver/usb_service.h"
 #include "xserver/smart_service.h"
 #include "xserver/kmod_service.h"
+#include "xserver/sysadmin_services.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -950,6 +951,26 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.KernelModules") == 0) {
         KmodService::handleMessage(*msg, client);
+        return {true, std::nullopt};
+    }
+    else if (std::strcmp(msg->service_name_, "com.freebsdx.Services") == 0) {
+        RcServicesService::handleMessage(*msg, client);
+        return {true, std::nullopt};
+    }
+    else if (std::strcmp(msg->service_name_, "com.freebsdx.Jails") == 0) {
+        JailsService::handleMessage(*msg, client);
+        return {true, std::nullopt};
+    }
+    else if (std::strcmp(msg->service_name_, "com.freebsdx.ZfsPools") == 0) {
+        ZfsPoolsService::handleMessage(*msg, client);
+        return {true, std::nullopt};
+    }
+    else if (std::strcmp(msg->service_name_, "com.freebsdx.BootEnv") == 0) {
+        BootEnvService::handleMessage(*msg, client);
+        return {true, std::nullopt};
+    }
+    else if (std::strcmp(msg->service_name_, "com.freebsdx.NTP") == 0) {
+        NtpService::handleMessage(*msg, client);
         return {true, std::nullopt};
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.BatteryHealth") == 0) {
