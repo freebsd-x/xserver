@@ -58,6 +58,7 @@ void LockService::spawn_lockscreen() noexcept {
 bool LockService::isLocked() noexcept { return locked_.load(); }
 
 uint32_t LockService::timeoutSeconds() noexcept { return timeout_seconds_.load(); }
+void LockService::setTimeoutSeconds(uint32_t seconds) noexcept { timeout_seconds_.store(seconds); }
 
 std::shared_ptr<IpcSocket> LockService::lockscreenClient() noexcept {
     std::lock_guard<std::mutex> lock(state_mutex_);

@@ -19,6 +19,16 @@ public:
     // Called from compositor timer (~1 Hz) to fire due reminders via broadcast.
     static void pollReminders() noexcept;
 
+    // Events that have a reminder, for com.freebsdx.Reminder: when the event
+    // starts and when its reminder is due (start − reminder_min), local time.
+    struct ReminderInfo {
+        uint32_t    event_id;
+        std::string title;
+        std::time_t start;
+        std::time_t due;
+    };
+    static std::vector<ReminderInfo> reminders() noexcept;
+
 private:
     struct Event {
         uint32_t    id;

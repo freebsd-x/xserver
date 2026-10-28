@@ -26,6 +26,8 @@
 #include "xserver/user_services.h"
 #include "xserver/device_services.h"
 #include "xserver/infra_services.h"
+#include "xserver/personal_services.h"
+#include "xserver/lock_service.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -96,6 +98,9 @@
 #include <tuple>
 #include <utility>
 #include <array>
+
+// Counts LockService::lock() calls (lock_service_stub.cc).
+namespace fbx::xserver { extern std::atomic<int> g_stub_lock_calls; }
 
 using namespace fbx::xserver;
 using namespace fbx::shared;
@@ -2623,6 +2628,187 @@ TEST_F(ServiceRoundtrip, GpuStatsNameAndNoTempSensor) {
     std::memcpy(&st, rep.payload_, sizeof(st));
     EXPECT_NE(st.name_[0], '\0');
     EXPECT_EQ(st.temp_c_, INT32_MIN);
+}
+
+// ── Batch 5: Totp / TextReplacement / Reminder / ScreenLock / License ─────────
+
+
+TEST_F(ServiceRoundtrip, TotpListAndCodeOnlyFromPrivateFile) {
+    std::string path = home_ + "/.config/freebsdx/totp";
+    writeHomeFile(path, "otpauth://totp/GitHub:octo?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\n");
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.Totp", static_cast<uint32_t>(TotpOpcode::ListAccounts),
+                                  tid, &page, sizeof(page));
+        TotpService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.Totp",
+                                    static_cast<uint32_t>(TotpOpcode::ListAccounts), tid);
+        TotpAccountPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    ::chmod(path.c_str(), 0644);
+    EXPECT_EQ(list(0x74000001).total_, 0u);        // world-readable secrets are ignored
+    ::chmod(path.c_str(), 0600);
+    TotpAccountPage pg = list(0x74000002);
+    ASSERT_EQ(pg.total_, 1u);
+    EXPECT_STREQ(pg.issuer_, "GitHub");
+    EXPECT_STREQ(pg.account_, "octo");
+
+    TotpCodeRequest cr{};
+    std::strncpy(cr.id_, pg.id_, sizeof(cr.id_) - 1);
+    XBusMessage req = makeReq("com.freebsdx.Totp", static_cast<uint32_t>(TotpOpcode::GetCode),
+                              0x74000003, &cr, sizeof(cr));
+    TotpService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.Totp",
+                                static_cast<uint32_t>(TotpOpcode::GetCode), 0x74000003);
+    TotpCodeResponse code{};
+    std::memcpy(&code, rep.payload_, sizeof(code));
+    EXPECT_EQ(std::strlen(code.code_), 6u);
+    EXPECT_GE(code.seconds_remaining_, 1u);
+    EXPECT_LE(code.seconds_remaining_, 30u);
+}
+
+TEST_F(ServiceRoundtrip, TextReplacementAddListDelete) {
+    auto p = makePipe();
+    auto add = [&](const char* k, const char* v, uint32_t tid) {
+        TextReplacementAddRequest r{};
+        std::strncpy(r.shortcut_, k, sizeof(r.shortcut_) - 1);
+        std::strncpy(r.phrase_, v, sizeof(r.phrase_) - 1);
+        XBusMessage req = makeReq("com.freebsdx.TextReplacement",
+                                  static_cast<uint32_t>(TextReplacementOpcode::AddShortcut), tid, &r, sizeof(r));
+        TextReplacementService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.TextReplacement",
+                  static_cast<uint32_t>(TextReplacementOpcode::AddShortcut), tid);
+    };
+    add("omw", "On my way!", 0x78000001);
+    add("two words", "nope", 0x78000002);           // invalid shortcut: refused
+    add("brb", "Be right back", 0x78000003);
+    std::string file = readHomeFile(home_ + "/.config/freebsdx/text-replacements");
+    EXPECT_NE(file.find("omw\tOn my way!\n"), std::string::npos);
+    EXPECT_EQ(file.find("two words"), std::string::npos);
+
+    uint32_t page = 1;
+    XBusMessage req = makeReq("com.freebsdx.TextReplacement",
+                              static_cast<uint32_t>(TextReplacementOpcode::ListShortcuts), 0x78000004, &page, sizeof(page));
+    TextReplacementService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.TextReplacement",
+                                static_cast<uint32_t>(TextReplacementOpcode::ListShortcuts), 0x78000004);
+    TextReplacementPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    EXPECT_EQ(pg.total_, 2u);
+    EXPECT_EQ(pg.valid_, 1u);
+    EXPECT_STREQ(pg.shortcut_, "brb");
+
+    TextReplacementDeleteRequest d{};
+    d.entry_id_ = pg.entry_id_;
+    req = makeReq("com.freebsdx.TextReplacement",
+                  static_cast<uint32_t>(TextReplacementOpcode::DeleteShortcut), 0x78000005, &d, sizeof(d));
+    TextReplacementService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.TextReplacement",
+              static_cast<uint32_t>(TextReplacementOpcode::DeleteShortcut), 0x78000005);
+    EXPECT_EQ(readHomeFile(home_ + "/.config/freebsdx/text-replacements").find("brb"), std::string::npos);
+}
+
+TEST_F(ServiceRoundtrip, ReminderFromCalendarThenComplete) {
+    // An event 2 h from now with a 30-minute reminder, and one without.
+    std::time_t start = std::time(nullptr) + 2 * 3600;
+    std::tm tm{};
+    localtime_r(&start, &tm);
+    char line[256];
+    std::snprintf(line, sizeof(line), "7|%d|%d|%d|%d|%d|%d|%d|30|0|Dentist|desc|\n"
+                                      "8|%d|%d|%d|%d|%d|%d|%d|0|0|No reminder||\n",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_hour, tm.tm_min,
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_hour, tm.tm_min);
+    writeHomeFile(home_ + "/.freebsdx-calendar", line);
+
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.Reminder", static_cast<uint32_t>(ReminderOpcode::ListReminders),
+                                  tid, &page, sizeof(page));
+        ReminderService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.Reminder",
+                                    static_cast<uint32_t>(ReminderOpcode::ListReminders), tid);
+        ReminderPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    ReminderPage pg = list(0x52000001);
+    ASSERT_EQ(pg.total_, 1u);
+    EXPECT_STREQ(pg.id_, "ev-7");
+    EXPECT_STREQ(pg.title_, "Dentist");
+    EXPECT_EQ(pg.overdue_, 0u);
+    EXPECT_EQ(std::strlen(pg.due_), 16u);
+
+    ReminderActionRequest done{};
+    std::strncpy(done.id_, "ev-7", sizeof(done.id_) - 1);
+    XBusMessage req = makeReq("com.freebsdx.Reminder", static_cast<uint32_t>(ReminderOpcode::CompleteReminder),
+                              0x52000002, &done, sizeof(done));
+    ReminderService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.Reminder",
+              static_cast<uint32_t>(ReminderOpcode::CompleteReminder), 0x52000002);
+    EXPECT_EQ(list(0x52000003).total_, 0u);
+}
+
+TEST_F(ServiceRoundtrip, ScreenLockPolicyDrivesIdleTimeout) {
+    auto p = makePipe();
+    auto set = [&](uint32_t enabled, uint32_t timeout, uint32_t tid) {
+        ScreenLockPolicy pol{};
+        pol.enabled_ = enabled;
+        pol.timeout_seconds_ = timeout;
+        XBusMessage req = makeReq("com.freebsdx.ScreenLock", static_cast<uint32_t>(ScreenLockOpcode::SetPolicy),
+                                  tid, &pol, sizeof(pol));
+        ScreenLockService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.ScreenLock",
+                  static_cast<uint32_t>(ScreenLockOpcode::SetPolicy), tid);
+    };
+    auto get = [&](uint32_t tid) {
+        XBusMessage req = makeReq("com.freebsdx.ScreenLock", static_cast<uint32_t>(ScreenLockOpcode::GetPolicy), tid);
+        ScreenLockService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.ScreenLock",
+                                    static_cast<uint32_t>(ScreenLockOpcode::GetPolicy), tid);
+        ScreenLockPolicy pol{};
+        std::memcpy(&pol, rep.payload_, sizeof(pol));
+        return pol;
+    };
+    set(1, 300, 0x53000001);
+    EXPECT_EQ(LockService::timeoutSeconds(), 300u);
+    ScreenLockPolicy pol = get(0x53000002);
+    EXPECT_EQ(pol.enabled_, 1u);
+    EXPECT_EQ(pol.timeout_seconds_, 300u);
+    EXPECT_EQ(pol.require_password_, 1u);
+
+    set(0, 300, 0x53000003);                         // off: idle lock disabled...
+    EXPECT_EQ(LockService::timeoutSeconds(), 0u);
+    pol = get(0x53000004);
+    EXPECT_EQ(pol.enabled_, 0u);
+    EXPECT_EQ(pol.timeout_seconds_, 300u);           // ...but the chosen timeout is kept
+
+    set(1, 5, 0x53000005);                           // clamped to 30 s
+    EXPECT_EQ(LockService::timeoutSeconds(), 30u);
+
+    int before = g_stub_lock_calls.load();
+    XBusMessage req = makeReq("com.freebsdx.ScreenLock", static_cast<uint32_t>(ScreenLockOpcode::LockNow), 0x53000006);
+    ScreenLockService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.ScreenLock", static_cast<uint32_t>(ScreenLockOpcode::LockNow), 0x53000006);
+    EXPECT_EQ(g_stub_lock_calls.load(), before + 1);
+}
+
+TEST_F(ServiceRoundtrip, LicenseFraming) {
+    auto p = makePipe();
+    XBusMessage req = makeReq("com.freebsdx.License", static_cast<uint32_t>(LicenseOpcode::GetInfo), 0x4c000001);
+    LicenseService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.License",
+                                static_cast<uint32_t>(LicenseOpcode::GetInfo), 0x4c000001);
+    LicenseState st{};
+    std::memcpy(&st, rep.payload_, sizeof(st));
+    EXPECT_NE(st.tier_[0], '\0');
+    EXPECT_NE(st.expiry_[0], '\0');
+    // Never more than the last 4 characters of a key.
+    std::string key(st.license_key_);
+    if (!key.empty()) EXPECT_EQ(key.rfind("****-****-****-", 0), 0u);
 }
 
 }  // namespace

@@ -461,4 +461,24 @@ void CalendarService::pollReminders() noexcept {
     }
 }
 
-} // namespace fbx::xserver
+std::vector<CalendarService::ReminderInfo> CalendarService::reminders() noexcept {
+    std::lock_guard<std::mutex> lk(mutex_);
+    load();
+    std::vector<ReminderInfo> out;
+    for (const auto& e : events_) {
+        if (e.reminder_min == 0) continue;
+        std::tm tm{};
+        tm.tm_year  = e.year - 1900;
+        tm.tm_mon   = e.month - 1;
+        tm.tm_mday  = e.day;
+        tm.tm_hour  = e.all_day ? 0 : e.hour;
+        tm.tm_min   = e.all_day ? 0 : e.minute;
+        tm.tm_isdst = -1;
+        std::time_t start = std::mktime(&tm);
+        if (start == static_cast<std::time_t>(-1)) continue;
+        out.push_back({e.id, e.title, start, start - static_cast<std::time_t>(e.reminder_min) * 60});
+    }
+    return out;
+}
+
+}  // namespace fbx::xserver

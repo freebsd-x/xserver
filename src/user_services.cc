@@ -2,6 +2,7 @@
 #include "xserver/user_parse.h"
 #include "xserver/async_shell.h"
 #include "xserver/xbus_reply.h"
+#include "xserver/user_files.h"
 #include "shared/user_env.h"
 #include "shared/autostart.h"
 #include "shared/logger.h"
@@ -31,39 +32,9 @@ namespace {
 
 using namespace svc;
 
-std::string homeDir() {
-    if (const char* h = std::getenv("HOME"); h && *h) return h;
-    if (const passwd* pw = ::getpwuid(::getuid())) return pw->pw_dir;
-    return "/tmp";
-}
-
-std::optional<std::string> readFile(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return std::nullopt;
-    std::stringstream body;
-    body << f.rdbuf();
-    return body.str();
-}
-
-// Write via a temp file in the same directory + rename, so a crash never
-// leaves a half-written file behind.
-bool writeFileAtomic(const std::string& path, const std::string& content, mode_t mode) {
-    std::string tmpl = path + ".XXXXXX";
-    int fd = ::mkstemp(tmpl.data());
-    if (fd < 0) return false;
-    bool ok = ::fchmod(fd, mode) == 0;
-    size_t off = 0;
-    while (ok && off < content.size()) {
-        ssize_t n = ::write(fd, content.data() + off, content.size() - off);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) ok = false; else off += static_cast<size_t>(n);
-    }
-    ok = (::fsync(fd) == 0) && ok;
-    ::close(fd);
-    if (ok && ::rename(tmpl.c_str(), path.c_str()) == 0) return true;
-    ::unlink(tmpl.c_str());
-    return false;
-}
+using userfiles::homeDir;
+using userfiles::readFile;
+using userfiles::writeFileAtomic;
 
 // ── Cron ─────────────────────────────────────────────────────────────────────
 

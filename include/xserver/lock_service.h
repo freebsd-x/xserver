@@ -29,6 +29,8 @@ public:
 
     [[nodiscard]] static bool     isLocked()      noexcept;
     [[nodiscard]] static uint32_t timeoutSeconds() noexcept;
+    // Idle auto-lock timeout; 0 disables it. (com.freebsdx.ScreenLock policy.)
+    static void setTimeoutSeconds(uint32_t seconds) noexcept;
 
     // Returns the IpcSocket of the registered lock screen app, or nullptr.
     [[nodiscard]] static std::shared_ptr<IpcSocket> lockscreenClient() noexcept;

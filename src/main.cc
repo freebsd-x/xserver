@@ -27,6 +27,7 @@
 #include "xserver/screenshot_service.h"
 #include "xserver/user_services.h"
 #include "xserver/device_services.h"
+#include "xserver/personal_services.h"
 #include "xserver/lock_service.h"
 #include "xserver/screensaver_service.h"
 #include "xserver/terminal_service.h"
@@ -459,6 +460,8 @@ int main(int argc, char** argv) {
     PointerService::init([in = input.get()](uint32_t speed, bool accel, bool tap) {
         if (in) in->setPointerConfig(speed, accel, tap);
     });
+    // Restore the saved auto-lock policy (com.freebsdx.ScreenLock).
+    ScreenLockService::init();
     // Per-device pointer speed (com.freebsdx.InputDevice) + hot-plug re-list.
     InputDeviceService::init(
         [in = input.get()]() { return in ? in->listDevices() : std::vector<inputdev::DeviceInfo>{}; },
