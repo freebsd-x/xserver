@@ -30,6 +30,7 @@
 #include "xserver/notif_services.h"
 #include "xserver/desktop_services.h"
 #include "xserver/ime_service.h"
+#include "xserver/login_items_service.h"
 #include "xserver/lock_service.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
@@ -3239,6 +3240,112 @@ TEST_F(ServiceRoundtrip, FastChargingReportsAndCannotBeDisabled) {
     std::memcpy(&st, rep.payload_, sizeof(st));
     EXPECT_EQ(st.enabled_, 1u);
     EXPECT_LT(st.charge_rate_w_, 500u);               // watts, sane for a laptop
+}
+
+// ── Batch 9: AudioRouting / LoginItems ───────────────────────────────────────
+
+TEST_F(ServiceRoundtrip, AudioRoutingListsStreamsAndCyclesDevices) {
+    std::vector<audioroute::Stream> streams{{7, "com.freebsdx.musicplayer", ""}, {9, "com.freebsdx.videoplayer", ""}};
+    std::vector<std::pair<std::string, std::string>> routed;
+    AudioRoutingService::init({
+        [&] { return streams; },
+        [&](const std::string& app, const std::string& path) {
+            routed.emplace_back(app, path);
+            for (auto& s : streams) if (s.app == app) s.route = path;
+        },
+        [] { return std::string("pcm0: <Realtek ALC294 (Analog 2.0+HP/4ch)> (play/rec)\n"
+                                "pcm1: <Intel Kaby Lake (HDMI/DP 8ch)> (play) default\n"); },
+    });
+    routed.clear();   // init replays saved routes (none yet)
+
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.AudioRouting", static_cast<uint32_t>(AudioRoutingOpcode::ListRoutes),
+                                  tid, &page, sizeof(page));
+        AudioRoutingService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.AudioRouting",
+                                    static_cast<uint32_t>(AudioRoutingOpcode::ListRoutes), tid);
+        AudioRoutePage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    AudioRoutePage pg = list(0x41100001);
+    ASSERT_EQ(pg.count_, 2u);
+    EXPECT_STREQ(pg.entries_[0].app_id_, "7");
+    EXPECT_EQ(pg.entries_[0].device_count_, 2u);
+    EXPECT_EQ(pg.entries_[0].device_idx_, 1u);        // default = HDMI (pcm1)
+    EXPECT_STREQ(pg.entries_[0].device_name_, "HDMI/DP (pcm1)");
+
+    AudioRouteSetRequest r{};
+    std::strncpy(r.app_id_, "7", sizeof(r.app_id_) - 1);
+    r.device_idx_ = 2;                                 // wraps: 2 % 2 = 0 → Analog
+    XBusMessage req = makeReq("com.freebsdx.AudioRouting", static_cast<uint32_t>(AudioRoutingOpcode::SetRoute),
+                              0x41100002, &r, sizeof(r));
+    AudioRoutingService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.AudioRouting", static_cast<uint32_t>(AudioRoutingOpcode::SetRoute), 0x41100002);
+    ASSERT_EQ(routed.size(), 1u);
+    EXPECT_EQ(routed[0].first, "com.freebsdx.musicplayer");
+    EXPECT_EQ(routed[0].second, "/dev/dsp0");
+    pg = list(0x41100003);
+    EXPECT_STREQ(pg.entries_[0].device_name_, "Analog (pcm0)");
+    EXPECT_STREQ(pg.entries_[1].device_name_, "HDMI/DP (pcm1)");   // other app untouched
+
+    // The route is remembered: a fresh init replays it.
+    routed.clear();
+    AudioRoutingService::init({[&] { return streams; },
+                               [&](const std::string& a, const std::string& pth) { routed.emplace_back(a, pth); },
+                               nullptr});
+    ASSERT_EQ(routed.size(), 1u);
+    EXPECT_EQ(routed[0].second, "/dev/dsp0");
+    AudioRoutingService::init({});
+}
+
+TEST_F(ServiceRoundtrip, LoginItemsAreRealAutostartEntries) {
+    std::string apps = home_ + "/apps";
+    writeHomeFile(apps + "/Notes.xapp/manifest.json",
+                  R"({"name": "Notes", "identifier": "com.freebsdx.notes", "executable": "bin/notes"})");
+    writeHomeFile(apps + "/Weather.xapp/manifest.json",
+                  R"({"name": "Weather", "identifier": "com.freebsdx.weather", "executable": "bin/weather"})");
+    AppPermsService::init([apps] { return apps; });
+
+    auto p = makePipe();
+    auto list = [&](uint32_t page, uint32_t tid) {
+        XBusMessage req = makeReq("com.freebsdx.LoginItems", static_cast<uint32_t>(LoginItemOpcode::ListItems),
+                                  tid, &page, sizeof(page));
+        LoginItemsService::ProcessMessage(p.svc, req);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.LoginItems",
+                                    static_cast<uint32_t>(LoginItemOpcode::ListItems), tid);
+        LoginItemPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    LoginItemPage pg = list(0, 0x4c100001);
+    EXPECT_EQ(pg.total_, 2u);                          // the real bundles, not a seeded list
+    EXPECT_STREQ(pg.app_name_, "Notes");
+    EXPECT_EQ(pg.enabled_, 0u);
+
+    auto set = [&](const char* name, uint32_t on, uint32_t tid) {
+        LoginItemRequest r{};
+        std::strncpy(r.app_name_, name, sizeof(r.app_name_) - 1);
+        r.enabled_ = on;
+        XBusMessage req = makeReq("com.freebsdx.LoginItems", static_cast<uint32_t>(LoginItemOpcode::SetItem),
+                                  tid, &r, sizeof(r));
+        LoginItemsService::ProcessMessage(p.svc, req);
+        recvReply(p.peer, "com.freebsdx.LoginItems", static_cast<uint32_t>(LoginItemOpcode::SetItem), tid);
+    };
+    set("Notes", 1, 0x4c100002);
+    std::string entry = home_ + "/.config/autostart/freebsdx-com.freebsdx.notes.desktop";
+    std::string text = readHomeFile(entry);
+    EXPECT_NE(text.find("X-FreeBSDX-App=com.freebsdx.notes"), std::string::npos);
+    EXPECT_NE(text.find("Notes.xapp/bin/notes"), std::string::npos);
+    EXPECT_EQ(list(0, 0x4c100003).enabled_, 1u);
+    EXPECT_EQ(list(1, 0x4c100004).enabled_, 0u);
+
+    set("Notes", 0, 0x4c100005);
+    EXPECT_FALSE(std::filesystem::exists(entry));
+    EXPECT_EQ(list(0, 0x4c100006).enabled_, 0u);
+    AppPermsService::init(nullptr);
 }
 
 }  // namespace

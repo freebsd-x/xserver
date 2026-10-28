@@ -463,6 +463,16 @@ int main(int argc, char** argv) {
         if (in) in->setPointerConfig(speed, accel, tap);
     });
     AppPermsService::init([] { return AppManagerService::appsDir(); });
+    // Per-app output routing (com.freebsdx.AudioRouting) → the audio mixer.
+    AudioRoutingService::init({
+        [] {
+            std::vector<audioroute::Stream> v;
+            for (auto& s : AudioService::getInstance().streams()) v.push_back({s.id, s.app, s.route});
+            return v;
+        },
+        [](const std::string& app, const std::string& path) { AudioService::getInstance().setAppRoute(app, path); },
+        nullptr,
+    });
     // Saved EQ → the audio mixer (com.freebsdx.AudioEq).
     AudioEqService::init([](const eq::Gains& g) { AudioService::getInstance().setEq(g); });
     // Restore the saved auto-lock policy (com.freebsdx.ScreenLock).

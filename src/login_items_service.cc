@@ -1,104 +1,86 @@
 #include "xserver/login_items_service.h"
+#include "xserver/desktop_services.h"
 #include "xserver/ipc_socket.h"
-#include <cstring>
-#include <iostream>
+#include "xserver/user_files.h"
+#include "xserver/xbus_reply.h"
+#include "shared/autostart.h"
+#include "shared/logger.h"
 
-namespace fbx::xserver { void BroadcastXBusMessage(const shared::XBusMessage& msg); }
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <string>
+
+#include <unistd.h>
 
 namespace fbx::xserver {
 
-std::mutex                              LoginItemsService::mutex_;
-std::vector<LoginItemsService::Item>    LoginItemsService::items_;
-bool                                    LoginItemsService::loaded_ = false;
+namespace {
 
-void LoginItemsService::load() noexcept {
-    if (loaded_) return;
-    loaded_ = true;
-    // Seed a plausible set of login items. A real implementation would read the
-    // user's autostart config.
-    items_ = {
-        {"Music",      1},
-        {"Contacts",   0},
-        {"Weather",    1},
-        {"TaskManager",0},
-        {"Notes",      1},
-    };
+using namespace svc;
+
+std::string entryPath(const std::string& id) {
+    return shared::autostart::dirPath(userfiles::homeDir()) + "/" + shared::autostart::appEntryFile(id);
 }
 
-void LoginItemsService::broadcastChanged() noexcept {
-    shared::XBusMessage bcast{};
-    bcast.magic_ = shared::XBUS_MAGIC;
-    std::strncpy(bcast.service_name_, "com.freebsdx.LoginItems",
-                 sizeof(bcast.service_name_) - 1);
-    bcast.opcode_ = static_cast<uint32_t>(shared::LoginItemOpcode::ItemsChanged);
-    // No payload — the shell re-fetches the list.
-    BroadcastXBusMessage(bcast);
+bool opensAtLogin(const std::string& id) {
+    auto text = userfiles::readFile(entryPath(id));
+    shared::autostart::Entry e;
+    return text && shared::autostart::parse(*text, e) && shared::autostart::enabled(e);
 }
+
+}  // namespace
 
 bool LoginItemsService::ProcessMessage(std::shared_ptr<IpcSocket> client,
                                        const shared::XBusMessage& msg) noexcept {
     if (std::strcmp(msg.service_name_, "com.freebsdx.LoginItems") != 0) return false;
-
-    using Op = shared::LoginItemOpcode;
-    std::lock_guard<std::mutex> lk(mutex_);
-    load();
-
-    shared::XBusMessage response = msg;
-
-    switch (static_cast<Op>(msg.opcode_)) {
-
-    case Op::ListItems: {
-        uint32_t page = 0;
-        std::memcpy(&page, msg.payload_, sizeof(page));
-        const uint32_t total = static_cast<uint32_t>(items_.size());
-
+    using O = shared::LoginItemOpcode;
+    constexpr const char* kName = "com.freebsdx.LoginItems";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::ListItems: {
+        auto apps = installedApps();
+        uint32_t page = readPage(msg);
         shared::LoginItemPage pg{};
         pg.page_  = page;
-        pg.total_ = total;
-        if (page < total) {
+        pg.total_ = static_cast<uint32_t>(apps.size());
+        if (page < apps.size()) {
             pg.valid_    = 1;
-            pg.has_more_ = (page + 1 < total) ? 1u : 0u;
-            std::strncpy(pg.app_name_, items_[page].name.c_str(),
-                         sizeof(pg.app_name_) - 1);
-            pg.enabled_  = items_[page].enabled;
-        } else {
-            pg.valid_    = 0;
-            pg.has_more_ = 0;
+            pg.has_more_ = page + 1 < apps.size() ? 1u : 0u;
+            std::strncpy(pg.app_name_, apps[page].name.c_str(), sizeof(pg.app_name_) - 1);
+            pg.enabled_  = opensAtLogin(apps[page].id) ? 1u : 0u;
         }
-        std::memset(response.payload_, 0, sizeof(response.payload_));
-        std::memcpy(response.payload_, &pg, sizeof(pg));
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
+        reply(msg, client, kName, msg.opcode_, &pg);
         break;
     }
-
-    case Op::SetItem: {
+    case O::SetItem: {
         shared::LoginItemRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         req.app_name_[sizeof(req.app_name_) - 1] = '\0';
-        bool found = false;
-        for (auto& it : items_) {
-            if (it.name == req.app_name_) {
-                it.enabled = req.enabled_ ? 1u : 0u;
-                found = true;
-                break;
+        bool ok = false;
+        for (const auto& a : installedApps()) {
+            if (a.name != req.app_name_) continue;
+            std::string path = entryPath(a.id);
+            if (req.enabled_) {
+                std::error_code ec;
+                std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+                ok = userfiles::writeFileAtomic(path, shared::autostart::appEntry(a.name, a.exec, a.id), 0644);
+            } else {
+                ok = ::unlink(path.c_str()) == 0 || errno == ENOENT;
             }
+            LOG_INFO("LoginItemsService: {} {} at login", a.name, req.enabled_ ? "opens" : "doesn't open");
+            break;
         }
-        std::cout << "[LoginItems] SetItem '" << req.app_name_ << "' -> "
-                  << (req.enabled_ ? "on" : "off")
-                  << (found ? "" : " (not found)") << "\n";
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
-        if (found) broadcastChanged();
+        if (!ok) LOG_WARN("LoginItemsService: can't change '{}'", req.app_name_);
+        ack(msg, client, kName);
+        if (ok) {
+            broadcast<char>(kName, static_cast<uint32_t>(O::ItemsChanged), nullptr);
+            broadcast<char>("com.freebsdx.StartupItems",
+                            static_cast<uint32_t>(shared::StartupOpcode::ItemsChanged), nullptr);
+        }
         break;
     }
-
-    default:
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
-        break;
+    default: break;
     }
-
     return true;
 }
 

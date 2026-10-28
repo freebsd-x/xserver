@@ -188,32 +188,86 @@ void AudioService::setEq(const eq::Gains& gains) noexcept {
 
 // ── Mix loop ──────────────────────────────────────────────────────────────────
 
+namespace {
+// Open an OSS playback device the way init() opens the default one.
+int openOutput(const std::string& path, uint32_t rate) noexcept {
+    int fd = ::open(path.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int format = AFMT_S16_LE, channels = 2, speed = static_cast<int>(rate);
+    ::ioctl(fd, SNDCTL_DSP_SETFMT, &format);
+    ::ioctl(fd, SNDCTL_DSP_CHANNELS, &channels);
+    ::ioctl(fd, SNDCTL_DSP_SPEED, &speed);
+    return fd;
+}
+}  // namespace
+
 void AudioService::audioThreadLoop() noexcept {
     const size_t mix_frames     = 1024;
     const size_t bytes_per_frame = 2 * 2; // stereo * int16
     const size_t mix_bytes      = mix_frames * bytes_per_frame;
 
-    std::vector<int32_t> mix_buffer(mix_frames * 2, 0);
+    // One mix (and EQ state) per output device in use; streams go to their
+    // app's route, else the default sink.
+    struct Output {
+        int                  fd = -1;
+        bool                 owned = true;    // the default fd belongs to init()
+        bool                 used = false;
+        eq::Equalizer        equalizer;
+        std::vector<int32_t> mix;
+    };
+    std::map<std::string, Output> outputs;
     std::vector<int16_t> out_buffer(mix_frames * 2, 0);
-    eq::Equalizer equalizer;
+    eq::Gains eq_gains{};
     uint32_t eq_seen = UINT32_MAX;
+    std::string init_path;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        init_path = default_sink_path_;
+    }
 
     while (running_) {
-        bool has_audio = false;
+        bool eq_changed = false;
         if (uint32_t v = eq_version_.load(); v != eq_seen) {
             std::lock_guard<std::mutex> lk(eq_mutex_);
-            equalizer.configure(eq_gains_, static_cast<double>(dsp_sample_rate_));
+            eq_gains = eq_gains_;
             eq_seen = v;
+            eq_changed = true;
         }
-        std::fill(mix_buffer.begin(), mix_buffer.end(), 0);
+        for (auto& [path, o] : outputs) {
+            if (eq_changed) o.equalizer.configure(eq_gains, static_cast<double>(dsp_sample_rate_));
+            o.used = false;
+            std::fill(o.mix.begin(), o.mix.end(), 0);
+        }
 
         const float global_scale = muted_ ? 0.0f
                                           : static_cast<float>(master_vol_.load()) / 100.0f;
+
+        // The output for `path`, opened on first use (a failed open is
+        // remembered so it isn't retried every block).
+        auto outputFor = [&](const std::string& path) -> Output& {
+            auto [it, inserted] = outputs.try_emplace(path);
+            Output& o = it->second;
+            if (inserted) {
+                if (path == init_path && dsp_fd_ >= 0) { o.fd = dsp_fd_; o.owned = false; }
+                else o.fd = openOutput(path, dsp_sample_rate_);
+                if (o.fd < 0) std::cerr << "[AudioService] Can't open " << path << "\n";
+                o.mix.assign(mix_frames * 2, 0);
+                o.equalizer.configure(eq_gains, static_cast<double>(dsp_sample_rate_));
+            }
+            return o;
+        };
 
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             for (const auto& [id, client] : clients_) {
                 if (!client->mapped_buffer_) continue;
+                Output* o = &outputFor(client->route_path_.empty() ? default_sink_path_ : client->route_path_);
+                // A routed device that's gone (unplugged HDMI…) falls back to
+                // the default sink rather than going silent.
+                if (o->fd < 0 && !client->route_path_.empty()) o = &outputFor(default_sink_path_);
+                if (o->fd < 0) continue;
+                o->used = true;
+
                 float stream_scale = global_scale *
                                      static_cast<float>(client->volume_) / 100.0f;
 
@@ -223,21 +277,20 @@ void AudioService::audioThreadLoop() noexcept {
                     client->buffer_size_ / sizeof(int16_t);
 
                 for (size_t i = 0; i < mix_frames * 2; ++i) {
-                    mix_buffer[i] += static_cast<int32_t>(
+                    o->mix[i] += static_cast<int32_t>(
                         src[(client->read_offset_ + i) % total_samples] * stream_scale);
                 }
                 client->read_offset_ =
                     (client->read_offset_ + mix_frames * 2) % total_samples;
-                has_audio = true;
             }
         }
 
-        if (has_audio) {
-            equalizer.process(mix_buffer.data(), mix_frames);
+        for (auto& [path, o] : outputs) {
+            if (!o.used) continue;
+            o.equalizer.process(o.mix.data(), mix_frames);
             for (size_t i = 0; i < mix_frames * 2; ++i)
-                out_buffer[i] = static_cast<int16_t>(
-                    std::clamp(mix_buffer[i], -32768, 32767));
-            auto written = ::write(dsp_fd_, out_buffer.data(), mix_bytes);
+                out_buffer[i] = static_cast<int16_t>(std::clamp(o.mix[i], -32768, 32767));
+            auto written = ::write(o.fd, out_buffer.data(), mix_bytes);
             (void)written;
         }
 
@@ -245,6 +298,32 @@ void AudioService::audioThreadLoop() noexcept {
             static_cast<uint32_t>(mix_frames) * 1000000u / dsp_sample_rate_;
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
     }
+
+    for (auto& [path, o] : outputs)
+        if (o.owned && o.fd >= 0) ::close(o.fd);
+}
+
+// ── Routing ───────────────────────────────────────────────────────────────────
+
+std::vector<AudioService::StreamInfo> AudioService::streams() noexcept {
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    std::vector<StreamInfo> v;
+    for (const auto& [id, c] : clients_) v.push_back({id, c->app_name_, c->route_path_});
+    std::sort(v.begin(), v.end(), [](const StreamInfo& a, const StreamInfo& b) { return a.id < b.id; });
+    return v;
+}
+
+void AudioService::setAppRoute(const std::string& app, const std::string& path) noexcept {
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    if (path.empty()) app_routes_.erase(app);
+    else app_routes_[app] = path;
+    for (auto& [id, c] : clients_)
+        if (c->app_name_ == app) c->route_path_ = path;
+}
+
+std::string AudioService::defaultSinkPath() noexcept {
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    return default_sink_path_;
 }
 
 // ── ProcessMessage ────────────────────────────────────────────────────────────
@@ -288,6 +367,8 @@ bool AudioService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         }
 
         std::lock_guard<std::mutex> lock(clients_mutex_);
+        if (auto r = app_routes_.find(ac->app_name_); r != app_routes_.end())
+            ac->route_path_ = r->second;
         uint32_t stream_id = msg.transaction_id_;
         clients_[stream_id] = ac;
         std::cout << "[AudioService] Stream " << stream_id
@@ -336,8 +417,13 @@ bool AudioService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         AudioDeviceRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         req.path_[sizeof(req.path_) - 1] = '\0';
-        default_sink_path_ = std::string(req.path_, strnlen(req.path_, sizeof(req.path_)));
-        std::cout << "[AudioService] Default sink → " << default_sink_path_ << "\n";
+        {
+            // The mix thread reads it per block, so the switch takes effect
+            // on the next one (it used to keep writing to the old device).
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            default_sink_path_ = std::string(req.path_, strnlen(req.path_, sizeof(req.path_)));
+        }
+        std::cout << "[AudioService] Default sink → " << req.path_ << "\n";
         (void)client->sendMessage(
             {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
         break;

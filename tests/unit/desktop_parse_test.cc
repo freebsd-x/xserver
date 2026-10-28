@@ -121,3 +121,47 @@ TEST(AudioEq, PresetsAndClamp) {
     EXPECT_EQ(g[0], 12);
     EXPECT_EQ(g[1], -12);
 }
+
+// ── Audio routing ────────────────────────────────────────────────────────────
+
+#include "xserver/audio_route.h"
+#include "shared/autostart.h"
+
+TEST(AudioRoute, ParsesSndstatPlaybackDevices) {
+    auto outs = audioroute::parseSndstat(
+        "Installed devices:\n"
+        "pcm0: <Realtek ALC294 (Analog 2.0+HP/4ch)> (play/rec)\n"
+        "pcm1: <Intel Kaby Lake (HDMI/DP 8ch)> (play) default\n"
+        "pcm2: <USB Mic> (rec)\n"
+        "No devices installed from userspace.\n");
+    ASSERT_EQ(outs.size(), 2u);                        // the capture-only one is skipped
+    EXPECT_EQ(outs[0].path(), "/dev/dsp0");
+    EXPECT_FALSE(outs[0].is_default);
+    EXPECT_TRUE(outs[1].is_default);
+    EXPECT_EQ(audioroute::shortLabel(outs[0]), "Analog (pcm0)");
+    EXPECT_EQ(audioroute::shortLabel(outs[1]), "HDMI/DP (pcm1)");
+    EXPECT_LT(audioroute::shortLabel(outs[1]).size(), 32u);
+}
+
+TEST(AudioRoute, RoutesPersistAndResolve) {
+    auto r = audioroute::parseRoutes("com.freebsdx.musicplayer=/dev/dsp0;bad=/etc/passwd;x=/dev/dspX;y=/dev/dsp1");
+    ASSERT_EQ(r.size(), 2u);
+    EXPECT_EQ(audioroute::parseRoutes(audioroute::formatRoutes(r)), r);
+    std::vector<audioroute::Output> outs{{0, "A", false}, {1, "H", true}};
+    EXPECT_EQ(audioroute::resolve(r, "com.freebsdx.musicplayer", outs), "/dev/dsp0");
+    EXPECT_EQ(audioroute::resolve(r, "unknown", outs), "");
+    outs.pop_back();
+    EXPECT_EQ(audioroute::resolve(r, "y", outs), "");  // its device is gone → default
+    EXPECT_FALSE(audioroute::validApp("a=b"));
+}
+
+TEST(LoginItems, AppEntryLaunchesByBundleId) {
+    namespace as = fbx::shared::autostart;
+    std::string text = as::appEntry("Notes", "/apps/Notes.xapp/bin/notes", "com.freebsdx.notes");
+    as::Entry e;
+    ASSERT_TRUE(as::parse(text, e));
+    EXPECT_EQ(e.app_id, "com.freebsdx.notes");
+    EXPECT_EQ(e.name, "Notes");
+    EXPECT_TRUE(as::shouldLaunch(e));
+    EXPECT_TRUE(as::isEntryFile(as::appEntryFile("com.freebsdx.notes")));
+}

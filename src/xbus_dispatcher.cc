@@ -186,6 +186,7 @@ static ServiceHandler shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.AudioEq",         &AudioEqService::handleMessage},
         {"com.freebsdx.FastCharging",    &FastChargingService::handleMessage},
         {"com.freebsdx.InputMethod",     &InputMethodService::handleMessage},
+        {"com.freebsdx.AudioRouting",    &AudioRoutingService::handleMessage},
     };
     for (const auto& e : kTable)
         if (std::strcmp(name, e.name) == 0) return e.fn;
@@ -1354,7 +1355,9 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         TrustedDevicesService::ProcessMessage(client, *msg);
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.LoginItems") == 0) {
-        LoginItemsService::ProcessMessage(client, *msg);
+        // Shell-only: it decides what runs at login.
+        if (trusted) LoginItemsService::ProcessMessage(client, *msg);
+        else std::cerr << "[XBusDispatcher] DENIED: untrusted app attempted com.freebsdx.LoginItems\n";
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.DefaultApps") == 0) {
         DefaultAppsService::ProcessMessage(client, *msg);

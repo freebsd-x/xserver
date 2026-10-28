@@ -7,6 +7,7 @@
 #include <span>
 #include <thread>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -29,6 +30,18 @@ public:
     // 5-band EQ (com.freebsdx.AudioEq); the mix thread picks it up on its next
     // block.
     void setEq(const eq::Gains& gains) noexcept;
+
+    // Per-app output routing (com.freebsdx.AudioRouting). A route is a
+    // /dev/dspN path; "" means "the default sink". Applies to the app's open
+    // streams now and to streams it opens later.
+    struct StreamInfo {
+        uint32_t    id;
+        std::string app;
+        std::string route;   // "" = default sink
+    };
+    [[nodiscard]] std::vector<StreamInfo> streams() noexcept;
+    void setAppRoute(const std::string& app, const std::string& path) noexcept;
+    [[nodiscard]] std::string defaultSinkPath() noexcept;
 
     // Handles incoming XBus Audio service messages.
     bool ProcessMessage(std::shared_ptr<IpcSocket> client,
@@ -56,6 +69,7 @@ private:
         size_t      read_offset_{0};   // ring-buffer read position (samples)
         uint32_t    volume_{100};      // per-stream scalar 0-100
         std::string app_name_;         // app identifier (from IpcSocket::appId())
+        std::string route_path_;       // output device; "" = default sink
     };
 
     std::unordered_map<uint32_t, std::shared_ptr<AudioClient>> clients_;
@@ -71,7 +85,8 @@ private:
     std::mutex            eq_mutex_;
     eq::Gains             eq_gains_{};
     std::atomic<uint32_t> eq_version_{0};
-    std::string default_sink_path_{"/dev/dsp"};
+    std::string default_sink_path_{"/dev/dsp"};          // guarded by clients_mutex_
+    std::map<std::string, std::string> app_routes_;      // app → /dev/dspN; clients_mutex_
 };
 
 } // namespace fbx::xserver

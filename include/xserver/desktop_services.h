@@ -2,12 +2,22 @@
 
 #include "shared/protocol.h"
 #include "xserver/audio_eq.h"
+#include "xserver/audio_route.h"
 #include "xserver/ipc_socket.h"
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace fbx::xserver {
+
+// An installed .xapp bundle (from the apps dir AppPermsService::init sets).
+struct InstalledApp {
+    std::string id;     // manifest identifier
+    std::string name;
+    std::string exec;   // bundle dir + manifest "executable"
+};
+[[nodiscard]] std::vector<InstalledApp> installedApps() noexcept;   // sorted by name
 
 // com.freebsdx.AppPerms — camera / microphone / location per installed app
 // (the .xapp bundles in the apps dir from init(), by manifest identifier,
@@ -59,6 +69,23 @@ public:
 // can't turn it off (the real state is broadcast so the switch snaps back).
 class FastChargingService {
 public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
+// com.freebsdx.AudioRouting — which output each playing app uses: the open
+// streams (AudioService) and the playback devices in /dev/sndstat. SetRoute
+// moves the stream's app to another device (AudioService mixes each device
+// separately); routes persist per app (ConfigService "audioroute.apps") and
+// apply to the app's future streams too.
+class AudioRoutingService {
+public:
+    struct Hooks {
+        std::function<std::vector<audioroute::Stream>()>              streams;
+        std::function<void(const std::string& app, const std::string& path)> route;
+        std::function<std::string()>                                   sndstat;   // default: /dev/sndstat
+    };
+    static void init(Hooks hooks) noexcept;
     static void handleMessage(const shared::XBusMessage& msg,
                               std::shared_ptr<IpcSocket> client) noexcept;
 };

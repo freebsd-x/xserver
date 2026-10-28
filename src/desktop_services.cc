@@ -30,25 +30,7 @@ using userfiles::readFile;
 
 // ── AppPerms ─────────────────────────────────────────────────────────────────
 
-struct InstalledApp {
-    std::string id, name;
-};
-
 std::function<std::string()> g_apps_dir;
-
-std::vector<InstalledApp> installedApps() {
-    std::vector<InstalledApp> out;
-    std::error_code ec;
-    for (const auto& de : std::filesystem::directory_iterator(g_apps_dir ? g_apps_dir() : "./apps", ec)) {
-        if (de.path().extension() != ".xapp") continue;
-        auto json = readFile((de.path() / "manifest.json").string());
-        if (!json) continue;
-        InstalledApp a{desktop::jsonString(*json, "identifier"), desktop::jsonString(*json, "name")};
-        if (!a.id.empty() && a.id.size() < 32) out.push_back(std::move(a));
-    }
-    std::sort(out.begin(), out.end(), [](const InstalledApp& a, const InstalledApp& b) { return a.name < b.name; });
-    return out;
-}
 
 bool locationAllowed(const std::string& id) {
     return std::strtoul(ConfigService::get("location.app." + id, "0").c_str(), nullptr, 10) > 0;
@@ -134,6 +116,22 @@ eq::Gains gainsOf(const shared::AudioEqConfig& c) {
 }
 
 }  // namespace
+
+std::vector<InstalledApp> installedApps() noexcept {
+    std::vector<InstalledApp> out;
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(g_apps_dir ? g_apps_dir() : "./apps", ec)) {
+        if (de.path().extension() != ".xapp") continue;
+        auto json = readFile((de.path() / "manifest.json").string());
+        if (!json) continue;
+        InstalledApp a{desktop::jsonString(*json, "identifier"), desktop::jsonString(*json, "name"), {}};
+        std::string exe = desktop::jsonString(*json, "executable");
+        if (!exe.empty()) a.exec = std::filesystem::absolute(de.path() / exe, ec).string();
+        if (!a.id.empty() && a.id.size() < 32 && !a.name.empty()) out.push_back(std::move(a));
+    }
+    std::sort(out.begin(), out.end(), [](const InstalledApp& a, const InstalledApp& b) { return a.name < b.name; });
+    return out;
+}
 
 // ── AppPermsService ──────────────────────────────────────────────────────────
 
@@ -342,6 +340,85 @@ void FastChargingService::handleMessage(const shared::XBusMessage& msg,
         ack(msg, client, kName);
         auto st = chargingState();
         broadcast(kName, static_cast<uint32_t>(O::StateChanged), &st);
+        break;
+    }
+    default: break;
+    }
+}
+
+// ── AudioRoutingService ──────────────────────────────────────────────────────
+
+namespace {
+
+constexpr const char* kRoutesKey = "audioroute.apps";
+AudioRoutingService::Hooks g_route;
+
+std::vector<audioroute::Output> outputs() {
+    std::string text = g_route.sndstat ? g_route.sndstat() : readFile("/dev/sndstat").value_or("");
+    return audioroute::parseSndstat(text);
+}
+
+// Index of the device a stream plays on (its route, else the default output).
+uint32_t deviceIndex(const audioroute::Stream& st, const std::vector<audioroute::Output>& outs) {
+    for (size_t i = 0; i < outs.size(); ++i)
+        if (st.route.empty() ? outs[i].is_default : outs[i].path() == st.route) return static_cast<uint32_t>(i);
+    return 0;
+}
+
+}  // namespace
+
+void AudioRoutingService::init(Hooks hooks) noexcept {
+    g_route = std::move(hooks);
+    if (!g_route.route) return;
+    for (const auto& [app, path] : audioroute::parseRoutes(ConfigService::get(kRoutesKey)))
+        g_route.route(app, path);
+}
+
+void AudioRoutingService::handleMessage(const shared::XBusMessage& msg,
+                                        std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::AudioRoutingOpcode;
+    constexpr const char* kName = "com.freebsdx.AudioRouting";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::ListRoutes: {
+        auto streams = g_route.streams ? g_route.streams() : std::vector<audioroute::Stream>{};
+        auto outs = outputs();
+        auto pg = makePage<shared::AudioRoutePage>(readPage(msg), streams,
+            [&outs](shared::AudioRouteEntry& e, const audioroute::Stream& st) {
+                std::strncpy(e.app_id_, std::to_string(st.id).c_str(), sizeof(e.app_id_) - 1);
+                std::strncpy(e.app_name_, st.app.c_str(), sizeof(e.app_name_) - 1);
+                e.device_count_ = static_cast<uint32_t>(outs.size());
+                if (!outs.empty()) {
+                    e.device_idx_ = deviceIndex(st, outs);
+                    std::strncpy(e.device_name_, audioroute::shortLabel(outs[e.device_idx_]).c_str(),
+                                 sizeof(e.device_name_) - 1);
+                }
+            });
+        reply(msg, client, kName, msg.opcode_, &pg);
+        break;
+    }
+    case O::SetRoute: {
+        shared::AudioRouteSetRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        req.app_id_[sizeof(req.app_id_) - 1] = '\0';
+        auto outs = outputs();
+        bool ok = false;
+        if (!outs.empty() && g_route.streams && g_route.route) {
+            uint32_t id = static_cast<uint32_t>(std::strtoul(req.app_id_, nullptr, 10));
+            for (const auto& st : g_route.streams()) {
+                if (st.id != id || !audioroute::validApp(st.app)) continue;
+                std::string path = outs[req.device_idx_ % outs.size()].path();
+                g_route.route(st.app, path);
+                auto routes = audioroute::parseRoutes(ConfigService::get(kRoutesKey));
+                routes[st.app] = path;
+                ConfigService::set(kRoutesKey, audioroute::formatRoutes(routes));
+                LOG_INFO("AudioRoutingService: {} → {}", st.app, path);
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) LOG_WARN("AudioRoutingService: no stream '{}' to route", req.app_id_);
+        ack(msg, client, kName);
+        if (ok) broadcast<char>(kName, static_cast<uint32_t>(O::RoutesChanged), nullptr);
         break;
     }
     default: break;
