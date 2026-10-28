@@ -1,5 +1,6 @@
 #include "xserver/sysadmin_services.h"
 #include "xserver/sysadmin_parse.h"
+#include "xserver/xbus_reply.h"
 #include "xserver/async_shell.h"
 #include "xserver/priv_broker.h"
 #include "xserver/priv_ops.h"
@@ -19,9 +20,9 @@
 
 namespace fbx::xserver {
 
-void BroadcastXBusMessage(const shared::XBusMessage&);
-
 namespace {
+
+using namespace svc;
 
 using Clock = std::chrono::steady_clock;
 
@@ -51,34 +52,6 @@ void invalidateCache() {
     g_cache.clear();
 }
 
-template <typename T>
-void reply(const shared::XBusMessage& msg, const std::shared_ptr<IpcSocket>& client,
-           const char* service, uint32_t opcode, const T* payload) {
-    shared::XBusMessage r{};
-    r.transaction_id_ = msg.transaction_id_;
-    std::strncpy(r.service_name_, service, sizeof(r.service_name_) - 1);
-    r.opcode_ = opcode;
-    if (payload) {
-        static_assert(sizeof(T) <= sizeof(r.payload_));
-        std::memcpy(r.payload_, payload, sizeof(T));
-    }
-    client->sendMessage({reinterpret_cast<const uint8_t*>(&r), sizeof(r)});
-}
-
-void ack(const shared::XBusMessage& msg, const std::shared_ptr<IpcSocket>& client,
-         const char* service) {
-    reply<char>(msg, client, service, msg.opcode_, nullptr);
-}
-
-template <typename T>
-void broadcast(const char* service, uint32_t opcode, const T* payload) {
-    shared::XBusMessage b{};
-    std::strncpy(b.service_name_, service, sizeof(b.service_name_) - 1);
-    b.opcode_ = opcode;
-    if (payload) std::memcpy(b.payload_, payload, sizeof(T));
-    BroadcastXBusMessage(b);
-}
-
 // Run a broker verb; log the outcome. Returns true on success.
 bool brokerOp(const char* who, const char* verb, const std::string& arg) {
     int r = runPrivilegedOp(verb, arg);
@@ -92,25 +65,6 @@ bool brokerOp(const char* who, const char* verb, const std::string& arg) {
     else
         LOG_WARN("{}: {} '{}' failed ({})", who, verb, arg, r);
     return false;
-}
-
-template <typename Page, typename Item, typename Fill>
-Page makePage(uint32_t page, const std::vector<Item>& items, Fill fill) {
-    Page pg{};
-    pg.page_  = page;
-    pg.total_ = static_cast<uint32_t>(items.size());
-    uint64_t start = static_cast<uint64_t>(page) * 3;
-    uint32_t n = 0;
-    for (; n < 3 && start + n < items.size(); ++n) fill(pg.entries_[n], items[start + n]);
-    pg.count_    = n;
-    pg.has_more_ = (start + n < items.size()) ? 1u : 0u;
-    return pg;
-}
-
-uint32_t readPage(const shared::XBusMessage& msg) {
-    uint32_t page = 0;
-    std::memcpy(&page, msg.payload_, sizeof(page));
-    return page;
 }
 
 // ── Services ─────────────────────────────────────────────────────────────────

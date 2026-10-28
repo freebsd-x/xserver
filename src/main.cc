@@ -25,6 +25,7 @@
 #include "xserver/xbus_dispatcher.h"
 #include "xserver/audio_service.h"
 #include "xserver/screenshot_service.h"
+#include "xserver/user_services.h"
 #include "xserver/lock_service.h"
 #include "xserver/screensaver_service.h"
 #include "xserver/terminal_service.h"
@@ -496,6 +497,7 @@ int main(int argc, char** argv) {
 
     // Give ScreenshotService a back-pointer to the compositor for captureToShm().
     ScreenshotService::getInstance().setCompositor(comp.get());
+    CapturesService::setScreenshotHook([] { ScreenshotService::getInstance().captureFullScreen(); });
 
     // Give RemoteDesktopService a back-pointer to the compositor for screen capture.
     RemoteDesktopService::setCompositor(comp.get());

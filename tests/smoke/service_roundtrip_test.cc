@@ -23,6 +23,7 @@
 #include "xserver/smart_service.h"
 #include "xserver/kmod_service.h"
 #include "xserver/sysadmin_services.h"
+#include "xserver/user_services.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -80,6 +81,9 @@
 
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sstream>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -145,10 +149,9 @@ protected:
         setenv("HOME", home_.c_str(), 1);
     }
     void TearDown() override {
-        // best-effort cleanup of the two files we may write
-        ::unlink((home_ + "/.freebsdx-proxy").c_str());
-        ::unlink((home_ + "/.freebsdx-wol").c_str());
-        ::rmdir(home_.c_str());
+        // best-effort cleanup of everything the services wrote under HOME
+        std::error_code ec;
+        std::filesystem::remove_all(home_, ec);
     }
     std::string home_;
 };
@@ -2211,6 +2214,168 @@ TEST_F(ServiceRoundtrip, StylusPalmRejectAndPressure) {
     EXPECT_EQ(st.palm_rejection_, 0u);
     EXPECT_EQ(st.pressure_curve_, 2u);
     EXPECT_EQ(st.connected_, 0u) << "no digitiser detected on this host";
+}
+
+// ── Per-user services (CronJobs/SshKeys/Captures/EnvVars) ─────────────────────
+
+void writeHomeFile(const std::string& path, const std::string& body) {
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+    std::ofstream(path) << body;
+}
+
+std::string readHomeFile(const std::string& path) {
+    std::ifstream f(path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// Reads the real user's crontab (never writes it): framing only.
+TEST_F(ServiceRoundtrip, CronListFramingAndStaleToggleAcked) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.CronJobs", static_cast<uint32_t>(CronOpcode::ListJobs),
+                              0x63000001, &page, sizeof(page));
+    CronJobsService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.CronJobs",
+                                static_cast<uint32_t>(CronOpcode::ListJobs), 0x63000001);
+    CronPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    expectPageInvariants(pg, 0);
+
+    // Line 0 is never a job → no crontab install, but still acked.
+    CronJobToggleRequest t{};
+    t.job_id_ = 0;
+    req = makeReq("com.freebsdx.CronJobs", static_cast<uint32_t>(CronOpcode::SetJobEnabled),
+                  0x63000002, &t, sizeof(t));
+    CronJobsService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.CronJobs",
+              static_cast<uint32_t>(CronOpcode::SetJobEnabled), 0x63000002);
+}
+
+TEST_F(ServiceRoundtrip, SshKeysListThenRemove) {
+    writeHomeFile(home_ + "/.ssh/authorized_keys",
+                  "# c\nssh-ed25519 AAAA one@a\nssh-rsa BBBB two@b\nssh-ed25519 CCCC three@c\n"
+                  "ssh-ed25519 DDDD four@d\n");
+    writeHomeFile(home_ + "/.ssh/known_hosts", "h1 ssh-ed25519 X\nh2 ssh-rsa Y\n");
+    auto p = makePipe();
+    uint32_t page = 1;
+    XBusMessage req = makeReq("com.freebsdx.SshKeys", static_cast<uint32_t>(SshKeyOpcode::ListKeys),
+                              0x6b000001, &page, sizeof(page));
+    SshKeysService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.SshKeys",
+                                static_cast<uint32_t>(SshKeyOpcode::ListKeys), 0x6b000001);
+    SshKeyPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    expectPageInvariants(pg, 1);
+    EXPECT_EQ(pg.total_, 4u);
+    ASSERT_EQ(pg.count_, 1u);
+    EXPECT_STREQ(pg.entries_[0].comment_, "four@d");
+    EXPECT_EQ(pg.known_hosts_count_, 2u);
+
+    SshKeyRemoveRequest rm{};
+    rm.key_id_ = 3;   // "two@b"
+    req = makeReq("com.freebsdx.SshKeys", static_cast<uint32_t>(SshKeyOpcode::RemoveKey),
+                  0x6b000002, &rm, sizeof(rm));
+    SshKeysService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.SshKeys",
+              static_cast<uint32_t>(SshKeyOpcode::RemoveKey), 0x6b000002);
+    std::string after = readHomeFile(home_ + "/.ssh/authorized_keys");
+    EXPECT_EQ(after.find("two@b"), std::string::npos);
+    EXPECT_NE(after.find("one@a"), std::string::npos);
+    struct stat st{};
+    ASSERT_EQ(::stat((home_ + "/.ssh/authorized_keys").c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & 0777, 0600u);
+}
+
+TEST_F(ServiceRoundtrip, CapturesListNewestFirstAndSafeDelete) {
+    std::string shots = home_ + "/Pictures/Screenshots";
+    writeHomeFile(shots + "/old.png", std::string(3000, 'x'));
+    writeHomeFile(shots + "/new.png", "y");
+    writeHomeFile(home_ + "/Videos/Captures/rec.mp4", "z");
+    writeHomeFile(home_ + "/keep.txt", "k");
+    struct timespec ts[2] = {{1000, 0}, {1000, 0}};
+    ::utimensat(AT_FDCWD, (shots + "/old.png").c_str(), ts, 0);
+    ts[0].tv_sec = ts[1].tv_sec = 2000;
+    ::utimensat(AT_FDCWD, (home_ + "/Videos/Captures/rec.mp4").c_str(), ts, 0);
+
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.Captures", static_cast<uint32_t>(CaptureOpcode::ListCaptures),
+                              0x70000001, &page, sizeof(page));
+    CapturesService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.Captures",
+                                static_cast<uint32_t>(CaptureOpcode::ListCaptures), 0x70000001);
+    CapturePage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    expectPageInvariants(pg, 0);
+    ASSERT_EQ(pg.count_, 3u);
+    EXPECT_STREQ(pg.entries_[0].filename_, "new.png");
+    EXPECT_STREQ(pg.entries_[1].filename_, "rec.mp4");
+    EXPECT_EQ(pg.entries_[1].type_, 1u);
+    EXPECT_STREQ(pg.entries_[2].filename_, "old.png");
+    EXPECT_EQ(pg.entries_[2].size_kb_, 3u);
+    EXPECT_EQ(std::strlen(pg.entries_[2].timestamp_), 16u);   // "YYYY-MM-DD HH:MM"
+
+    // A traversal name is refused; a plain one is deleted. Both are acked.
+    for (const char* name : {"../../keep.txt", "old.png"}) {
+        CaptureDeleteRequest d{};
+        std::strncpy(d.filename_, name, sizeof(d.filename_) - 1);
+        req = makeReq("com.freebsdx.Captures", static_cast<uint32_t>(CaptureOpcode::DeleteCapture),
+                      0x70000002, &d, sizeof(d));
+        CapturesService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.Captures",
+                  static_cast<uint32_t>(CaptureOpcode::DeleteCapture), 0x70000002);
+    }
+    EXPECT_TRUE(std::filesystem::exists(home_ + "/keep.txt"));
+    EXPECT_FALSE(std::filesystem::exists(shots + "/old.png"));
+}
+
+TEST_F(ServiceRoundtrip, EnvVarsSetListUnset) {
+    auto p = makePipe();
+    auto set = [&](const char* k, const char* v, uint32_t tid) {
+        EnvSetRequest r{};
+        std::strncpy(r.key_, k, sizeof(r.key_) - 1);
+        std::strncpy(r.value_, v, sizeof(r.value_) - 1);
+        XBusMessage req = makeReq("com.freebsdx.EnvVars", static_cast<uint32_t>(EnvVarOpcode::SetVar),
+                                  tid, &r, sizeof(r));
+        EnvVarsService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.EnvVars", static_cast<uint32_t>(EnvVarOpcode::SetVar), tid);
+    };
+    set("FBX_TEST_VAR", "hello", 0x65000001);
+    set("XBUS_SOCKET", "/evil", 0x65000002);      // reserved: refused
+    set("bad key", "x", 0x65000003);              // invalid: refused
+    std::string file = readHomeFile(home_ + "/.config/freebsdx/environment");
+    EXPECT_NE(file.find("FBX_TEST_VAR=hello\n"), std::string::npos);
+    EXPECT_EQ(file.find("XBUS_SOCKET"), std::string::npos);
+
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.EnvVars", static_cast<uint32_t>(EnvVarOpcode::ListVars),
+                              0x65000004, &page, sizeof(page));
+    EnvVarsService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.EnvVars",
+                                static_cast<uint32_t>(EnvVarOpcode::ListVars), 0x65000004);
+    EnvVarPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    expectPageInvariants(pg, 0);
+    ASSERT_GE(pg.count_, 2u);                      // user var + at least HOME
+    EXPECT_STREQ(pg.entries_[0].key_, "FBX_TEST_VAR");   // user vars come first
+    EXPECT_EQ(pg.entries_[0].readonly_, 0u);
+    EXPECT_EQ(pg.entries_[1].readonly_, 1u);
+
+    // Inherited vars can't be unset; the user var can.
+    for (const char* k : {"HOME", "FBX_TEST_VAR"}) {
+        EnvUnsetRequest u{};
+        std::strncpy(u.key_, k, sizeof(u.key_) - 1);
+        req = makeReq("com.freebsdx.EnvVars", static_cast<uint32_t>(EnvVarOpcode::UnsetVar),
+                      0x65000005, &u, sizeof(u));
+        EnvVarsService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.EnvVars",
+                  static_cast<uint32_t>(EnvVarOpcode::UnsetVar), 0x65000005);
+    }
+    EXPECT_EQ(readHomeFile(home_ + "/.config/freebsdx/environment").find("FBX_TEST_VAR"),
+              std::string::npos);
+    EXPECT_STREQ(std::getenv("HOME"), home_.c_str());
 }
 
 }  // namespace

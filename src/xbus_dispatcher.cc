@@ -58,6 +58,7 @@
 #include "xserver/smart_service.h"
 #include "xserver/kmod_service.h"
 #include "xserver/sysadmin_services.h"
+#include "xserver/user_services.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -142,6 +143,26 @@ namespace fbx::xserver {
 // which would escape the dispatch path. Parse defensively.
 static uint32_t safeConfigU32(const std::string& s) noexcept {
     try { return static_cast<uint32_t>(std::stoul(s)); } catch (...) { return 0u; }
+}
+
+// Services only the trusted shell may call (see the gate in ProcessMessage).
+using ServiceHandler = void (*)(const shared::XBusMessage&, std::shared_ptr<IpcSocket>) noexcept;
+
+static ServiceHandler shellOnlyService(const char* name) noexcept {
+    static constexpr struct { const char* name; ServiceHandler fn; } kTable[] = {
+        {"com.freebsdx.Services", &RcServicesService::handleMessage},
+        {"com.freebsdx.Jails",    &JailsService::handleMessage},
+        {"com.freebsdx.ZfsPools", &ZfsPoolsService::handleMessage},
+        {"com.freebsdx.BootEnv",  &BootEnvService::handleMessage},
+        {"com.freebsdx.NTP",      &NtpService::handleMessage},
+        {"com.freebsdx.CronJobs", &CronJobsService::handleMessage},
+        {"com.freebsdx.SshKeys",  &SshKeysService::handleMessage},
+        {"com.freebsdx.Captures", &CapturesService::handleMessage},
+        {"com.freebsdx.EnvVars",  &EnvVarsService::handleMessage},
+    };
+    for (const auto& e : kTable)
+        if (std::strcmp(name, e.name) == 0) return e.fn;
+    return nullptr;
 }
 
 // ─── DnD state ───────────────────────────────────────────────────────────────
@@ -953,24 +974,13 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         KmodService::handleMessage(*msg, client);
         return {true, std::nullopt};
     }
-    else if (std::strcmp(msg->service_name_, "com.freebsdx.Services") == 0) {
-        RcServicesService::handleMessage(*msg, client);
-        return {true, std::nullopt};
-    }
-    else if (std::strcmp(msg->service_name_, "com.freebsdx.Jails") == 0) {
-        JailsService::handleMessage(*msg, client);
-        return {true, std::nullopt};
-    }
-    else if (std::strcmp(msg->service_name_, "com.freebsdx.ZfsPools") == 0) {
-        ZfsPoolsService::handleMessage(*msg, client);
-        return {true, std::nullopt};
-    }
-    else if (std::strcmp(msg->service_name_, "com.freebsdx.BootEnv") == 0) {
-        BootEnvService::handleMessage(*msg, client);
-        return {true, std::nullopt};
-    }
-    else if (std::strcmp(msg->service_name_, "com.freebsdx.NTP") == 0) {
-        NtpService::handleMessage(*msg, client);
+    else if (auto handler = shellOnlyService(msg->service_name_)) {
+        // Root actions via the broker (Services/Jails/ZfsPools/BootEnv/NTP) and
+        // the user's crontab, SSH keys, captures and env file: shell panels
+        // only. Apps get no reply, like the other trusted-only services.
+        if (trusted) handler(*msg, client);
+        else std::cerr << "[XBusDispatcher] DENIED: untrusted app attempted "
+                       << msg->service_name_ << "\n";
         return {true, std::nullopt};
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.BatteryHealth") == 0) {
