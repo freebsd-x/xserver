@@ -69,7 +69,7 @@ shared::SystemInfo SystemService::getSystemStats() noexcept {
     }
 
     info.frame_count_ = frame_count_;
-    info.gpu_temp_ = 45; // Mock GPU temp for now
+    info.gpu_temp_ = 0;  // no GPU temperature sensor is exposed (0 = unknown)
 
     return info;
 }

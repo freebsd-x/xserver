@@ -425,6 +425,52 @@ void AudioRoutingService::handleMessage(const shared::XBusMessage& msg,
     }
 }
 
+// ── DevOverlayService ────────────────────────────────────────────────────────
+
+namespace {
+std::function<bool()>     g_overlay_visible;
+std::function<void(bool)> g_overlay_show;
+
+shared::DevOverlayState overlayState() {
+    shared::DevOverlayState st{};
+    st.mode_ = g_overlay_visible && g_overlay_visible() ? 1u : 0u;
+    return st;
+}
+}  // namespace
+
+void DevOverlayService::init(std::function<bool()> visible, std::function<void(bool)> show) noexcept {
+    g_overlay_visible = std::move(visible);
+    g_overlay_show    = std::move(show);
+}
+
+void DevOverlayService::notifyChanged() noexcept {
+    auto st = overlayState();
+    broadcast("com.freebsdx.DevOverlay", static_cast<uint32_t>(shared::DevOverlayOpcode::StateChanged), &st);
+}
+
+void DevOverlayService::handleMessage(const shared::XBusMessage& msg,
+                                      std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::DevOverlayOpcode;
+    constexpr const char* kName = "com.freebsdx.DevOverlay";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::GetState: {
+        auto st = overlayState();
+        reply(msg, client, kName, msg.opcode_, &st);
+        break;
+    }
+    case O::SetMode: {
+        shared::DevOverlayRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        if (req.mode_ <= 1 && g_overlay_show) g_overlay_show(req.mode_ == 1);
+        else LOG_INFO("DevOverlayService: mode {} isn't supported (FPS or Off)", req.mode_);
+        ack(msg, client, kName);
+        notifyChanged();
+        break;
+    }
+    default: break;
+    }
+}
+
 // ── AudioEqService ───────────────────────────────────────────────────────────
 
 void AudioEqService::init(std::function<void(const eq::Gains&)> apply) noexcept {

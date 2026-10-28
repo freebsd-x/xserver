@@ -38,6 +38,13 @@ public:
     // Return all handler app_ids for a given MIME type (default handler first).
     [[nodiscard]] static std::vector<std::string> allHandlers(const std::string& mime_type) noexcept;
 
+    // Make app_id the default for mime_type (persisted). False if it isn't a
+    // registered handler for that type.
+    static bool setDefault(const std::string& mime_type, const std::string& app_id) noexcept;
+
+    // Display name of a handler app ("" if unknown).
+    [[nodiscard]] static std::string appName(const std::string& app_id) noexcept;
+
 private:
     struct AppEntry {
         std::string app_id;

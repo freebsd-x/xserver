@@ -228,18 +228,7 @@ void MimeService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         std::string mime(req.mime_type_, strnlen(req.mime_type_, sizeof(req.mime_type_)));
         std::string app_id(req.app_id_, strnlen(req.app_id_, sizeof(req.app_id_)));
 
-        // Promote app_id to the front of the handler list
-        auto it = registry_.find(mime);
-        if (it != registry_.end()) {
-            auto eit = std::find_if(it->second.begin(), it->second.end(),
-                [&app_id](const AppEntry& e){ return e.app_id == app_id; });
-            if (eit != it->second.end() && eit != it->second.begin())
-                std::rotate(it->second.begin(), eit, eit + 1);
-        }
-
-        // Persist the override
-        ConfigService::set("mime.default." + mime, app_id);
-        std::cout << "[MimeService] SetDefault: " << mime << " → " << app_id << "\n";
+        setDefault(mime, app_id);
         break;
     }
 
@@ -290,6 +279,26 @@ void MimeService::ProcessMessage(std::shared_ptr<IpcSocket> client,
                   << std::dec << "\n";
         break;
     }
+}
+
+bool MimeService::setDefault(const std::string& mime, const std::string& app_id) noexcept {
+    // Promote app_id to the front of the handler list
+    auto it = registry_.find(mime);
+    if (it == registry_.end()) return false;
+    auto eit = std::find_if(it->second.begin(), it->second.end(),
+        [&app_id](const AppEntry& e){ return e.app_id == app_id; });
+    if (eit == it->second.end()) return false;
+    if (eit != it->second.begin()) std::rotate(it->second.begin(), eit, eit + 1);
+
+    // Persist the override
+    ConfigService::set("mime.default." + mime, app_id);
+    std::cout << "[MimeService] SetDefault: " << mime << " → " << app_id << "\n";
+    return true;
+}
+
+std::string MimeService::appName(const std::string& app_id) noexcept {
+    auto it = app_names_.find(app_id);
+    return it == app_names_.end() ? std::string{} : it->second;
 }
 
 } // namespace fbx::xserver

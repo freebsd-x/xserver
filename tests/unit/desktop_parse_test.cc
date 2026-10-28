@@ -3,6 +3,7 @@
 #include "xserver/desktop_parse.h"
 #include "xserver/audio_eq.h"
 #include <cmath>
+#include <cstring>
 #include <gtest/gtest.h>
 #include <vector>
 
@@ -164,4 +165,32 @@ TEST(LoginItems, AppEntryLaunchesByBundleId) {
     EXPECT_EQ(e.name, "Notes");
     EXPECT_TRUE(as::shouldLaunch(e));
     EXPECT_TRUE(as::isEntryFile(as::appEntryFile("com.freebsdx.notes")));
+}
+
+// ── Shortcut registry / old-cache rule ───────────────────────────────────────
+
+#include "xserver/shortcuts.h"
+#include "xserver/opt_storage_service.h"
+
+TEST(Shortcuts, RegistryFitsTheWireAndToggles) {
+    for (const auto& d : shortcuts::kAll) {
+        EXPECT_LT(std::strlen(d.action), 48u) << d.action;
+        EXPECT_LT(std::strlen(d.binding), 16u) << d.binding;
+        EXPECT_EQ(shortcuts::byAction(d.action), d.id);
+    }
+    EXPECT_EQ(shortcuts::byAction("Mission Control"), shortcuts::kCount);   // not a real shortcut here
+    shortcuts::g_disabled = 0;
+    EXPECT_TRUE(shortcuts::enabled(shortcuts::kLock));
+    shortcuts::setEnabled(shortcuts::kLock, false);
+    EXPECT_FALSE(shortcuts::enabled(shortcuts::kLock));
+    EXPECT_TRUE(shortcuts::enabled(shortcuts::kClose));
+    shortcuts::setEnabled(shortcuts::kLock, true);
+    EXPECT_EQ(shortcuts::g_disabled.load(), 0u);
+}
+
+TEST(OptStorage, StaleMeansUntouchedFor30Days) {
+    const std::time_t now = 2'000'000'000, day = 86400;
+    EXPECT_TRUE(OptStorageService::isStale(now - 31 * day, now - 31 * day, now));
+    EXPECT_FALSE(OptStorageService::isStale(now - 31 * day, now - 2 * day, now));   // read recently
+    EXPECT_FALSE(OptStorageService::isStale(now - 2 * day, now - 31 * day, now));   // written recently
 }

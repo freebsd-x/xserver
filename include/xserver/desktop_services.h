@@ -90,6 +90,17 @@ public:
                               std::shared_ptr<IpcSocket> client) noexcept;
 };
 
+// com.freebsdx.DevOverlay — the compositor's GPU frame-time overlay (also
+// Super+F3): mode 1 shows it, 0 hides it. There's no repaint highlighting, so
+// mode 2 is refused and the real mode broadcast (the button snaps back).
+class DevOverlayService {
+public:
+    static void init(std::function<bool()> visible, std::function<void(bool)> show) noexcept;
+    static void notifyChanged() noexcept;   // after Super+F3
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
 // com.freebsdx.AudioEq — 5-band EQ (audio_eq.h) persisted in ConfigService
 // "audioeq.*"; init() installs the hook (AudioService::setEq in main) and
 // applies the saved settings.

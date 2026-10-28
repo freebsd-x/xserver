@@ -1,109 +1,100 @@
 #include "xserver/default_apps_service.h"
 #include "xserver/ipc_socket.h"
-#include <cstring>
-#include <iostream>
+#include "xserver/mime_service.h"
+#include "xserver/xbus_reply.h"
+#include "shared/logger.h"
 
-namespace fbx::xserver { void BroadcastXBusMessage(const shared::XBusMessage& msg); }
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace fbx::xserver {
 
-std::mutex                                  DefaultAppsService::mutex_;
-std::vector<DefaultAppsService::Category>   DefaultAppsService::categories_;
-bool                                        DefaultAppsService::loaded_ = false;
+namespace {
 
-void DefaultAppsService::load() noexcept {
-    if (loaded_) return;
-    loaded_ = true;
-    // Seed the category → handler table. A real implementation would read the
-    // MIME/association database. Each category lists its candidate handlers;
-    // idx points at the current default (0).
-    categories_ = {
-        {"Image Viewer", {"ImageViewer.xapp", "Browser.xapp"},                    0},
-        {"Music",        {"MusicPlayer.xapp", "Browser.xapp"},                    0},
-        {"PDF Viewer",   {"PDFViewer.xapp", "ImageViewer.xapp", "Browser.xapp"}, 0},
-        {"Text Editor",  {"Notes.xapp", "Terminal.xapp"},                         0},
-        {"Web Browser",  {"Browser.xapp", "Terminal.xapp"},                       0},
+using namespace svc;
+
+struct Category {
+    const char*              name;
+    std::vector<std::string> mimes;   // the first one represents the category
+};
+
+const std::vector<Category>& categories() {
+    static const std::vector<Category> kAll = {
+        {"Web Browser",  {"text/html"}},
+        {"Text Editor",  {"text/plain", "text/markdown"}},
+        {"Image Viewer", {"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml", "image/bmp"}},
+        {"Music",        {"audio/mpeg", "audio/flac", "audio/wav", "audio/ogg"}},
+        {"Video",        {"video/mp4", "video/x-matroska", "video/webm"}},
+        {"PDF Viewer",   {"application/pdf"}},
+        {"Archives",     {"application/zip", "application/x-tar", "application/gzip"}},
     };
+    return kAll;
 }
 
-void DefaultAppsService::broadcastChanged() noexcept {
-    shared::XBusMessage bcast{};
-    bcast.magic_ = shared::XBUS_MAGIC;
-    std::strncpy(bcast.service_name_, "com.freebsdx.DefaultApps",
-                 sizeof(bcast.service_name_) - 1);
-    bcast.opcode_ = static_cast<uint32_t>(shared::DefaultAppsOpcode::DefaultsChanged);
-    // No payload — the shell re-fetches the list.
-    BroadcastXBusMessage(bcast);
+// Categories some installed app handles.
+std::vector<const Category*> available() {
+    std::vector<const Category*> out;
+    for (const auto& c : categories())
+        if (!MimeService::allHandlers(c.mimes.front()).empty()) out.push_back(&c);
+    return out;
 }
+
+std::string label(const std::string& app_id) {
+    std::string n = MimeService::appName(app_id);
+    return n.empty() ? app_id : n;
+}
+
+}  // namespace
 
 bool DefaultAppsService::ProcessMessage(std::shared_ptr<IpcSocket> client,
                                         const shared::XBusMessage& msg) noexcept {
     if (std::strcmp(msg.service_name_, "com.freebsdx.DefaultApps") != 0) return false;
-
     using Op = shared::DefaultAppsOpcode;
-    std::lock_guard<std::mutex> lk(mutex_);
-    load();
-
-    shared::XBusMessage response = msg;
-
+    constexpr const char* kName = "com.freebsdx.DefaultApps";
     switch (static_cast<Op>(msg.opcode_)) {
-
     case Op::ListDefaults: {
-        uint32_t page = 0;
-        std::memcpy(&page, msg.payload_, sizeof(page));
-        const uint32_t total = static_cast<uint32_t>(categories_.size());
-
+        auto cats = available();
+        uint32_t page = readPage(msg);
         shared::DefaultAppPage pg{};
         pg.page_  = page;
-        pg.total_ = total;
-        if (page < total) {
-            const Category& c = categories_[page];
+        pg.total_ = static_cast<uint32_t>(cats.size());
+        if (page < cats.size()) {
             pg.valid_    = 1;
-            pg.has_more_ = (page + 1 < total) ? 1u : 0u;
-            std::strncpy(pg.category_, c.name.c_str(), sizeof(pg.category_) - 1);
-            if (!c.handlers.empty())
-                std::strncpy(pg.handler_, c.handlers[c.idx].c_str(),
-                             sizeof(pg.handler_) - 1);
-        } else {
-            pg.valid_    = 0;
-            pg.has_more_ = 0;
+            pg.has_more_ = page + 1 < cats.size() ? 1u : 0u;
+            std::strncpy(pg.category_, cats[page]->name, sizeof(pg.category_) - 1);
+            std::string h = label(MimeService::defaultHandler(cats[page]->mimes.front()));
+            std::strncpy(pg.handler_, h.c_str(), sizeof(pg.handler_) - 1);
         }
-        std::memset(response.payload_, 0, sizeof(response.payload_));
-        std::memcpy(response.payload_, &pg, sizeof(pg));
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
+        reply(msg, client, kName, msg.opcode_, &pg);
         break;
     }
-
     case Op::CycleDefault: {
         shared::DefaultAppRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         req.category_[sizeof(req.category_) - 1] = '\0';
-        bool found = false;
-        for (auto& c : categories_) {
-            if (c.name == req.category_) {
-                if (c.handlers.size() > 1)
-                    c.idx = (c.idx + 1) % static_cast<uint32_t>(c.handlers.size());
-                found = true;
-                std::cout << "[DefaultApps] Cycle '" << c.name << "' -> "
-                          << (c.handlers.empty() ? "(none)" : c.handlers[c.idx]) << "\n";
-                break;
-            }
+        bool ok = false;
+        for (const Category* c : available()) {
+            if (std::strcmp(c->name, req.category_) != 0) continue;
+            // Stable order (by name) so cycling visits every handler.
+            auto handlers = MimeService::allHandlers(c->mimes.front());
+            std::sort(handlers.begin(), handlers.end(),
+                      [](const std::string& a, const std::string& b) { return label(a) < label(b); });
+            std::string cur = MimeService::defaultHandler(c->mimes.front());
+            auto it = std::find(handlers.begin(), handlers.end(), cur);
+            size_t next = it == handlers.end() ? 0 : (static_cast<size_t>(it - handlers.begin()) + 1) % handlers.size();
+            for (const auto& mime : c->mimes) MimeService::setDefault(mime, handlers[next]);
+            LOG_INFO("DefaultAppsService: {} → {}", c->name, label(handlers[next]));
+            ok = true;
+            break;
         }
-        if (!found)
-            std::cout << "[DefaultApps] Cycle '" << req.category_ << "' (not found)\n";
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
-        if (found) broadcastChanged();
+        ack(msg, client, kName);
+        if (ok) broadcast<char>(kName, static_cast<uint32_t>(Op::DefaultsChanged), nullptr);
         break;
     }
-
-    default:
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
-        break;
+    default: break;
     }
-
     return true;
 }
 

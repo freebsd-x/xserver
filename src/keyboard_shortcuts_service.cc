@@ -1,106 +1,68 @@
 #include "xserver/keyboard_shortcuts_service.h"
+#include "xserver/config_service.h"
 #include "xserver/ipc_socket.h"
-#include <cstring>
-#include <iostream>
+#include "xserver/shortcuts.h"
+#include "xserver/xbus_reply.h"
+#include "shared/logger.h"
 
-namespace fbx::xserver { void BroadcastXBusMessage(const shared::XBusMessage& msg); }
+#include <cstdlib>
+#include <cstring>
+#include <string>
 
 namespace fbx::xserver {
 
-std::mutex                                      KeyboardShortcutsService::mutex_;
-std::vector<KeyboardShortcutsService::Shortcut> KeyboardShortcutsService::shortcuts_;
-bool                                            KeyboardShortcutsService::loaded_ = false;
+namespace {
+using namespace svc;
+constexpr const char* kDisabledKey = "shortcuts.disabled";
+constexpr uint32_t    kValidBits   = (1u << shortcuts::kCount) - 1;
+}  // namespace
 
-void KeyboardShortcutsService::load() noexcept {
-    if (loaded_) return;
-    loaded_ = true;
-    // Seed a plausible set of system shortcuts. A real implementation would read
-    // the keymap/config. binding_ is display-only; only enabled_ is toggleable.
-    shortcuts_ = {
-        {"Screenshot",      "Cmd+Shift+4", 1},
-        {"Lock Screen",     "Cmd+Ctrl+Q",  1},
-        {"Mission Control", "Ctrl+Up",     1},
-        {"Spotlight",       "Cmd+Space",   1},
-        {"Switch App",      "Cmd+Tab",     1},
-        {"Emoji Picker",    "Cmd+Ctrl+Sp", 0},
-    };
-}
-
-void KeyboardShortcutsService::broadcastChanged() noexcept {
-    shared::XBusMessage bcast{};
-    bcast.magic_ = shared::XBUS_MAGIC;
-    std::strncpy(bcast.service_name_, "com.freebsdx.KeyboardShortcuts",
-                 sizeof(bcast.service_name_) - 1);
-    bcast.opcode_ = static_cast<uint32_t>(shared::KeyboardShortcutOpcode::ShortcutsChanged);
-    // No payload — the shell re-fetches the list.
-    BroadcastXBusMessage(bcast);
+void KeyboardShortcutsService::init() noexcept {
+    uint32_t mask = static_cast<uint32_t>(std::strtoul(ConfigService::get(kDisabledKey, "0").c_str(), nullptr, 10));
+    shortcuts::g_disabled = mask & kValidBits;
 }
 
 bool KeyboardShortcutsService::ProcessMessage(std::shared_ptr<IpcSocket> client,
                                               const shared::XBusMessage& msg) noexcept {
     if (std::strcmp(msg.service_name_, "com.freebsdx.KeyboardShortcuts") != 0) return false;
-
     using Op = shared::KeyboardShortcutOpcode;
-    std::lock_guard<std::mutex> lk(mutex_);
-    load();
-
-    shared::XBusMessage response = msg;
-
+    constexpr const char* kName = "com.freebsdx.KeyboardShortcuts";
     switch (static_cast<Op>(msg.opcode_)) {
-
     case Op::ListShortcuts: {
-        uint32_t page = 0;
-        std::memcpy(&page, msg.payload_, sizeof(page));
-        const uint32_t total = static_cast<uint32_t>(shortcuts_.size());
-
+        uint32_t page = readPage(msg);
         shared::KeyShortcutPage pg{};
         pg.page_  = page;
-        pg.total_ = total;
-        if (page < total) {
-            const Shortcut& s = shortcuts_[page];
+        pg.total_ = shortcuts::kCount;
+        if (page < shortcuts::kCount) {
+            const auto& d = shortcuts::kAll[page];
             pg.valid_    = 1;
-            pg.has_more_ = (page + 1 < total) ? 1u : 0u;
-            std::strncpy(pg.action_,  s.action.c_str(),  sizeof(pg.action_)  - 1);
-            std::strncpy(pg.binding_, s.binding.c_str(), sizeof(pg.binding_) - 1);
-            pg.enabled_  = s.enabled;
-        } else {
-            pg.valid_    = 0;
-            pg.has_more_ = 0;
+            pg.has_more_ = page + 1 < shortcuts::kCount ? 1u : 0u;
+            std::strncpy(pg.action_, d.action, sizeof(pg.action_) - 1);
+            std::strncpy(pg.binding_, d.binding, sizeof(pg.binding_) - 1);
+            pg.enabled_ = shortcuts::enabled(d.id) ? 1u : 0u;
         }
-        std::memset(response.payload_, 0, sizeof(response.payload_));
-        std::memcpy(response.payload_, &pg, sizeof(pg));
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
+        reply(msg, client, kName, msg.opcode_, &pg);
         break;
     }
-
     case Op::SetShortcut: {
         shared::KeyShortcutRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         req.action_[sizeof(req.action_) - 1] = '\0';
-        bool found = false;
-        for (auto& s : shortcuts_) {
-            if (s.action == req.action_) {
-                s.enabled = req.enabled_ ? 1u : 0u;
-                found = true;
-                break;
-            }
+        shortcuts::Id id = shortcuts::byAction(req.action_);
+        bool ok = id != shortcuts::kCount;
+        if (ok) {
+            shortcuts::setEnabled(id, req.enabled_ != 0);
+            ConfigService::set(kDisabledKey, std::to_string(shortcuts::g_disabled.load()));
+            LOG_INFO("KeyboardShortcutsService: '{}' {}", req.action_, req.enabled_ ? "on" : "off");
+        } else {
+            LOG_WARN("KeyboardShortcutsService: no shortcut '{}'", req.action_);
         }
-        std::cout << "[KeyboardShortcuts] SetShortcut '" << req.action_ << "' -> "
-                  << (req.enabled_ ? "on" : "off")
-                  << (found ? "" : " (not found)") << "\n";
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
-        if (found) broadcastChanged();
+        ack(msg, client, kName);
+        if (ok) broadcast<char>(kName, static_cast<uint32_t>(Op::ShortcutsChanged), nullptr);
         break;
     }
-
-    default:
-        (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
-        break;
+    default: break;
     }
-
     return true;
 }
 

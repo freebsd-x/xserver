@@ -31,6 +31,12 @@
 #include "xserver/desktop_services.h"
 #include "xserver/ime_service.h"
 #include "xserver/login_items_service.h"
+#include "xserver/shortcuts.h"
+#include "xserver/mime_service.h"
+#include "xserver/opt_storage_service.h"
+#include "xserver/trusted_devices_service.h"
+#include "xserver/default_apps_service.h"
+#include "xserver/keyboard_shortcuts_service.h"
 #include "xserver/lock_service.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
@@ -103,6 +109,7 @@
 #include <chrono>
 #include <thread>
 #include <span>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -3346,6 +3353,164 @@ TEST_F(ServiceRoundtrip, LoginItemsAreRealAutostartEntries) {
     EXPECT_FALSE(std::filesystem::exists(entry));
     EXPECT_EQ(list(0, 0x4c100006).enabled_, 0u);
     AppPermsService::init(nullptr);
+}
+
+// ── Batch 10: fake services made real ─────────────────────────────────────────
+
+TEST_F(ServiceRoundtrip, KeyboardShortcutsAreTheRealOnesAndToggle) {
+    KeyboardShortcutsService::init();
+    auto p = makePipe();
+    auto get = [&](uint32_t page, uint32_t tid) {
+        XBusMessage req = makeReq("com.freebsdx.KeyboardShortcuts",
+                                  static_cast<uint32_t>(KeyboardShortcutOpcode::ListShortcuts), tid, &page, sizeof(page));
+        KeyboardShortcutsService::ProcessMessage(p.svc, req);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.KeyboardShortcuts",
+                                    static_cast<uint32_t>(KeyboardShortcutOpcode::ListShortcuts), tid);
+        KeyShortcutPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    KeyShortcutPage pg = get(shortcuts::kLock, 0x4b000001);
+    EXPECT_EQ(pg.total_, static_cast<uint32_t>(shortcuts::kCount));
+    EXPECT_STREQ(pg.action_, "Lock screen");
+    EXPECT_STREQ(pg.binding_, "Super+L");
+    EXPECT_EQ(pg.enabled_, 1u);
+
+    KeyShortcutRequest r{};
+    std::strncpy(r.action_, "Lock screen", sizeof(r.action_) - 1);
+    r.enabled_ = 0;
+    XBusMessage req = makeReq("com.freebsdx.KeyboardShortcuts",
+                              static_cast<uint32_t>(KeyboardShortcutOpcode::SetShortcut), 0x4b000002, &r, sizeof(r));
+    KeyboardShortcutsService::ProcessMessage(p.svc, req);
+    recvReply(p.peer, "com.freebsdx.KeyboardShortcuts",
+              static_cast<uint32_t>(KeyboardShortcutOpcode::SetShortcut), 0x4b000002);
+    EXPECT_FALSE(shortcuts::enabled(shortcuts::kLock));          // the key handler sees it
+    EXPECT_EQ(get(shortcuts::kLock, 0x4b000003).enabled_, 0u);
+    r.enabled_ = 1;
+    req = makeReq("com.freebsdx.KeyboardShortcuts",
+                  static_cast<uint32_t>(KeyboardShortcutOpcode::SetShortcut), 0x4b000004, &r, sizeof(r));
+    KeyboardShortcutsService::ProcessMessage(p.svc, req);
+    recvReply(p.peer, "com.freebsdx.KeyboardShortcuts",
+              static_cast<uint32_t>(KeyboardShortcutOpcode::SetShortcut), 0x4b000004);
+    EXPECT_TRUE(shortcuts::enabled(shortcuts::kLock));
+}
+
+TEST_F(ServiceRoundtrip, DefaultAppsFollowMimeHandlersAndCycleAll) {
+    std::string apps = home_ + "/apps";
+    writeHomeFile(apps + "/TextEditor.xapp/manifest.json",
+                  R"({"name": "TextEditor", "identifier": "com.freebsdx.texteditor", "mime_types": ["text/plain", "text/html"]})");
+    writeHomeFile(apps + "/Notes.xapp/manifest.json",
+                  R"({"name": "Notes", "identifier": "com.freebsdx.notes", "mime_types": ["text/plain"]})");
+    writeHomeFile(apps + "/Viewer.xapp/manifest.json",
+                  R"({"name": "Viewer", "identifier": "com.freebsdx.viewer", "mime_types": ["text/plain"]})");
+    MimeService::loadFromAppsDir(apps);
+
+    auto p = makePipe();
+    auto find = [&](const char* cat) {
+        for (uint32_t page = 0; page < 10; ++page) {
+            XBusMessage req = makeReq("com.freebsdx.DefaultApps", static_cast<uint32_t>(DefaultAppsOpcode::ListDefaults),
+                                      0x44000100 + page, &page, sizeof(page));
+            DefaultAppsService::ProcessMessage(p.svc, req);
+            XBusMessage rep = recvReply(p.peer, "com.freebsdx.DefaultApps",
+                                        static_cast<uint32_t>(DefaultAppsOpcode::ListDefaults), 0x44000100 + page);
+            DefaultAppPage pg{};
+            std::memcpy(&pg, rep.payload_, sizeof(pg));
+            if (!pg.valid_) break;
+            if (std::strcmp(pg.category_, cat) == 0) return std::string(pg.handler_);
+        }
+        return std::string("<none>");
+    };
+    EXPECT_EQ(find("Music"), "<none>");                // no installed app plays music → not listed
+    EXPECT_NE(find("Web Browser"), "<none>");
+    std::set<std::string> seen{find("Text Editor")};
+    for (int i = 0; i < 3; ++i) {
+        DefaultAppRequest r{};
+        std::strncpy(r.category_, "Text Editor", sizeof(r.category_) - 1);
+        XBusMessage req = makeReq("com.freebsdx.DefaultApps", static_cast<uint32_t>(DefaultAppsOpcode::CycleDefault),
+                                  0x44000200 + i, &r, sizeof(r));
+        DefaultAppsService::ProcessMessage(p.svc, req);
+        recvReply(p.peer, "com.freebsdx.DefaultApps", static_cast<uint32_t>(DefaultAppsOpcode::CycleDefault), 0x44000200 + i);
+        seen.insert(find("Text Editor"));
+    }
+    EXPECT_EQ(seen, (std::set<std::string>{"Notes", "TextEditor", "Viewer"}));   // visits every handler
+}
+
+TEST_F(ServiceRoundtrip, TrustedDevicesNoLongerInvented) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.TrustedDevices", static_cast<uint32_t>(TrustedDeviceOpcode::ListDevices),
+                              0x54000001, &page, sizeof(page));
+    TrustedDevicesService::ProcessMessage(p.svc, req);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.TrustedDevices",
+                                static_cast<uint32_t>(TrustedDeviceOpcode::ListDevices), 0x54000001);
+    TrustedDevicePage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    EXPECT_EQ(pg.valid_, pg.total_ > 0 ? 1u : 0u);
+    EXPECT_EQ(std::string(pg.device_name_).find("iPhone"), std::string::npos);
+}
+
+TEST_F(ServiceRoundtrip, OptStorageMeasuresAndClearsOnlyOldCacheFiles) {
+    std::string cache = home_ + "/.cache";
+    writeHomeFile(cache + "/app/old.bin", std::string(2 << 20, 'o'));   // 2 MB, untouched for 40 days
+    writeHomeFile(cache + "/app/new.bin", "fresh");
+    writeHomeFile(home_ + "/precious.txt", "keep me");
+    std::filesystem::create_symlink(home_ + "/precious.txt", cache + "/link");
+    struct timespec old[2] = {{std::time(nullptr) - 40 * 86400, 0}, {std::time(nullptr) - 40 * 86400, 0}};
+    ::utimensat(AT_FDCWD, (cache + "/app/old.bin").c_str(), old, 0);
+    ::utimensat(AT_FDCWD, (home_ + "/precious.txt").c_str(), old, 0);
+
+    auto p = makePipe();
+    auto getState = [&](uint32_t tid) {
+        XBusMessage req = makeReq("com.freebsdx.OptStorage", static_cast<uint32_t>(OptStorageOpcode::GetState), tid);
+        OptStorageService::ProcessMessage(p.svc, req);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.OptStorage",
+                                    static_cast<uint32_t>(OptStorageOpcode::GetState), tid);
+        OptStorageState st{};
+        std::memcpy(&st, rep.payload_, sizeof(st));
+        return st;
+    };
+    getState(0x4f000001);                                  // kicks a scan
+    OptStorageState st{};
+    for (int i = 0; i < 100 && st.reclaimable_mb_ != 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        st = getState(0x4f000100 + i);
+    }
+    EXPECT_EQ(st.reclaimable_mb_, 2u);                     // the 2 MB old file only
+
+    OptStorageRequest r{};
+    r.enabled_ = 1;
+    r.target_pct_ = 100;                                   // always "below target" → clean now
+    XBusMessage req = makeReq("com.freebsdx.OptStorage", static_cast<uint32_t>(OptStorageOpcode::SetState),
+                              0x4f000002, &r, sizeof(r));
+    OptStorageService::ProcessMessage(p.svc, req);
+    recvReply(p.peer, "com.freebsdx.OptStorage", static_cast<uint32_t>(OptStorageOpcode::SetState), 0x4f000002);
+    for (int i = 0; i < 100 && std::filesystem::exists(cache + "/app/old.bin"); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(std::filesystem::exists(cache + "/app/old.bin"));
+    EXPECT_TRUE(std::filesystem::exists(cache + "/app/new.bin"));
+    EXPECT_TRUE(std::filesystem::exists(home_ + "/precious.txt"));      // symlink target untouched
+    EXPECT_TRUE(std::filesystem::is_symlink(cache + "/link"));
+    for (int i = 0; i < 50; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));   // let the worker finish
+}
+
+TEST_F(ServiceRoundtrip, DevOverlayDrivesTheGpuOverlay) {
+    bool visible = false;
+    DevOverlayService::init([&] { return visible; }, [&](bool on) { visible = on; });
+    auto p = makePipe();
+    auto set = [&](uint32_t mode, uint32_t tid) {
+        DevOverlayRequest r{};
+        r.mode_ = mode;
+        XBusMessage req = makeReq("com.freebsdx.DevOverlay", static_cast<uint32_t>(DevOverlayOpcode::SetMode), tid, &r, sizeof(r));
+        DevOverlayService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.DevOverlay", static_cast<uint32_t>(DevOverlayOpcode::SetMode), tid);
+    };
+    set(1, 0x4d000001);
+    EXPECT_TRUE(visible);
+    set(2, 0x4d000002);                                    // Repaint: unsupported, no change
+    EXPECT_TRUE(visible);
+    set(0, 0x4d000003);
+    EXPECT_FALSE(visible);
+    DevOverlayService::init(nullptr, nullptr);
 }
 
 }  // namespace

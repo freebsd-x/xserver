@@ -1,4 +1,5 @@
 #include "xserver/input_manager.h"
+#include "xserver/shortcuts.h"
 #include <iostream>
 #include <algorithm>
 #include <cerrno>
@@ -280,7 +281,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // DASHBOARD TOGGLE: Super + C (Keycode 46)
-            if (key == 46 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kDashboard) && key == 46 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 std::cout << "[input_manager] DASHBOARD TOGGLE REQUESTED (Super+C).\n";
                 messages.push_back({
                     .type_ = shared::InputEventType::DashboardToggle,
@@ -291,7 +292,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // COLOR PICKER TOGGLE: Super + P (Keycode 25)
-            if (key == 25 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kColorPicker) && key == 25 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 std::cout << "[input_manager] COLOR PICKER TOGGLE (Super+P).\n";
                 messages.push_back({
                     .type_ = shared::InputEventType::ColorPickerToggle,
@@ -300,7 +301,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // CLIPBOARD HISTORY TOGGLE: Super + V (Keycode 47)
-            if (key == 47 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kClipboard) && key == 47 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 std::cout << "[input_manager] CLIPBOARD HISTORY TOGGLE (Super+V).\n";
                 messages.push_back({
                     .type_ = shared::InputEventType::ClipboardHistoryToggle,
@@ -311,7 +312,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // SEARCH TOGGLE: Super + Space (Keycode 57)
-            if (key == 57 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kSearch) && key == 57 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 std::cout << "[input_manager] SEARCH TOGGLE REQUESTED (Super+Space).\n";
                 messages.push_back({
                     .type_ = shared::InputEventType::SearchToggle,
@@ -322,7 +323,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // WORKSPACE SWITCH: Super + 1..9 (Keycodes 2..10)
-            if (key >= 2 && key <= 10 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kWorkspaces) && key >= 2 && key <= 10 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 int ws_index = key - 2;
                 std::cout << "[input_manager] WORKSPACE SWITCH: " << (ws_index + 1) << "\n";
                 messages.push_back({
@@ -334,7 +335,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // ALT+TAB / ALT+SHIFT+TAB: cycle window focus (Tab keycode = 15)
-            if (key == 15 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 4)) {
+            if (shortcuts::enabled(shortcuts::kSwitchWindows) && key == 15 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 4)) {
                 int direction = (modifiers_ & 1) ? -1 : 1; // Shift = backward
                 messages.push_back({
                     .type_      = shared::InputEventType::CycleFocus,
@@ -355,7 +356,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // MOVE WINDOW TO ADJACENT OUTPUT: Super + Shift + Left/Right (Keycodes 105, 106)
-            if ((key == 105 || key == 106) && state == LIBINPUT_KEY_STATE_PRESSED
+            if (shortcuts::enabled(shortcuts::kSnap) && (key == 105 || key == 106) && state == LIBINPUT_KEY_STATE_PRESSED
                     && (modifiers_ & 8) && (modifiers_ & 1)) {
                 int direction = (key == 105) ? -1 : 1;
                 std::cout << "[input_manager] MOVE WINDOW TO OUTPUT (Super+Shift+"
@@ -369,7 +370,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // WORKSPACE SLIDE: Super + Left/Right (no Shift) (Keycodes 105, 106)
-            if ((key == 105 || key == 106) && state == LIBINPUT_KEY_STATE_PRESSED
+            if (shortcuts::enabled(shortcuts::kWorkspaces) && (key == 105 || key == 106) && state == LIBINPUT_KEY_STATE_PRESSED
                     && (modifiers_ & 8) && !(modifiers_ & 1)) {
                 int direction = (key == 105) ? -1 : 1;
                 messages.push_back({
@@ -381,7 +382,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // SNAP MAXIMIZE: Super + Up (Keycode 103, no Shift)
-            if (key == 103 && state == LIBINPUT_KEY_STATE_PRESSED
+            if (shortcuts::enabled(shortcuts::kSnap) && key == 103 && state == LIBINPUT_KEY_STATE_PRESSED
                     && (modifiers_ & 8) && !(modifiers_ & 1)) {
                 messages.push_back({
                     .type_      = shared::InputEventType::SnapWindow,
@@ -392,7 +393,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // SNAP RESTORE: Super + Down (Keycode 108, no Shift)
-            if (key == 108 && state == LIBINPUT_KEY_STATE_PRESSED
+            if (shortcuts::enabled(shortcuts::kSnap) && key == 108 && state == LIBINPUT_KEY_STATE_PRESSED
                     && (modifiers_ & 8) && !(modifiers_ & 1)) {
                 messages.push_back({
                     .type_      = shared::InputEventType::SnapWindow,
@@ -403,7 +404,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // SNAP LEFT: Super + Left (Keycode 105)
-            if (key == 105 && state == LIBINPUT_KEY_STATE_PRESSED
+            if (shortcuts::enabled(shortcuts::kSnap) && key == 105 && state == LIBINPUT_KEY_STATE_PRESSED
                     && (modifiers_ & 8) && !(modifiers_ & 1)) {
                 messages.push_back({
                     .type_      = shared::InputEventType::SnapWindow,
@@ -414,7 +415,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // SNAP RIGHT: Super + Right (Keycode 106)
-            if (key == 106 && state == LIBINPUT_KEY_STATE_PRESSED
+            if (shortcuts::enabled(shortcuts::kSnap) && key == 106 && state == LIBINPUT_KEY_STATE_PRESSED
                     && (modifiers_ & 8) && !(modifiers_ & 1)) {
                 messages.push_back({
                     .type_      = shared::InputEventType::SnapWindow,
@@ -425,7 +426,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // QUARTER-SNAP: Super + Shift + arrow  (value_a_: 4=TL 5=TR 6=BL 7=BR)
-            if (state == LIBINPUT_KEY_STATE_PRESSED
+            if (shortcuts::enabled(shortcuts::kSnap) && state == LIBINPUT_KEY_STATE_PRESSED
                     && (modifiers_ & 8) && (modifiers_ & 1)) {  // Super + Shift
                 int qa = -1;
                 if      (key == 105) qa = 4; // Left  → top-left
@@ -444,7 +445,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // LAYOUT CYCLE: Super + A (Keycode 30)
-            if (key == 30 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kTiling) && key == 30 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 std::cout << "[input_manager] LAYOUT CYCLE REQUESTED (Super+A).\n";
                 messages.push_back({
                     .type_ = shared::InputEventType::WorkspaceSwitch,
@@ -456,7 +457,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
 
             // MASTER RATIO: Super+H shrink (35), Super+L grow (38) — tiling mode.
             // (Super WITHOUT Shift; Super+Shift+H/L is directional focus below.)
-            if ((key == 35 || key == 38) && state == LIBINPUT_KEY_STATE_PRESSED &&
+            if (shortcuts::enabled(shortcuts::kTiling) && (key == 35 || key == 38) && state == LIBINPUT_KEY_STATE_PRESSED &&
                 (modifiers_ & 8) && !(modifiers_ & 1)) {
                 messages.push_back({
                     .type_      = shared::InputEventType::WorkspaceSwitch,
@@ -467,7 +468,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // DIRECTIONAL FOCUS: Super+Shift+H/J/K/L (vim: 35/36/37/38 = L/D/U/R).
-            if ((modifiers_ & 8) && (modifiers_ & 1) &&
+            if (shortcuts::enabled(shortcuts::kTiling) && (modifiers_ & 8) && (modifiers_ & 1) &&
                 state == LIBINPUT_KEY_STATE_PRESSED &&
                 (key == 35 || key == 36 || key == 37 || key == 38)) {
                 int dir = key == 35 ? 0 : key == 36 ? 3 : key == 37 ? 2 : 1; // L/D/U/R
@@ -480,7 +481,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // SWAP WITH MASTER: Super+M (keycode 50) — tiling "zoom".
-            if (key == 50 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kTiling) && key == 50 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 messages.push_back({
                     .type_      = shared::InputEventType::WorkspaceSwitch,
                     .value_a_   = -5,               // -5 = swap focused with master
@@ -490,7 +491,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // DEBUG OVERLAY TOGGLE: Super + F3 (Keycode 61)
-            if (key == 61 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kDebugOverlay) && key == 61 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 std::cout << "[input_manager] DEBUG OVERLAY TOGGLE (Super+F3).\n";
                 messages.push_back({
                     .type_      = shared::InputEventType::DebugOverlayToggle,
@@ -501,7 +502,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // SHORTCUT HELP TOGGLE: Super + / (Keycode 53)
-            if (key == 53 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kHelp) && key == 53 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 std::cout << "[input_manager] SHORTCUT HELP TOGGLE (Super+/).\n";
                 messages.push_back({
                     .type_      = shared::InputEventType::ShortcutHelpToggle,
@@ -512,7 +513,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             }
 
             // QUICK NOTE TOGGLE: Super + N (Keycode 49)
-            if (key == 49 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
+            if (shortcuts::enabled(shortcuts::kQuickNote) && key == 49 && state == LIBINPUT_KEY_STATE_PRESSED && (modifiers_ & 8)) {
                 std::cout << "[input_manager] QUICK NOTE TOGGLE (Super+N).\n";
                 messages.push_back({
                     .type_      = shared::InputEventType::QuickNoteToggle,
@@ -538,7 +539,7 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
 
             // KEY_SYSRQ (99) = Print Screen — screenshot shortcuts.
             // Plain Print = full-screen capture; Shift+Print = region selector.
-            if (key == 99 && state == LIBINPUT_KEY_STATE_PRESSED) {
+            if (shortcuts::enabled(shortcuts::kScreenshot) && key == 99 && state == LIBINPUT_KEY_STATE_PRESSED) {
                 bool shifted = (modifiers_ & 1) != 0;
                 messages.push_back({
                     .type_      = shifted

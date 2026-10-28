@@ -1,4 +1,6 @@
 #include "xserver/hardware_service.h"
+#include "xserver/async_shell.h"
+#include "xserver/backlight.h"
 #include "xserver/ipc_socket.h"
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -98,11 +100,14 @@ shared::HardwareStatus HardwareService::getStatus() noexcept {
         status.battery_state_ = static_cast<uint32_t>(state);
     }
 
-    // 3. Query Backlight (Mocked if hardware not present)
-    int brightness = 80;
+    // 3. Query Backlight: ACPI video if present, else backlight(8)
+    //    (/dev/backlight*, group video — what this laptop uses).
+    int brightness = 0;
     len = sizeof(brightness);
     if (sysctlbyname("hw.acpi.video.lcd0.brightness", &brightness, &len, nullptr, 0) == 0) {
         status.backlight_level_ = static_cast<uint32_t>(brightness);
+    } else if (int b = backlight::parseBrightness(spawnCapture("backlight 2>/dev/null")); b >= 0) {
+        status.backlight_level_ = static_cast<uint32_t>(b);
     }
 
     // 4. Query volume from /dev/mixer

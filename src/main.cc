@@ -5,6 +5,8 @@
 #include "xserver/seat_manager.h"
 #include "xserver/xsessiond_device.h"
 #include "xserver/input_manager.h"
+#include <spawn.h>
+#include "xserver/shortcuts.h"
 #include "xserver/scrolldir_service.h"
 #include "xserver/touchpad_service.h"
 #include "xserver/pointer_service.h"
@@ -29,6 +31,8 @@
 #include "xserver/device_services.h"
 #include "xserver/personal_services.h"
 #include "xserver/desktop_services.h"
+#include "xserver/keyboard_shortcuts_service.h"
+#include "xserver/opt_storage_service.h"
 #include "xserver/notif_services.h"
 #include "xserver/lock_service.h"
 #include "xserver/screensaver_service.h"
@@ -91,6 +95,8 @@
 #include <cstring>
 #include <drm_fourcc.h>
 #include "xwayland-bridge/wayland_bridge.h"
+
+extern "C" char** environ;  // POSIX doesn't guarantee a header declares it
 
 namespace shared = fbx::shared; // allows shared::XYZ qualified access
 using namespace fbx::shared;    // allows unqualified Logger, RenderMessage, etc.
@@ -473,6 +479,8 @@ int main(int argc, char** argv) {
         [](const std::string& app, const std::string& path) { AudioService::getInstance().setAppRoute(app, path); },
         nullptr,
     });
+    // Saved shortcut on/off switches (com.freebsdx.KeyboardShortcuts).
+    KeyboardShortcutsService::init();
     // Saved EQ → the audio mixer (com.freebsdx.AudioEq).
     AudioEqService::init([](const eq::Gains& g) { AudioService::getInstance().setEq(g); });
     // Restore the saved auto-lock policy (com.freebsdx.ScreenLock).
@@ -522,6 +530,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::shared_ptr<VulkanCompositor> comp = std::move(comp_res.value());
+    // Settings → Developer overlay drives the GPU frame-time overlay (Super+F3).
+    DevOverlayService::init([c = comp.get()] { return c->isDebugOverlayVisible(); },
+                            [c = comp.get()](bool on) { if (c->isDebugOverlayVisible() != on) c->toggleDebugOverlay(); });
 
     // Give ScreenshotService a back-pointer to the compositor for captureToShm().
     ScreenshotService::getInstance().setCompositor(comp.get());
@@ -1200,6 +1211,7 @@ int main(int argc, char** argv) {
     (void)loop->addTimer(4, 10000, []() {
         ScreenSaverService::pollIdle();
         LockService::pollIdle();
+        OptStorageService::poll();   // ≤ hourly: old-cache measurement / cleanup
     });
 
     // Poll calendar reminders and delayed screenshots every second (timer id=5).
@@ -1758,6 +1770,7 @@ int main(int argc, char** argv) {
                         comp->toggleDebugOverlay();
                         std::cout << "[xserver] Debug overlay: "
                                   << (comp->isDebugOverlayVisible() ? "ON" : "OFF") << "\n";
+                        DevOverlayService::notifyChanged();
                     }
 
                     // --- XF86 playback media keys → MediaPlayerService broadcast ---
@@ -1772,21 +1785,36 @@ int main(int argc, char** argv) {
                     }
 
                     // --- Super+Enter: launch terminal ---
-                    if (msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
-                        && msg.value_b_ != 0 && msg.value_a_ == 28) {
-                        if (fork() == 0) {
-                            setenv("LD_LIBRARY_PATH", "./out", 1);
-                            setenv("XBUS_SOCKET", kSocketPath, 1);
-                            if (access("./out/terminal", X_OK) == 0)
-                                execl("./out/terminal", "terminal", nullptr);
-                            exit(1);
+                    if (shortcuts::enabled(shortcuts::kTerminal)
+                        && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
+                        && msg.value_b_ != 0 && msg.value_a_ == 28
+                        && access("./out/terminal", X_OK) == 0) {
+                        // posix_spawn, not fork+setenv: the compositor is
+                        // multithreaded, and the child may only run
+                        // async-signal-safe code before exec.
+                        std::vector<std::string> env;
+                        for (char** e = environ; e && *e; ++e) {
+                            std::string_view kv(*e);
+                            if (kv.starts_with("LD_LIBRARY_PATH=") || kv.starts_with("XBUS_SOCKET=")) continue;
+                            env.emplace_back(kv);
                         }
+                        env.push_back("LD_LIBRARY_PATH=./out");
+                        env.push_back(std::string("XBUS_SOCKET=") + kSocketPath);
+                        std::vector<char*> envp;
+                        for (auto& kv : env) envp.push_back(kv.data());
+                        envp.push_back(nullptr);
+                        char arg0[] = "terminal";
+                        char* argv[] = {arg0, nullptr};
+                        pid_t pid = -1;
+                        if (posix_spawn(&pid, "./out/terminal", nullptr, nullptr, argv, envp.data()) != 0)
+                            std::cerr << "[xserver] Super+Enter: can't start the terminal\n";
                     }
 
                     // --- Super+Q: close the focused app window (reliable keyboard
                     // fallback for the small title-bar close button). Never closes
                     // the shell (999). Mirrors the title-bar close path. ---
-                    if (msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
+                    if (shortcuts::enabled(shortcuts::kClose)
+                        && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
                         && msg.value_b_ != 0 && msg.value_a_ == 16 /* KEY_Q */) {
                         uint32_t fid = focused_surface;
                         if (fid != 0 && fid != 999 && g_surface_clients.contains(fid)) {
@@ -1804,7 +1832,7 @@ int main(int argc, char** argv) {
 
                     // --- Super+L: lock the screen (spawns the lock screen via
                     // LockService, same path as the Quick Settings Lock button). ---
-                    if (msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
+                    if (shortcuts::enabled(shortcuts::kLock) && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
                         && msg.value_b_ != 0 && msg.value_a_ == 38 /* KEY_L */) {
                         LockService::lock();
                     }
