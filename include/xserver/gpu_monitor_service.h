@@ -15,4 +15,13 @@ public:
                               std::shared_ptr<IpcSocket> client) noexcept;
 };
 
+// com.freebsdx.GpuStats — the AC card's 2 s poll (GpuOpcode::GetStats →
+// GpuStats). Same source as GpuMonitor: the name is real, temp_c_ is
+// INT32_MIN (no sensor) and the other counters are 0.
+class GpuStatsService {
+public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
 }  // namespace fbx::xserver

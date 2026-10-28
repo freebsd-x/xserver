@@ -11,6 +11,7 @@
 // recent result (at worst one poll stale — fine for status widgets).
 
 #include <string>
+#include <vector>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -72,6 +73,20 @@ inline int spawnStatus(const std::string& cmd) noexcept {
     pid_t pid = -1;
     if (::posix_spawn(&pid, "/bin/sh", nullptr, nullptr,
                       const_cast<char* const*>(argv), environ) != 0) return -1;
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// posix_spawn a fixed argv (no shell — wire-supplied arguments can't be
+// interpreted) and wait; returns the exit status, or -1. argv[0] is a path.
+inline int spawnArgvStatus(const std::vector<std::string>& args) noexcept {
+    if (args.empty()) return -1;
+    std::vector<char*> argv;
+    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    if (::posix_spawn(&pid, argv[0], nullptr, nullptr, argv.data(), environ) != 0) return -1;
     int status = 0;
     if (::waitpid(pid, &status, 0) < 0) return -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;

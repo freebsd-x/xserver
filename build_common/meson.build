@@ -202,6 +202,7 @@ xbus_service_srcs = files(
   '../src/sysadmin_services.cc',
   '../src/user_services.cc',
   '../src/device_services.cc',
+  '../src/infra_services.cc',
   '../src/battery_health_service.cc',
   '../src/audio_output_service.cc',
   '../src/gpu_monitor_service.cc',

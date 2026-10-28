@@ -65,19 +65,6 @@ bool writeFileAtomic(const std::string& path, const std::string& content, mode_t
     return false;
 }
 
-// posix_spawn a fixed argv (no shell) and wait; exit status or -1. Not
-// fork/system: those deadlock the threaded compositor (see async_shell.h).
-int spawnArgv(const std::vector<std::string>& args) {
-    std::vector<char*> argv;
-    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-    argv.push_back(nullptr);
-    pid_t pid = -1;
-    if (::posix_spawn(&pid, argv[0], nullptr, nullptr, argv.data(), environ) != 0) return -1;
-    int status = 0;
-    if (::waitpid(pid, &status, 0) < 0) return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
 // ── Cron ─────────────────────────────────────────────────────────────────────
 
 constexpr const char* kCronName = "com.freebsdx.CronJobs";
@@ -96,7 +83,7 @@ bool installCrontab(const std::string& text) {
     if (fd < 0) return false;
     bool ok = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
     ::close(fd);
-    ok = ok && spawnArgv({"/usr/bin/crontab", path}) == 0;
+    ok = ok && spawnArgvStatus({"/usr/bin/crontab", path}) == 0;
     ::unlink(path);
     return ok;
 }
@@ -273,7 +260,7 @@ void CronJobsService::handleMessage(const shared::XBusMessage& msg,
             std::string cmd = userdata::cronRunnableCommand(j.command);
             // daemon(8) detaches (and nulls stdio) so a long job never ties
             // up the compositor; the user's own uid, same as cron would.
-            int rc = spawnArgv({"/usr/sbin/daemon", "-f", "/bin/sh", "-c", cmd});
+            int rc = spawnArgvStatus({"/usr/sbin/daemon", "-f", "/bin/sh", "-c", cmd});
             LOG_INFO("CronJobsService: run job {} '{}' ({})", j.line, cmd, rc);
             break;
         }

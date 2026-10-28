@@ -25,6 +25,7 @@
 #include "xserver/sysadmin_services.h"
 #include "xserver/user_services.h"
 #include "xserver/device_services.h"
+#include "xserver/infra_services.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -85,6 +86,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sstream>
+#include <climits>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -2526,6 +2529,100 @@ TEST_F(ServiceRoundtrip, InputDeviceListAndPerDeviceSpeed) {
     ASSERT_EQ(applied.size(), 1u);
     EXPECT_EQ(std::get<1>(applied[0]), 80u);
     InputDeviceService::init(nullptr, nullptr);
+}
+
+// ── Batch 4: NetworkShare(s) / VirtualMachines / Containers / GpuStats ────────
+
+TEST_F(ServiceRoundtrip, NetworkSharesListFraming) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.NetworkShares",
+                              static_cast<uint32_t>(NetworkShareOpcode::ListShares), 0x6e000001, &page, sizeof(page));
+    NetworkSharesService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.NetworkShares",
+                                static_cast<uint32_t>(NetworkShareOpcode::ListShares), 0x6e000001);
+    NetworkSharePage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    EXPECT_LE(pg.count_, 2u);
+    EXPECT_EQ(pg.has_more_, pg.total_ > 2 ? 1u : 0u);
+    for (uint32_t i = 0; i < pg.count_; ++i) {
+        std::string type(pg.entries_[i].type_);
+        EXPECT_TRUE(type == "SMB" || type == "NFS") << type;
+    }
+}
+
+// Every request here is refused before anything is spawned, so nothing mounts.
+TEST_F(ServiceRoundtrip, NetworkShareMountRefusalsCarryStatus) {
+    auto p = makePipe();
+    auto mount = [&](const char* host, const char* share, const char* mp, const char* pass,
+                     uint32_t proto, uint32_t tid) {
+        NetworkShareMountRequest r{};
+        std::strncpy(r.host_, host, sizeof(r.host_) - 1);
+        std::strncpy(r.share_, share, sizeof(r.share_) - 1);
+        std::strncpy(r.mountpoint_, mp, sizeof(r.mountpoint_) - 1);
+        std::strncpy(r.password_, pass, sizeof(r.password_) - 1);
+        r.protocol_ = proto;
+        XBusMessage req = makeReq("com.freebsdx.NetworkShare",
+                                  static_cast<uint32_t>(NetworkShareMountOpcode::Mount), tid, &r, sizeof(r));
+        NetworkShareService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.NetworkShare",
+                                    static_cast<uint32_t>(NetworkShareMountOpcode::Mount), tid);
+        uint32_t st = 0;
+        std::memcpy(&st, rep.payload_, sizeof(st));
+        return st;
+    };
+    EXPECT_EQ(mount("-oexec", "/x", "/tmp", "", 1, 0x6e100001), static_cast<uint32_t>(EINVAL));
+    EXPECT_EQ(mount("nas", "/../etc", "/tmp", "", 1, 0x6e100002), static_cast<uint32_t>(EINVAL));
+    EXPECT_EQ(mount("nas", "media", "/tmp", "secret", 0, 0x6e100003), static_cast<uint32_t>(ENOTSUP));
+    uint32_t st = mount("nas", "/export", (home_ + "/no-such-dir").c_str(), "", 1, 0x6e100004);
+    EXPECT_TRUE(st == static_cast<uint32_t>(EPERM) || st == static_cast<uint32_t>(ENOTDIR)) << st;
+
+    NetworkShareRequest u{};
+    u.share_id_ = 0xdeadbeef;
+    XBusMessage req = makeReq("com.freebsdx.NetworkShare",
+                              static_cast<uint32_t>(NetworkShareMountOpcode::Unmount), 0x6e100005, &u, sizeof(u));
+    NetworkShareService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.NetworkShare",
+                                static_cast<uint32_t>(NetworkShareMountOpcode::Unmount), 0x6e100005);
+    uint32_t ust = 0;
+    std::memcpy(&ust, rep.payload_, sizeof(ust));
+    EXPECT_EQ(ust, static_cast<uint32_t>(ENOENT));
+}
+
+TEST_F(ServiceRoundtrip, VmsAndContainersListFraming) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.VirtualMachines",
+                              static_cast<uint32_t>(VmOpcode::ListVMs), 0x76000001, &page, sizeof(page));
+    VirtualMachinesService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.VirtualMachines",
+                                static_cast<uint32_t>(VmOpcode::ListVMs), 0x76000001);
+    VmPage vp{};
+    std::memcpy(&vp, rep.payload_, sizeof(vp));
+    expectPageInvariants(vp, 0);
+    for (uint32_t i = 0; i < vp.count_; ++i) EXPECT_STREQ(vp.entries_[i].type_, "bhyve");
+
+    req = makeReq("com.freebsdx.Containers",
+                  static_cast<uint32_t>(ContainerOpcode::ListContainers), 0x63100001, &page, sizeof(page));
+    ContainersService::handleMessage(req, p.svc);
+    rep = recvReply(p.peer, "com.freebsdx.Containers",
+                    static_cast<uint32_t>(ContainerOpcode::ListContainers), 0x63100001);
+    ContainerPage cp{};
+    std::memcpy(&cp, rep.payload_, sizeof(cp));
+    expectPageInvariants(cp, 0);
+}
+
+TEST_F(ServiceRoundtrip, GpuStatsNameAndNoTempSensor) {
+    auto p = makePipe();
+    XBusMessage req = makeReq("com.freebsdx.GpuStats",
+                              static_cast<uint32_t>(GpuOpcode::GetStats), 0x67000001);
+    GpuStatsService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.GpuStats",
+                                static_cast<uint32_t>(GpuOpcode::GetStats), 0x67000001);
+    GpuStats st{};
+    std::memcpy(&st, rep.payload_, sizeof(st));
+    EXPECT_NE(st.name_[0], '\0');
+    EXPECT_EQ(st.temp_c_, INT32_MIN);
 }
 
 }  // namespace
