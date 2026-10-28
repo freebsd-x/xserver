@@ -1185,9 +1185,10 @@ int main(int argc, char** argv) {
         LockService::pollIdle();
     });
 
-    // Poll calendar reminders every second (timer id=5).
+    // Poll calendar reminders and delayed screenshots every second (timer id=5).
     (void)loop->addTimer(5, 1000, []() {
         CalendarService::pollReminders();
+        ScreenCaptureService::poll();   // delayed screenshots
     });
 
 

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <climits>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -333,6 +334,106 @@ void CapturesService::handleMessage(const shared::XBusMessage& msg,
         }
         ack(msg, client, kCapturesName);
         if (ok) broadcast<char>(kCapturesName, static_cast<uint32_t>(O::CapturesChanged), nullptr);
+        break;
+    }
+    default: break;
+    }
+}
+
+// ── ScreenCaptureService ─────────────────────────────────────────────────────
+
+namespace {
+
+constexpr const char* kScreenCaptureName = "com.freebsdx.ScreenCapture";
+constexpr uint32_t    kMaxCaptureDelay = 60;
+
+std::time_t g_capture_due = 0;   // pending delayed capture (0 = none)
+
+shared::ScreenCapturePageFlat capturePage(const std::vector<CaptureFile>& files, uint32_t page) {
+    shared::ScreenCapturePageFlat pg{};
+    pg.page_  = page;
+    pg.total_ = static_cast<uint32_t>(files.size());
+    if (page >= files.size()) return pg;
+    const auto& f = files[page];
+    pg.valid_    = 1;
+    pg.has_more_ = page + 1 < files.size() ? 1u : 0u;
+    std::string path = captureDirs()[f.type] + "/" + f.name;
+    std::strncpy(pg.path_, path.c_str(), sizeof(pg.path_) - 1);
+    pg.size_bytes_ = f.size;
+    pg.timestamp_  = static_cast<uint32_t>(f.mtime);
+    std::ifstream in(path, std::ios::binary);
+    char head[24] = {};
+    if (in.read(head, sizeof(head)))
+        (void)userdata::pngSize(std::string_view(head, sizeof(head)), pg.width_, pg.height_);
+    return pg;
+}
+
+void takeCaptureNow() {
+    if (!g_take_screenshot) { LOG_WARN("ScreenCaptureService: no screenshot backend"); return; }
+    g_take_screenshot();
+    auto files = listCaptures();
+    if (files.empty()) return;
+    auto pg = capturePage(files, 0);      // the newest = the one just taken
+    broadcast(kScreenCaptureName, static_cast<uint32_t>(shared::ScreenCaptureOpcode::CaptureAdded), &pg);
+    broadcast<char>(kCapturesName, static_cast<uint32_t>(shared::CaptureOpcode::CapturesChanged), nullptr);
+}
+
+// The file `path` names, if it's a regular file directly inside a capture dir.
+std::string captureFileFor(const char* path) {
+    char real[PATH_MAX];
+    if (!::realpath(path, real)) return {};
+    std::string r(real);
+    size_t slash = r.rfind('/');
+    if (slash == std::string::npos || !userdata::safeCaptureName(r.substr(slash + 1))) return {};
+    std::string dir = r.substr(0, slash);
+    bool in_dir = false;
+    for (const auto& d : captureDirs()) {
+        char rd[PATH_MAX];
+        if (::realpath(d.c_str(), rd) && dir == rd) in_dir = true;
+    }
+    struct stat st{};
+    if (!in_dir || ::lstat(r.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return {};
+    return r;
+}
+
+}  // namespace
+
+void ScreenCaptureService::poll() noexcept {
+    if (g_capture_due != 0 && std::time(nullptr) >= g_capture_due) {
+        g_capture_due = 0;
+        takeCaptureNow();
+    }
+}
+
+void ScreenCaptureService::handleMessage(const shared::XBusMessage& msg,
+                                         std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::ScreenCaptureOpcode;
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::Capture: {
+        shared::ScreenCaptureRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        if (!req.full_screen_) LOG_INFO("ScreenCaptureService: window capture not supported; taking the full screen");
+        ack(msg, client, kScreenCaptureName);
+        uint32_t delay = std::min(req.delay_secs_, kMaxCaptureDelay);
+        if (delay == 0) takeCaptureNow();
+        else g_capture_due = std::time(nullptr) + delay;
+        break;
+    }
+    case O::ListCaptures: {
+        auto pg = capturePage(listCaptures(), readPage(msg));
+        reply(msg, client, kScreenCaptureName, msg.opcode_, &pg);
+        break;
+    }
+    case O::DeleteCapture: {
+        shared::ScreenCaptureDeleteRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        req.path_[sizeof(req.path_) - 1] = '\0';
+        std::string file = captureFileFor(req.path_);
+        bool ok = !file.empty() && ::unlink(file.c_str()) == 0;
+        if (ok) LOG_INFO("ScreenCaptureService: deleted {}", file);
+        else    LOG_WARN("ScreenCaptureService: refusing to delete '{}'", req.path_);
+        ack(msg, client, kScreenCaptureName);
+        if (ok) broadcast<char>(kCapturesName, static_cast<uint32_t>(shared::CaptureOpcode::CapturesChanged), nullptr);
         break;
     }
     default: break;

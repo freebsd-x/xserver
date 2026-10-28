@@ -1,6 +1,7 @@
 #include "xserver/notification_service.h"
 #include "xserver/xbus_dispatcher.h"
 #include "xserver/ipc_socket.h"
+#include "xserver/notif_services.h"
 #include <cstring>
 #include <iostream>
 #include <algorithm>
@@ -10,6 +11,24 @@ namespace fbx::xserver {
 std::vector<Notification> NotificationService::active_notifications_;
 std::set<std::string>     NotificationService::muted_apps_;
 uint32_t NotificationService::next_id_ = 1;
+std::vector<shared::NotificationPayload> NotificationService::held_;
+
+namespace {
+constexpr size_t kMaxHeld = 50;
+}  // namespace
+
+void NotificationService::deliver(const shared::NotificationPayload& payload) noexcept {
+    uint32_t timeout_ms = payload.timeout_ms_ ? payload.timeout_ms_ : 5000u;
+    active_notifications_.push_back({
+        payload.id_,
+        std::string(payload.title_),
+        std::string(payload.message_),
+        std::string(payload.app_name_),
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms)
+    });
+    // Push to the shell (and any other registered broadcast client)
+    BroadcastNotification(payload);
+}
 
 void NotificationService::broadcastMutedApps() noexcept {
     shared::XBusMessage bcast{};
@@ -52,23 +71,21 @@ bool NotificationService::ProcessMessage(std::shared_ptr<IpcSocket> client, cons
 
         // Assign a server-side ID
         payload.id_ = next_id_++;
+        payload.app_name_[sizeof(payload.app_name_) - 1] = '\0';
+        NotifSoundService::noteApp(app_name);
 
-        uint32_t timeout_ms = payload.timeout_ms_ ? payload.timeout_ms_ : 5000u;
-        auto expires = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
-        active_notifications_.push_back({
-            payload.id_,
-            std::string(payload.title_),
-            std::string(payload.message_),
-            app_name,
-            expires
-        });
-
-        std::cout << "[NotificationService] Posted #" << payload.id_
-                  << ": " << payload.title_ << " — " << payload.message_ << "\n";
-
-        // Push to the shell (and any other registered broadcast client)
-        BroadcastNotification(payload);
+        if (NotifScheduleService::holdNow(app_name)) {
+            // Do Not Disturb / quiet hours: keep it for later instead of
+            // dropping it; cleanup() shows it when the quiet time ends.
+            if (held_.size() >= kMaxHeld) held_.erase(held_.begin());
+            held_.push_back(payload);
+            std::cout << "[NotificationService] Held #" << payload.id_ << " (quiet time)\n";
+        } else {
+            std::cout << "[NotificationService] Posted #" << payload.id_
+                      << ": " << payload.title_ << " — " << payload.message_ << "\n";
+            deliver(payload);
+            NotifSoundService::playFor(app_name);
+        }
 
         // Return the assigned ID so the sender can dismiss later
         shared::XBusMessage response = msg;
@@ -145,6 +162,12 @@ const std::vector<Notification>& NotificationService::getActiveNotifications() n
 }
 
 void NotificationService::cleanup() noexcept {
+    if (!held_.empty() && !NotifScheduleService::holdNow("")) {
+        std::cout << "[NotificationService] Quiet time over — showing " << held_.size() << " held\n";
+        for (const auto& p : held_) deliver(p);
+        NotifSoundService::playFor(held_.back().app_name_);   // one sound, not a burst
+        held_.clear();
+    }
     auto now = std::chrono::steady_clock::now();
     for (const auto& n : active_notifications_) {
         if (now > n.expires) {

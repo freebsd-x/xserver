@@ -40,6 +40,18 @@ public:
     static void setScreenshotHook(void (*take)()) noexcept;
 };
 
+// com.freebsdx.ScreenCapture — the same folders as Captures, one file per page
+// with its full path, size, PNG dimensions and mtime, newest first. Capture
+// takes a full-screen shot through the Captures hook, now or after delay_secs_
+// (poll() is called once a second); DeleteCapture only removes a regular file
+// directly inside one of the two folders.
+class ScreenCaptureService {
+public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+    static void poll() noexcept;
+};
+
 // com.freebsdx.EnvVars — the compositor's inherited environment (read-only)
 // plus the user's overrides in ~/.config/freebsdx/environment (editable),
 // which xshell applies to every app it launches.

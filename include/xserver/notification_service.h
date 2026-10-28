@@ -23,13 +23,17 @@ class NotificationService {
 public:
     static bool ProcessMessage(std::shared_ptr<IpcSocket> client, const shared::XBusMessage& msg) noexcept;
     static const std::vector<Notification>& getActiveNotifications() noexcept;
-    // Prune expired notifications and broadcast Dismiss for each removed one
+    // Prune expired notifications and broadcast Dismiss for each removed one;
+    // release held notifications once quiet time is over.
     static void cleanup() noexcept;
 
 private:
     static std::vector<Notification> active_notifications_;
     static std::set<std::string>     muted_apps_;
     static uint32_t next_id_;
+    // Posted during Do Not Disturb / quiet hours; shown when that ends.
+    static std::vector<shared::NotificationPayload> held_;
+    static void deliver(const shared::NotificationPayload& payload) noexcept;
 
     static void broadcastMutedApps() noexcept;
 };

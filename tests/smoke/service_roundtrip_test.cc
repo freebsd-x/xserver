@@ -27,6 +27,7 @@
 #include "xserver/device_services.h"
 #include "xserver/infra_services.h"
 #include "xserver/personal_services.h"
+#include "xserver/notif_services.h"
 #include "xserver/lock_service.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
@@ -2809,6 +2810,147 @@ TEST_F(ServiceRoundtrip, LicenseFraming) {
     // Never more than the last 4 characters of a key.
     std::string key(st.license_key_);
     if (!key.empty()) EXPECT_EQ(key.rfind("****-****-****-", 0), 0u);
+}
+
+// ── Batch 6: NotifSchedule / NotifSound / quiet gate / ScreenCapture ──────────
+
+std::vector<size_t> g_played;   // PCM lengths handed to the fake player
+void fakePlayer(std::vector<int16_t> pcm) { g_played.push_back(pcm.size()); }
+
+TEST_F(ServiceRoundtrip, NotifScheduleSetGetAndRejectsBadTimes) {
+    auto p = makePipe();
+    auto set = [&](uint32_t sh, uint32_t sm, uint32_t eh, uint32_t em, uint32_t tid) {
+        NotifSchedule r{};
+        r.enabled_ = 1; r.start_hour_ = sh; r.start_minute_ = sm; r.end_hour_ = eh; r.end_minute_ = em;
+        r.allow_alarms_ = 1;
+        XBusMessage req = makeReq("com.freebsdx.NotifSchedule",
+                                  static_cast<uint32_t>(NotifScheduleOpcode::SetSchedule), tid, &r, sizeof(r));
+        NotifScheduleService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.NotifSchedule",
+                  static_cast<uint32_t>(NotifScheduleOpcode::SetSchedule), tid);
+    };
+    auto get = [&](uint32_t tid) {
+        XBusMessage req = makeReq("com.freebsdx.NotifSchedule",
+                                  static_cast<uint32_t>(NotifScheduleOpcode::GetSchedule), tid);
+        NotifScheduleService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.NotifSchedule",
+                                    static_cast<uint32_t>(NotifScheduleOpcode::GetSchedule), tid);
+        NotifSchedule w{};
+        std::memcpy(&w, rep.payload_, sizeof(w));
+        return w;
+    };
+    NotifSchedule w = get(0x51000001);                // defaults: off, 22:00 → 07:00
+    EXPECT_EQ(w.enabled_, 0u);
+    EXPECT_EQ(w.start_hour_, 22u);
+    EXPECT_EQ(w.end_hour_, 7u);
+    set(23, 15, 6, 45, 0x51000002);
+    w = get(0x51000003);
+    EXPECT_EQ(w.enabled_, 1u);
+    EXPECT_EQ(w.start_hour_, 23u);
+    EXPECT_EQ(w.start_minute_, 15u);
+    EXPECT_EQ(w.end_minute_, 45u);
+    set(25, 0, 6, 0, 0x51000004);                     // invalid hour: unchanged
+    EXPECT_EQ(get(0x51000005).start_hour_, 23u);
+}
+
+TEST_F(ServiceRoundtrip, QuietGateHoldsUnderDndExceptAlarms) {
+    EXPECT_FALSE(NotifScheduleService::holdNow("Mail"));
+    writeHomeFile(home_ + "/.freebsdx-dnd", "1 0 0\n");       // DND on, no end time
+    EXPECT_TRUE(NotifScheduleService::holdNow("Mail"));
+    EXPECT_TRUE(NotifScheduleService::holdNow(""));
+    EXPECT_FALSE(NotifScheduleService::holdNow("Clock"));     // alarms allowed by default
+}
+
+TEST_F(ServiceRoundtrip, NotifSoundRemembersAppsAndPreviews) {
+    NotifSoundService::setPlayer(&fakePlayer);
+    g_played.clear();
+    NotifSoundService::noteApp("Mail");
+    NotifSoundService::noteApp("Weather");
+    NotifSoundService::noteApp("Mail");                       // once only
+
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.NotifSound", static_cast<uint32_t>(NotifSoundOpcode::ListSounds),
+                              0x55000001, &page, sizeof(page));
+    NotifSoundService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.NotifSound",
+                                static_cast<uint32_t>(NotifSoundOpcode::ListSounds), 0x55000001);
+    NotifSoundPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    EXPECT_GE(pg.total_, 2u);
+    EXPECT_EQ(pg.valid_, 1u);
+
+    NotifSoundRequest r{};
+    std::strncpy(r.app_name_, "Mail", sizeof(r.app_name_) - 1);
+    r.sound_id_ = 2;                                          // Ping
+    req = makeReq("com.freebsdx.NotifSound", static_cast<uint32_t>(NotifSoundOpcode::SetSound),
+                  0x55000002, &r, sizeof(r));
+    NotifSoundService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.NotifSound", static_cast<uint32_t>(NotifSoundOpcode::SetSound), 0x55000002);
+    ASSERT_EQ(g_played.size(), 1u);                           // preview played
+    NotifSoundService::playFor("Mail");
+    ASSERT_EQ(g_played.size(), 2u);
+    EXPECT_EQ(g_played[1], g_played[0]);                      // Mail now pings
+
+    r.sound_id_ = 3;                                          // Silent: nothing plays
+    req = makeReq("com.freebsdx.NotifSound", static_cast<uint32_t>(NotifSoundOpcode::SetSound),
+                  0x55000003, &r, sizeof(r));
+    NotifSoundService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.NotifSound", static_cast<uint32_t>(NotifSoundOpcode::SetSound), 0x55000003);
+    NotifSoundService::playFor("Mail");
+    EXPECT_EQ(g_played.size(), 2u);
+    NotifSoundService::setPlayer(nullptr);
+}
+
+std::string g_shot_dir;
+void fakeScreenshot() {
+    // A 1×1 PNG header is all ListCaptures reads.
+    static const unsigned char kPng[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
+                                         0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 7, 0x80, 0, 0, 4, 0x38};
+    std::ofstream(g_shot_dir + "/screenshot-test.png", std::ios::binary)
+        .write(reinterpret_cast<const char*>(kPng), sizeof(kPng));
+}
+
+TEST_F(ServiceRoundtrip, ScreenCaptureCaptureListAndSafeDelete) {
+    g_shot_dir = home_ + "/Pictures/Screenshots";
+    std::filesystem::create_directories(g_shot_dir);
+    writeHomeFile(home_ + "/keep.txt", "k");
+    CapturesService::setScreenshotHook(&fakeScreenshot);
+
+    auto p = makePipe();
+    ScreenCaptureRequest c{};
+    c.full_screen_ = 1;
+    XBusMessage req = makeReq("com.freebsdx.ScreenCapture", static_cast<uint32_t>(ScreenCaptureOpcode::Capture),
+                              0x5c000001, &c, sizeof(c));
+    ScreenCaptureService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.ScreenCapture", static_cast<uint32_t>(ScreenCaptureOpcode::Capture), 0x5c000001);
+
+    uint32_t page = 0;
+    req = makeReq("com.freebsdx.ScreenCapture", static_cast<uint32_t>(ScreenCaptureOpcode::ListCaptures),
+                  0x5c000002, &page, sizeof(page));
+    ScreenCaptureService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.ScreenCapture",
+                                static_cast<uint32_t>(ScreenCaptureOpcode::ListCaptures), 0x5c000002);
+    ScreenCapturePageFlat pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    ASSERT_EQ(pg.total_, 1u);
+    EXPECT_EQ(std::string(pg.path_), g_shot_dir + "/screenshot-test.png");
+    EXPECT_EQ(pg.width_, 1920u);
+    EXPECT_EQ(pg.height_, 1080u);
+    EXPECT_EQ(pg.size_bytes_, 24u);
+
+    for (std::string path : {home_ + "/keep.txt", g_shot_dir + "/../../keep.txt", std::string(pg.path_)}) {
+        ScreenCaptureDeleteRequest d{};
+        std::strncpy(d.path_, path.c_str(), sizeof(d.path_) - 1);
+        req = makeReq("com.freebsdx.ScreenCapture", static_cast<uint32_t>(ScreenCaptureOpcode::DeleteCapture),
+                      0x5c000003, &d, sizeof(d));
+        ScreenCaptureService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.ScreenCapture",
+                  static_cast<uint32_t>(ScreenCaptureOpcode::DeleteCapture), 0x5c000003);
+    }
+    EXPECT_TRUE(std::filesystem::exists(home_ + "/keep.txt"));
+    EXPECT_FALSE(std::filesystem::exists(g_shot_dir + "/screenshot-test.png"));
+    CapturesService::setScreenshotHook(nullptr);
 }
 
 }  // namespace

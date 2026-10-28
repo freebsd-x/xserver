@@ -33,6 +33,8 @@ void reply(IpcSocket* c, uint32_t tid, shared::DoNotDisturbOpcode op,
 }
 }  // namespace
 
+bool DoNotDisturbService::isActive() noexcept { return load().enabled_ != 0; }
+
 void DoNotDisturbService::handleMessage(const shared::XBusMessage& msg,
                                         std::shared_ptr<IpcSocket> client) noexcept {
     using O = shared::DoNotDisturbOpcode;

@@ -246,4 +246,22 @@ inline bool safeCaptureName(std::string_view name) {
     return true;
 }
 
+// Width/height from a PNG's first 24 bytes (signature + IHDR). False if it
+// isn't a PNG.
+inline bool pngSize(std::string_view head, uint32_t& w, uint32_t& h) {
+    static constexpr unsigned char kSig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    if (head.size() < 24 || head.substr(12, 4) != "IHDR") return false;
+    for (int i = 0; i < 8; ++i)
+        if (static_cast<unsigned char>(head[i]) != kSig[i]) return false;
+    auto be32 = [&](size_t o) {
+        return (static_cast<uint32_t>(static_cast<unsigned char>(head[o])) << 24) |
+               (static_cast<uint32_t>(static_cast<unsigned char>(head[o + 1])) << 16) |
+               (static_cast<uint32_t>(static_cast<unsigned char>(head[o + 2])) << 8) |
+               static_cast<uint32_t>(static_cast<unsigned char>(head[o + 3]));
+    };
+    w = be32(16);
+    h = be32(20);
+    return true;
+}
+
 }  // namespace fbx::xserver::userdata
