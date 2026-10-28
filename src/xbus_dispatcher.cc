@@ -184,6 +184,8 @@ static ServiceHandler shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.Backup",          &BackupService::handleMessage},
         {"com.freebsdx.GameController",  &GameControllerService::handleMessage},
         {"com.freebsdx.AudioEq",         &AudioEqService::handleMessage},
+        {"com.freebsdx.FastCharging",    &FastChargingService::handleMessage},
+        {"com.freebsdx.InputMethod",     &InputMethodService::handleMessage},
     };
     for (const auto& e : kTable)
         if (std::strcmp(name, e.name) == 0) return e.fn;
@@ -1005,8 +1007,8 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // autostart files, print jobs, input devices, network mounts, VMs,
         // containers, TOTP secrets, reminders, text replacements, the
         // auto-lock policy, quiet hours, notification sounds, screen captures,
-        // app permissions, presentation mode, backups, game controllers and
-        // the EQ: shell panels only.
+        // app permissions, presentation mode, backups, game controllers, the
+        // EQ, charging and the input method: shell panels only.
         // Apps get no reply, like the other trusted-only services.
         if (trusted) handler(*msg, client);
         else std::cerr << "[XBusDispatcher] DENIED: untrusted app attempted "

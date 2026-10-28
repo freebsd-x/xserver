@@ -53,6 +53,16 @@ public:
                               std::shared_ptr<IpcSocket> client) noexcept;
 };
 
+// com.freebsdx.FastCharging — the live charge rate (hw.acpi.battery.rate while
+// charging). ACPI on FreeBSD has no charge-rate control, so the battery always
+// charges as fast as the hardware allows: enabled_ is always 1 and SetState
+// can't turn it off (the real state is broadcast so the switch snaps back).
+class FastChargingService {
+public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
 // com.freebsdx.AudioEq — 5-band EQ (audio_eq.h) persisted in ConfigService
 // "audioeq.*"; init() installs the hook (AudioService::setEq in main) and
 // applies the saved settings.

@@ -1,6 +1,9 @@
 #include "xserver/ime_service.h"
 #include "xserver/ipc_socket.h"
+#include "xserver/config_service.h"
+#include "xserver/xbus_reply.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -13,6 +16,13 @@ namespace fbx::xserver {
 std::shared_ptr<IpcSocket> ImeService::active_client_;
 uint32_t                   ImeService::locale_      = 0;
 std::string                ImeService::composition_;
+hangul::Composer           ImeService::hangul_;
+
+namespace {
+constexpr uint32_t kLocaleJa = 1, kLocaleKo = 3;
+constexpr uint32_t kKeySpace = 57, kKeyHangul = 122;   // evdev KEY_SPACE, KEY_HANGEUL
+bool supportedLocale(uint32_t l) { return l == 0 || l == kLocaleJa || l == kLocaleKo; }
+}  // namespace
 
 // ─── UTF-8 helpers ────────────────────────────────────────────────────────────
 
@@ -210,6 +220,56 @@ void ImeService::clearComposition() noexcept {
     sendPreedit(""); // clear preedit display
 }
 
+void ImeService::commitPending() noexcept {
+    if (locale_ == kLocaleKo) {
+        std::string s = hangul_.flush();
+        if (!s.empty()) { sendCommit(s); sendPreedit(""); }
+    } else if (!composition_.empty()) {
+        sendCommit(composition_);
+        clearComposition();
+    }
+}
+
+void ImeService::broadcastMethodChanged() noexcept {
+    svc::broadcast<char>("com.freebsdx.InputMethod", static_cast<uint32_t>(shared::ImOpcode::MethodChanged), nullptr);
+}
+
+uint32_t ImeService::defaultLocale() noexcept {
+    uint32_t l = static_cast<uint32_t>(std::strtoul(ConfigService::get("ime.default", "0").c_str(), nullptr, 10));
+    return supportedLocale(l) ? l : 0;
+}
+
+void ImeService::setDefaultLocale(uint32_t locale) noexcept {
+    if (!supportedLocale(locale)) return;
+    ConfigService::set("ime.default", std::to_string(locale));
+    if (active_client_ && locale_ != locale) {
+        commitPending();
+        locale_ = locale;
+    }
+}
+
+uint32_t ImeService::currentLocale() noexcept {
+    return active_client_ ? locale_ : defaultLocale();
+}
+
+// Korean: letters compose; anything else commits the syllable and passes through.
+bool ImeService::filterHangul(const shared::InputMessage& msg) noexcept {
+    uint32_t key = static_cast<uint32_t>(msg.value_a_);
+    if (key == 14) {                                   // Backspace edits the syllable
+        if (hangul_.backspace()) { sendPreedit(hangul_.preedit()); return true; }
+        return false;
+    }
+    char ch = static_cast<char>(msg.char_value_);
+    if (msg.char_value_ == 0 || !hangul::jamoForKey(ch)) {
+        commitPending();
+        return false;
+    }
+    std::string done = hangul_.feed(ch);
+    if (!done.empty()) sendCommit(done);
+    sendPreedit(hangul_.preedit());
+    return true;
+}
+
 bool ImeService::tryCommitRomaji() noexcept {
     ensureTable();
 
@@ -264,15 +324,15 @@ bool ImeService::tryCommitRomaji() noexcept {
 
 bool ImeService::FilterKeyPress(const std::shared_ptr<IpcSocket>& focused_client,
                                 const shared::InputMessage& msg) noexcept {
-    // If the focused client changed, silently deactivate IME
+    // If the focused client changed, deactivate IME (finishing what was typed)
     if (active_client_ != focused_client) {
+        commitPending();
+        hangul_.flush();
         composition_.clear();
         locale_ = 0;
         active_client_ = nullptr;
         return false;
     }
-
-    if (locale_ == 0) return false; // passthrough — no interception
 
     // Only handle key-down events
     if (msg.value_b_ == 0) return false; // key release
@@ -281,6 +341,20 @@ bool ImeService::FilterKeyPress(const std::shared_ptr<IpcSocket>& focused_client
     if (msg.modifiers_ & 0xEu) return false; // bits 1(Ctrl) 2(Alt) 3(Super)
 
     uint32_t key = static_cast<uint32_t>(msg.value_a_);
+
+    // 한/영 or Shift+Space: toggle this field between Latin and the default
+    // method (Korean when the default is Latin).
+    if (active_client_ && (key == kKeyHangul || (key == kKeySpace && (msg.modifiers_ & 1u)))) {
+        commitPending();
+        uint32_t target = defaultLocale() ? defaultLocale() : kLocaleKo;
+        locale_ = locale_ ? 0 : target;
+        std::cout << "[ime] Toggled, locale=" << locale_ << "\n";
+        broadcastMethodChanged();
+        return true;
+    }
+
+    if (locale_ == 0) return false; // passthrough — no interception
+    if (locale_ == kLocaleKo) return filterHangul(msg);
 
     // ── Backspace ─────────────────────────────────────────────────────────────
     if (key == 14) {
@@ -373,22 +447,66 @@ void ImeService::ProcessMessage(std::shared_ptr<IpcSocket> client,
 
     if (op == shared::IMEOpcode::Activate) {
         const auto* req = reinterpret_cast<const shared::IMEActivateRequest*>(msg.payload_);
-        // Flush any pending composition from the previous client
-        if (active_client_ && active_client_ != client && !composition_.empty()) {
-            clearComposition();
-        }
+        // Finish what was being typed into the previous field
+        if (active_client_ && active_client_ != client) commitPending();
+        hangul_.flush();
         active_client_ = client;
-        locale_        = req->locale_;
+        // A field with no preference gets the system default method.
+        locale_        = req->locale_ ? req->locale_ : defaultLocale();
         composition_.clear();
         std::cout << "[ime] Activated for client, locale=" << locale_ << "\n";
     }
     else if (op == shared::IMEOpcode::Deactivate) {
         if (active_client_ == client) {
-            if (!composition_.empty()) clearComposition();
+            commitPending();
             active_client_ = nullptr;
             locale_        = 0;
             std::cout << "[ime] Deactivated\n";
         }
+    }
+}
+
+// ─── InputMethodService ───────────────────────────────────────────────────────
+
+namespace {
+struct Method { const char* name; const char* lang; uint32_t locale; };
+constexpr Method kMethods[] = {
+    {"us-qwerty",       "en", 0},
+    {"hangul-2beolsik", "ko", kLocaleKo},
+    {"romaji-kana",     "ja", kLocaleJa},
+};
+}  // namespace
+
+void InputMethodService::handleMessage(const shared::XBusMessage& msg,
+                                       std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::ImOpcode;
+    constexpr const char* kName = "com.freebsdx.InputMethod";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::ListMethods: {
+        std::vector<Method> all(std::begin(kMethods), std::end(kMethods));
+        uint32_t cur = ImeService::currentLocale();
+        auto pg = svc::makePage<shared::ImPage>(svc::readPage(msg), all,
+            [cur](shared::ImEntry& e, const Method& m) {
+                std::strncpy(e.name_, m.name, sizeof(e.name_) - 1);
+                std::strncpy(e.lang_, m.lang, sizeof(e.lang_) - 1);
+                e.active_ = m.locale == cur ? 1u : 0u;
+            });
+        svc::reply(msg, client, kName, msg.opcode_, &pg);
+        break;
+    }
+    case O::SetActive: {
+        shared::ImSetRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        req.name_[sizeof(req.name_) - 1] = '\0';
+        bool ok = false;
+        for (const auto& m : kMethods)
+            if (std::strcmp(m.name, req.name_) == 0) { ImeService::setDefaultLocale(m.locale); ok = true; }
+        if (!ok) std::cerr << "[ime] Unknown input method '" << req.name_ << "'\n";
+        svc::ack(msg, client, kName);
+        if (ok) svc::broadcast<char>(kName, static_cast<uint32_t>(O::MethodChanged), nullptr);
+        break;
+    }
+    default: break;
     }
 }
 

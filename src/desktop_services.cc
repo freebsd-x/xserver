@@ -18,6 +18,8 @@
 #include <thread>
 #include <vector>
 
+#include <sys/sysctl.h>
+
 namespace fbx::xserver {
 
 namespace {
@@ -301,6 +303,47 @@ void GameControllerService::handleMessage(const shared::XBusMessage& msg,
                  static_cast<O>(msg.opcode_) == O::CalibrateController ? "calibrate" : "forget");
         ack(msg, client, kName);
         break;
+    default: break;
+    }
+}
+
+// ── FastChargingService ──────────────────────────────────────────────────────
+
+namespace {
+shared::FastChargingState chargingState() {
+    shared::FastChargingState st{};
+    st.enabled_ = 1;
+    int state = 0, rate = 0;
+    size_t len = sizeof(int);
+    // ACPI_BATT_STAT_CHARGING = 0x2; rate is in mW (-1 when unknown).
+    if (::sysctlbyname("hw.acpi.battery.state", &state, &len, nullptr, 0) == 0 && (state & 0x2)) {
+        len = sizeof(int);
+        if (::sysctlbyname("hw.acpi.battery.rate", &rate, &len, nullptr, 0) == 0 && rate > 0)
+            st.charge_rate_w_ = static_cast<uint32_t>((rate + 500) / 1000);
+    }
+    return st;
+}
+}  // namespace
+
+void FastChargingService::handleMessage(const shared::XBusMessage& msg,
+                                        std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::FastChargingOpcode;
+    constexpr const char* kName = "com.freebsdx.FastCharging";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::GetState: {
+        auto st = chargingState();
+        reply(msg, client, kName, msg.opcode_, &st);
+        break;
+    }
+    case O::SetState: {
+        shared::FastChargingRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        if (!req.enabled_) LOG_INFO("FastChargingService: no charge-rate control on this system");
+        ack(msg, client, kName);
+        auto st = chargingState();
+        broadcast(kName, static_cast<uint32_t>(O::StateChanged), &st);
+        break;
+    }
     default: break;
     }
 }

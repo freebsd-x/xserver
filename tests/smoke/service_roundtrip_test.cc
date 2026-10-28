@@ -29,6 +29,7 @@
 #include "xserver/personal_services.h"
 #include "xserver/notif_services.h"
 #include "xserver/desktop_services.h"
+#include "xserver/ime_service.h"
 #include "xserver/lock_service.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
@@ -86,6 +87,7 @@
 #include <gtest/gtest.h>
 
 #include <sys/socket.h>
+#include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -3116,6 +3118,127 @@ TEST_F(ServiceRoundtrip, AudioEqPresetsCustomAndApply) {
     EXPECT_EQ(c.gains_[4], -12);
     EXPECT_EQ(applied.back()[4], -12);
     AudioEqService::init(nullptr);
+}
+
+// ── Batch 8: Korean IME + InputMethod + FastCharging ─────────────────────────
+
+namespace {
+InputMessage key(int32_t code, char ch, uint32_t mods = 0) {
+    InputMessage m{};
+    m.type_ = InputEventType::KeyPress;
+    m.value_a_ = code;
+    m.value_b_ = 1;
+    m.modifiers_ = mods;
+    m.char_value_ = ch;
+    return m;
+}
+// Drain the IME's messages to the client; return the committed text.
+std::string drainCommits(IpcSocket& peer) {
+    std::string out;
+    for (;;) {
+        pollfd pfd{peer.fd(), POLLIN, 0};
+        if (::poll(&pfd, 1, 50) <= 0) break;
+        auto r = peer.receiveMessage();
+        if (!r || r->first.size() < sizeof(InputMessage)) break;
+        InputMessage m{};
+        std::memcpy(&m, r->first.data(), sizeof(m));
+        if (m.type_ != InputEventType::ImeCommit) continue;
+        char buf[8];
+        std::memcpy(buf, &m.value_a_, 4);
+        std::memcpy(buf + 4, &m.value_b_, 4);
+        out.append(buf, std::min<uint32_t>(m.modifiers_, 8));
+    }
+    return out;
+}
+void activate(const std::shared_ptr<IpcSocket>& c, uint32_t locale) {
+    IMEActivateRequest req{};
+    req.locale_ = locale;
+    XBusMessage m = makeReq("com.freebsdx.IME", static_cast<uint32_t>(IMEOpcode::Activate), 0, &req, sizeof(req));
+    ImeService::ProcessMessage(c, m);
+}
+}  // namespace
+
+TEST_F(ServiceRoundtrip, KoreanImeComposesAndCommits) {
+    auto p = makePipe();
+    activate(p.svc, 3);
+    std::string passed;   // keys the IME let through to the app
+    for (char c : std::string("gksrmf"))
+        if (!ImeService::FilterKeyPress(p.svc, key(30, c))) passed += c;
+    EXPECT_EQ(passed, "");
+    EXPECT_FALSE(ImeService::FilterKeyPress(p.svc, key(57, ' ')));   // space commits, passes through
+    EXPECT_EQ(drainCommits(p.peer), "한글");
+
+    // Shift+Space toggles to Latin: letters pass through untouched.
+    EXPECT_TRUE(ImeService::FilterKeyPress(p.svc, key(57, ' ', 1u)));
+    EXPECT_FALSE(ImeService::FilterKeyPress(p.svc, key(30, 'a')));
+    // 한/영 key toggles back.
+    EXPECT_TRUE(ImeService::FilterKeyPress(p.svc, key(122, 0)));
+    EXPECT_TRUE(ImeService::FilterKeyPress(p.svc, key(30, 'd')));
+    EXPECT_TRUE(ImeService::FilterKeyPress(p.svc, key(30, 'k')));
+    // Focus moving to another client commits the pending syllable to this one.
+    auto other = makePipe();
+    EXPECT_FALSE(ImeService::FilterKeyPress(other.svc, key(30, 'x')));
+    EXPECT_EQ(drainCommits(p.peer), "아");
+}
+
+TEST_F(ServiceRoundtrip, InputMethodDefaultAppliesToPlainFields) {
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.InputMethod", static_cast<uint32_t>(ImOpcode::ListMethods),
+                                  tid, &page, sizeof(page));
+        InputMethodService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.InputMethod",
+                                    static_cast<uint32_t>(ImOpcode::ListMethods), tid);
+        ImPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    ImPage pg = list(0x49000001);
+    ASSERT_EQ(pg.total_, 3u);
+    EXPECT_STREQ(pg.entries_[0].name_, "us-qwerty");
+    EXPECT_EQ(pg.entries_[0].active_, 1u);            // Latin by default
+
+    ImSetRequest r{};
+    std::strncpy(r.name_, "hangul-2beolsik", sizeof(r.name_) - 1);
+    XBusMessage req = makeReq("com.freebsdx.InputMethod", static_cast<uint32_t>(ImOpcode::SetActive),
+                              0x49000002, &r, sizeof(r));
+    InputMethodService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.InputMethod", static_cast<uint32_t>(ImOpcode::SetActive), 0x49000002);
+    pg = list(0x49000003);
+    EXPECT_EQ(pg.entries_[0].active_, 0u);
+    EXPECT_EQ(pg.entries_[1].active_, 1u);
+    EXPECT_STREQ(pg.entries_[1].lang_, "ko");
+
+    // A field that asks for no particular locale now gets Korean.
+    auto field = makePipe();
+    activate(field.svc, 0);
+    EXPECT_TRUE(ImeService::FilterKeyPress(field.svc, key(30, 'r')));
+    EXPECT_FALSE(ImeService::FilterKeyPress(field.svc, key(28, '\r')));   // Enter commits, passes
+    EXPECT_EQ(drainCommits(field.peer), "ㄱ");
+
+    std::strncpy(r.name_, "us-qwerty", sizeof(r.name_) - 1);
+    req = makeReq("com.freebsdx.InputMethod", static_cast<uint32_t>(ImOpcode::SetActive), 0x49000004, &r, sizeof(r));
+    InputMethodService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.InputMethod", static_cast<uint32_t>(ImOpcode::SetActive), 0x49000004);
+}
+
+TEST_F(ServiceRoundtrip, FastChargingReportsAndCannotBeDisabled) {
+    auto p = makePipe();
+    FastChargingRequest r{};
+    r.enabled_ = 0;
+    XBusMessage req = makeReq("com.freebsdx.FastCharging", static_cast<uint32_t>(FastChargingOpcode::SetState),
+                              0x46000001, &r, sizeof(r));
+    FastChargingService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.FastCharging", static_cast<uint32_t>(FastChargingOpcode::SetState), 0x46000001);
+    req = makeReq("com.freebsdx.FastCharging", static_cast<uint32_t>(FastChargingOpcode::GetState), 0x46000002);
+    FastChargingService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.FastCharging",
+                                static_cast<uint32_t>(FastChargingOpcode::GetState), 0x46000002);
+    FastChargingState st{};
+    std::memcpy(&st, rep.payload_, sizeof(st));
+    EXPECT_EQ(st.enabled_, 1u);
+    EXPECT_LT(st.charge_rate_w_, 500u);               // watts, sane for a laptop
 }
 
 }  // namespace
