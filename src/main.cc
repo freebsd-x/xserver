@@ -28,6 +28,8 @@
 #include "xserver/user_services.h"
 #include "xserver/device_services.h"
 #include "xserver/personal_services.h"
+#include "xserver/desktop_services.h"
+#include "xserver/notif_services.h"
 #include "xserver/lock_service.h"
 #include "xserver/screensaver_service.h"
 #include "xserver/terminal_service.h"
@@ -460,6 +462,9 @@ int main(int argc, char** argv) {
     PointerService::init([in = input.get()](uint32_t speed, bool accel, bool tap) {
         if (in) in->setPointerConfig(speed, accel, tap);
     });
+    AppPermsService::init([] { return AppManagerService::appsDir(); });
+    // Saved EQ → the audio mixer (com.freebsdx.AudioEq).
+    AudioEqService::init([](const eq::Gains& g) { AudioService::getInstance().setEq(g); });
     // Restore the saved auto-lock policy (com.freebsdx.ScreenLock).
     ScreenLockService::init();
     // Per-device pointer speed (com.freebsdx.InputDevice) + hot-plug re-list.
@@ -472,8 +477,10 @@ int main(int argc, char** argv) {
     // Mic mute gates the input at the OSS mixer.
     MicMuteService::init([](bool muted) { MicMuteService::applyToMixer(muted); });
     // WakeLock inhibits the idle screensaver + idle-lock while a keep-awake holds.
-    ScreenSaverService::setWakeInhibitor([]() { return WakeLockService::isActive(); });
-    LockService::setWakeInhibitor([]() { return WakeLockService::isActive(); });
+    // Presentation mode holds them off too.
+    ScreenSaverService::setWakeInhibitor([]() { return WakeLockService::isActive() || PresentationService::isActive(); });
+    LockService::setWakeInhibitor([]() { return WakeLockService::isActive() || PresentationService::isActive(); });
+    NotifScheduleService::setExtraHold([] { return PresentationService::isActive(); });
     // Logout: tear down the desktop process group (xshell + its apps) but keep
     // the compositor + seat alive, end the login session, and return to the
     // greeter. Reuses the same pgroup-signal teardown as shutdown (fire-and-

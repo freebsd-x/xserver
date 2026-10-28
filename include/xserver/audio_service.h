@@ -2,6 +2,7 @@
 
 #include "shared/protocol.h"
 #include "xserver/ipc_socket.h"
+#include "xserver/audio_eq.h"
 #include <memory>
 #include <span>
 #include <thread>
@@ -24,6 +25,10 @@ public:
     void setMasterVolume(int level) noexcept;
     void adjustVolume(int delta) noexcept;  // clamp-safe ±delta
     void toggleMute() noexcept;
+
+    // 5-band EQ (com.freebsdx.AudioEq); the mix thread picks it up on its next
+    // block.
+    void setEq(const eq::Gains& gains) noexcept;
 
     // Handles incoming XBus Audio service messages.
     bool ProcessMessage(std::shared_ptr<IpcSocket> client,
@@ -63,6 +68,9 @@ private:
 
     std::atomic<int>  master_vol_{80}; // 0-100, mirrors /dev/mixer
     std::atomic<bool> muted_{false};
+    std::mutex            eq_mutex_;
+    eq::Gains             eq_gains_{};
+    std::atomic<uint32_t> eq_version_{0};
     std::string default_sink_path_{"/dev/dsp"};
 };
 

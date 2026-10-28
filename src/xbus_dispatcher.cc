@@ -63,6 +63,7 @@
 #include "xserver/infra_services.h"
 #include "xserver/personal_services.h"
 #include "xserver/notif_services.h"
+#include "xserver/desktop_services.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -178,6 +179,11 @@ static ServiceHandler shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.NotifSchedule",   &NotifScheduleService::handleMessage},
         {"com.freebsdx.NotifSound",      &NotifSoundService::handleMessage},
         {"com.freebsdx.ScreenCapture",   &ScreenCaptureService::handleMessage},
+        {"com.freebsdx.AppPerms",        &AppPermsService::handleMessage},
+        {"com.freebsdx.Presentation",    &PresentationService::handleMessage},
+        {"com.freebsdx.Backup",          &BackupService::handleMessage},
+        {"com.freebsdx.GameController",  &GameControllerService::handleMessage},
+        {"com.freebsdx.AudioEq",         &AudioEqService::handleMessage},
     };
     for (const auto& e : kTable)
         if (std::strcmp(name, e.name) == 0) return e.fn;
@@ -998,8 +1004,9 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // RemoteLogin), the user's crontab, SSH keys, captures, env and
         // autostart files, print jobs, input devices, network mounts, VMs,
         // containers, TOTP secrets, reminders, text replacements, the
-        // auto-lock policy, quiet hours, notification sounds and screen
-        // captures: shell panels only.
+        // auto-lock policy, quiet hours, notification sounds, screen captures,
+        // app permissions, presentation mode, backups, game controllers and
+        // the EQ: shell panels only.
         // Apps get no reply, like the other trusted-only services.
         if (trusted) handler(*msg, client);
         else std::cerr << "[XBusDispatcher] DENIED: untrusted app attempted "

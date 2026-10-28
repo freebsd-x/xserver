@@ -1,6 +1,8 @@
 #include "xserver/audio_service.h"
 #include "xserver/privacy_service.h"
 #include <iostream>
+#include <climits>
+#include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <unistd.h>
@@ -178,6 +180,12 @@ std::vector<shared::AudioDevice> AudioService::enumDevices(bool capture) noexcep
     return devices;
 }
 
+void AudioService::setEq(const eq::Gains& gains) noexcept {
+    std::lock_guard<std::mutex> lk(eq_mutex_);
+    eq_gains_ = eq::clampGains(gains);
+    ++eq_version_;
+}
+
 // ── Mix loop ──────────────────────────────────────────────────────────────────
 
 void AudioService::audioThreadLoop() noexcept {
@@ -187,9 +195,16 @@ void AudioService::audioThreadLoop() noexcept {
 
     std::vector<int32_t> mix_buffer(mix_frames * 2, 0);
     std::vector<int16_t> out_buffer(mix_frames * 2, 0);
+    eq::Equalizer equalizer;
+    uint32_t eq_seen = UINT32_MAX;
 
     while (running_) {
         bool has_audio = false;
+        if (uint32_t v = eq_version_.load(); v != eq_seen) {
+            std::lock_guard<std::mutex> lk(eq_mutex_);
+            equalizer.configure(eq_gains_, static_cast<double>(dsp_sample_rate_));
+            eq_seen = v;
+        }
         std::fill(mix_buffer.begin(), mix_buffer.end(), 0);
 
         const float global_scale = muted_ ? 0.0f
@@ -218,6 +233,7 @@ void AudioService::audioThreadLoop() noexcept {
         }
 
         if (has_audio) {
+            equalizer.process(mix_buffer.data(), mix_frames);
             for (size_t i = 0; i < mix_frames * 2; ++i)
                 out_buffer[i] = static_cast<int16_t>(
                     std::clamp(mix_buffer[i], -32768, 32767));

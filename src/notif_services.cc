@@ -105,12 +105,17 @@ void play(uint32_t sound) {
 
 // ── NotifScheduleService ─────────────────────────────────────────────────────
 
+namespace { bool (*g_extra_hold)() = nullptr; }
+
+void NotifScheduleService::setExtraHold(bool (*pred)()) noexcept { g_extra_hold = pred; }
+
 bool NotifScheduleService::holdNow(std::string_view app) noexcept {
     notif::Schedule s = loadSchedule();
     std::time_t now = std::time(nullptr);
     std::tm tm{};
     localtime_r(&now, &tm);
-    bool quiet = DoNotDisturbService::isActive() || notif::inQuietWindow(s, tm);
+    bool quiet = DoNotDisturbService::isActive() || notif::inQuietWindow(s, tm) ||
+                 (g_extra_hold && g_extra_hold());
     return quiet && !notif::breaksThrough(s, app);
 }
 

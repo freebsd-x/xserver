@@ -28,6 +28,7 @@
 #include "xserver/infra_services.h"
 #include "xserver/personal_services.h"
 #include "xserver/notif_services.h"
+#include "xserver/desktop_services.h"
 #include "xserver/lock_service.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
@@ -94,6 +95,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include "xserver/app_sandbox_service.h"
+#include "xserver/async_shell.h"
+#include <chrono>
+#include <thread>
 #include <span>
 #include <string>
 #include <tuple>
@@ -2951,6 +2956,166 @@ TEST_F(ServiceRoundtrip, ScreenCaptureCaptureListAndSafeDelete) {
     EXPECT_TRUE(std::filesystem::exists(home_ + "/keep.txt"));
     EXPECT_FALSE(std::filesystem::exists(g_shot_dir + "/screenshot-test.png"));
     CapturesService::setScreenshotHook(nullptr);
+}
+
+// ── Batch 7: AppPerms / Presentation / Backup / GameController / AudioEq ──────
+
+TEST_F(ServiceRoundtrip, AppPermsListsBundlesAndSetsGrants) {
+    std::string apps = home_ + "/apps";
+    writeHomeFile(apps + "/Camera.xapp/manifest.json", R"({"name": "Camera", "identifier": "com.freebsdx.camera"})");
+    writeHomeFile(apps + "/Maps.xapp/manifest.json", R"({"name": "Maps", "identifier": "com.freebsdx.maps"})");
+    writeHomeFile(apps + "/Broken.xapp/manifest.json", R"({"name": "NoId"})");
+    AppPermsService::init([apps] { return apps; });
+
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.AppPerms", static_cast<uint32_t>(AppPermOpcode::ListPerms),
+                                  tid, &page, sizeof(page));
+        AppPermsService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.AppPerms",
+                                    static_cast<uint32_t>(AppPermOpcode::ListPerms), tid);
+        AppPermPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    AppPermPage pg = list(0x41000001);
+    ASSERT_EQ(pg.total_, 2u);
+    EXPECT_STREQ(pg.entries_[0].name_, "Camera");
+    EXPECT_EQ(pg.entries_[0].camera_, 0u);           // camera/mic default-deny
+    EXPECT_EQ(pg.entries_[1].location_, 0u);
+
+    auto set = [&](const char* id, uint32_t perm, uint32_t value, uint32_t tid) {
+        AppPermSetRequest r{};
+        std::strncpy(r.app_id_, id, sizeof(r.app_id_) - 1);
+        r.perm_ = perm;
+        r.value_ = value;
+        XBusMessage req = makeReq("com.freebsdx.AppPerms", static_cast<uint32_t>(AppPermOpcode::SetPerm), tid, &r, sizeof(r));
+        AppPermsService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.AppPerms", static_cast<uint32_t>(AppPermOpcode::SetPerm), tid);
+    };
+    set("com.freebsdx.camera", 0, 1, 0x41000002);
+    set("com.freebsdx.maps", 2, 1, 0x41000003);
+    set("com.evil.notinstalled", 0, 1, 0x41000004);  // not a bundle: ignored
+    pg = list(0x41000005);
+    EXPECT_EQ(pg.entries_[0].camera_, 1u);
+    EXPECT_EQ(pg.entries_[0].mic_, 0u);
+    EXPECT_EQ(pg.entries_[1].location_, 1u);
+    EXPECT_TRUE(AppSandboxService::isAllowed("com.freebsdx.camera", PermissionStore::Camera));
+    EXPECT_FALSE(AppSandboxService::isAllowed("com.evil.notinstalled", PermissionStore::Camera));
+    set("com.freebsdx.camera", 0, 0, 0x41000006);
+    EXPECT_FALSE(AppSandboxService::isAllowed("com.freebsdx.camera", PermissionStore::Camera));
+    AppPermsService::init(nullptr);
+}
+
+TEST_F(ServiceRoundtrip, PresentationHoldsNotifications) {
+    NotifScheduleService::setExtraHold([] { return PresentationService::isActive(); });
+    auto p = makePipe();
+    auto set = [&](uint32_t on, uint32_t tid) {
+        PresentationRequest r{};
+        r.active_ = on;
+        XBusMessage req = makeReq("com.freebsdx.Presentation", static_cast<uint32_t>(PresentationOpcode::SetActive),
+                                  tid, &r, sizeof(r));
+        PresentationService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.Presentation", static_cast<uint32_t>(PresentationOpcode::SetActive), tid);
+    };
+    EXPECT_FALSE(NotifScheduleService::holdNow("Mail"));
+    set(1, 0x50000001);
+    EXPECT_TRUE(PresentationService::isActive());
+    EXPECT_TRUE(NotifScheduleService::holdNow("Mail"));
+    set(0, 0x50000002);
+    EXPECT_FALSE(NotifScheduleService::holdNow("Mail"));
+    NotifScheduleService::setExtraHold(nullptr);
+}
+
+TEST_F(ServiceRoundtrip, BackupRunsTarOnAWorker) {
+    std::string src = home_ + "/data", dst = home_ + "/out";
+    writeHomeFile(src + "/a.txt", "hello");
+    writeHomeFile(home_ + "/.config/freebsdx/backups", "Data\t" + src + "\t" + dst + "\n");
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.Backup", static_cast<uint32_t>(BackupOpcode::ListJobs),
+                                  tid, &page, sizeof(page));
+        BackupService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.Backup",
+                                    static_cast<uint32_t>(BackupOpcode::ListJobs), tid);
+        BackupJobPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    BackupJobPage pg = list(0x42000001);
+    ASSERT_EQ(pg.total_, 1u);
+    EXPECT_STREQ(pg.name_, "Data");
+    EXPECT_STREQ(pg.next_run_, "Manual");
+    EXPECT_EQ(pg.last_run_[0], '\0');
+
+    BackupJobRequest r{};
+    std::strncpy(r.id_, pg.id_, sizeof(r.id_) - 1);
+    XBusMessage req = makeReq("com.freebsdx.Backup", static_cast<uint32_t>(BackupOpcode::RunJob), 0x42000002, &r, sizeof(r));
+    BackupService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.Backup", static_cast<uint32_t>(BackupOpcode::RunJob), 0x42000002);
+
+    for (int i = 0; i < 100 && list(0x42000100 + i).status_ == 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    pg = list(0x42000003);
+    EXPECT_EQ(pg.status_, 0u);
+    EXPECT_NE(pg.last_run_[0], '\0');
+    std::vector<std::string> archives;
+    for (const auto& de : std::filesystem::directory_iterator(dst)) archives.push_back(de.path().string());
+    ASSERT_EQ(archives.size(), 1u);
+    EXPECT_NE(archives[0].find("/data-"), std::string::npos);
+    std::string listing = spawnCapture("tar -tzf '" + archives[0] + "'");
+    EXPECT_NE(listing.find("a.txt"), std::string::npos);
+}
+
+TEST_F(ServiceRoundtrip, GameControllerFraming) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.GameController",
+                              static_cast<uint32_t>(GameControllerOpcode::ListControllers), 0x47000001, &page, sizeof(page));
+    GameControllerService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.GameController",
+                                static_cast<uint32_t>(GameControllerOpcode::ListControllers), 0x47000001);
+    GameControllerPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    EXPECT_EQ(pg.valid_, pg.total_ > 0 ? 1u : 0u);   // no pad on this laptop → empty
+}
+
+TEST_F(ServiceRoundtrip, AudioEqPresetsCustomAndApply) {
+    std::vector<eq::Gains> applied;
+    AudioEqService::init([&](const eq::Gains& g) { applied.push_back(g); });
+    ASSERT_EQ(applied.size(), 1u);                   // saved settings pushed at init
+    auto p = makePipe();
+    auto set = [&](uint8_t preset, std::array<int8_t, 5> g, uint32_t tid) {
+        AudioEqConfig c{};
+        c.preset_ = preset;
+        std::memcpy(c.gains_, g.data(), 5);
+        XBusMessage req = makeReq("com.freebsdx.AudioEq", static_cast<uint32_t>(AudioEqOpcode::SetEq), tid, &c, sizeof(c));
+        AudioEqService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.AudioEq", static_cast<uint32_t>(AudioEqOpcode::SetEq), tid);
+    };
+    auto get = [&](uint32_t tid) {
+        XBusMessage req = makeReq("com.freebsdx.AudioEq", static_cast<uint32_t>(AudioEqOpcode::GetEq), tid);
+        AudioEqService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.AudioEq", static_cast<uint32_t>(AudioEqOpcode::GetEq), tid);
+        AudioEqConfig c{};
+        std::memcpy(&c, rep.payload_, sizeof(c));
+        return c;
+    };
+    set(1, {0, 0, 0, 0, 0}, 0x45000001);             // Bass Boost: preset gains, not the request's
+    AudioEqConfig c = get(0x45000002);
+    EXPECT_EQ(c.preset_, 1u);
+    EXPECT_EQ(c.gains_[0], 6);
+    EXPECT_EQ(applied.back()[0], 6);
+    set(4, {20, -3, 0, 2, -20}, 0x45000003);         // Custom, clamped to ±12
+    c = get(0x45000004);
+    EXPECT_EQ(c.preset_, 4u);
+    EXPECT_EQ(c.gains_[0], 12);
+    EXPECT_EQ(c.gains_[1], -3);
+    EXPECT_EQ(c.gains_[4], -12);
+    EXPECT_EQ(applied.back()[4], -12);
+    AudioEqService::init(nullptr);
 }
 
 }  // namespace

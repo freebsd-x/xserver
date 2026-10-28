@@ -22,6 +22,18 @@ bool AppSandboxService::isAllowed(const std::string& app,
     return store().isAllowed(app, cap);
 }
 
+void AppSandboxService::setPermission(const std::string& app, PermissionStore::Capability cap,
+                                      bool allowed) noexcept {
+    if (!store().set(app, cap, allowed)) return;
+    LOG_INFO("AppSandboxService: {} cap {} -> {}", app, static_cast<uint32_t>(cap),
+             allowed ? "grant" : "revoke");
+    // Broadcast so the shell re-fetches (no payload per protocol).
+    shared::XBusMessage bcast{};
+    std::strncpy(bcast.service_name_, "com.freebsdx.AppSandbox", sizeof(bcast.service_name_) - 1);
+    bcast.opcode_ = static_cast<uint32_t>(shared::AppSandboxOpcode::PermsChanged);
+    BroadcastXBusMessage(bcast);
+}
+
 void AppSandboxService::sendPage(IpcSocket* client, uint32_t tid, uint32_t page) noexcept {
     const auto apps = store().list();
     shared::AppSandboxPage pg{};
@@ -64,19 +76,9 @@ void AppSandboxService::handleMessage(const shared::XBusMessage& msg,
         shared::AppSandboxPermRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         req.identifier_[sizeof(req.identifier_) - 1] = '\0';
-        if (req.permission_ < PermissionStore::kNumCaps) {
-            store().set(req.identifier_,
-                        static_cast<PermissionStore::Capability>(req.permission_),
-                        req.allowed_ != 0);
-            LOG_INFO("AppSandboxService: {} cap {} -> {}", req.identifier_,
-                     req.permission_, req.allowed_ ? "grant" : "revoke");
-            // Broadcast so the shell re-fetches (no payload per protocol).
-            shared::XBusMessage bcast{};
-            std::strncpy(bcast.service_name_, "com.freebsdx.AppSandbox",
-                         sizeof(bcast.service_name_) - 1);
-            bcast.opcode_ = static_cast<uint32_t>(O::PermsChanged);
-            BroadcastXBusMessage(bcast);
-        }
+        if (req.permission_ < PermissionStore::kNumCaps)
+            setPermission(req.identifier_, static_cast<PermissionStore::Capability>(req.permission_),
+                          req.allowed_ != 0);
         break;
     }
     default:

@@ -23,6 +23,11 @@ public:
     static bool isAllowed(const std::string& app,
                           PermissionStore::Capability cap) noexcept;
 
+    // Record a grant/revoke, persist it and broadcast PermsChanged (also used
+    // by com.freebsdx.AppPerms).
+    static void setPermission(const std::string& app, PermissionStore::Capability cap,
+                              bool allowed) noexcept;
+
 private:
     static void sendPage(IpcSocket* client, uint32_t tid, uint32_t page) noexcept;
     static PermissionStore& store() noexcept;

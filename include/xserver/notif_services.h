@@ -21,6 +21,10 @@ public:
     // Hold `app`'s notification right now? (DND on or inside quiet hours, and
     // the app isn't an allowed call/alarm.) Empty app = "anything at all".
     [[nodiscard]] static bool holdNow(std::string_view app) noexcept;
+
+    // Something else that also means "hold notifications" (Presentation mode,
+    // wired in main; kept as a hook so xnotify doesn't link it).
+    static void setExtraHold(bool (*pred)()) noexcept;
 };
 
 // com.freebsdx.NotifSound — each app's notification sound (Default / Chime /
