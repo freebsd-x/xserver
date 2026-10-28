@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <string_view>
@@ -245,6 +246,57 @@ inline NtpPeerInfo parseNtpqPeers(std::string_view out) {
         }
     }
     return info;
+}
+
+// ── sshd ─────────────────────────────────────────────────────────────────────
+
+struct SshdConfig {
+    uint32_t    port = 22;
+    std::string listen = "0.0.0.0";   // first ListenAddress, port suffix dropped
+};
+
+// /etc/ssh/sshd_config: first Port / ListenAddress wins (sshd's own rule).
+// Keywords are case-insensitive; a Match block ends the global section.
+inline SshdConfig parseSshdConfig(std::string_view text) {
+    SshdConfig c;
+    bool have_port = false, have_listen = false;
+    auto lower = [](std::string_view s) {
+        std::string o(s);
+        for (char& ch : o) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        return o;
+    };
+    for (auto line : detail::lines(text)) {
+        auto t = detail::tokens(line);
+        if (t.empty() || t[0][0] == '#') continue;
+        std::string kw = lower(t[0]);
+        if (kw == "match") break;
+        if (t.size() < 2) continue;
+        if (kw == "port" && !have_port) {
+            uint64_t p = detail::toU64(t[1]);
+            if (p > 0 && p < 65536) { c.port = static_cast<uint32_t>(p); have_port = true; }
+        } else if (kw == "listenaddress" && !have_listen) {
+            std::string_view a = t[1];
+            if (!a.empty() && a.front() == '[') a = a.substr(1, a.find(']') - 1);  // [::1]:22
+            else if (std::count(a.begin(), a.end(), ':') == 1) a = a.substr(0, a.find(':'));
+            c.listen = std::string(a);
+            have_listen = true;
+        }
+    }
+    return c;
+}
+
+// `netstat -an -p tcp`: ESTABLISHED connections whose local port is `port`
+// (inbound SSH sessions). Local address is "a.b.c.d.port" / "v6addr.port".
+inline uint32_t countEstablished(std::string_view out, uint32_t port) {
+    uint32_t n = 0;
+    std::string suffix = "." + std::to_string(port);
+    for (auto line : detail::lines(out)) {
+        auto t = detail::tokens(line);
+        if (t.size() < 6 || t[0].substr(0, 3) != "tcp" || t[5] != "ESTABLISHED") continue;
+        std::string_view local = t[3];
+        if (local.size() > suffix.size() && local.substr(local.size() - suffix.size()) == suffix) ++n;
+    }
+    return n;
 }
 
 }  // namespace fbx::xserver::sysadmin

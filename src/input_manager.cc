@@ -132,12 +132,20 @@ bool InputManager::isTouchpad(libinput_device* dev) noexcept {
 // Apply the current pointer prefs (accel speed/profile + tap-to-click) to a device.
 void InputManager::applyPointerTo(libinput_device* dev) noexcept {
     if (libinput_device_config_accel_is_available(dev)) {
-        // Map speed step 1..10 → libinput's [-1.0, +1.0].
-        uint32_t s = pointer_speed_ < 1 ? 1 : (pointer_speed_ > 10 ? 10 : pointer_speed_);
-        libinput_device_config_accel_set_speed(dev, (static_cast<double>(s) - 1.0) / 9.0 * 2.0 - 1.0);
-        libinput_device_config_accel_set_profile(dev,
-            pointer_accel_ ? LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE
-                           : LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT);
+        auto ov = device_overrides_.find(inputdev::deviceId(libinput_device_get_name(dev)));
+        if (ov != device_overrides_.end()) {
+            libinput_device_config_accel_set_speed(dev, inputdev::sensitivityToSpeed(ov->second.sensitivity));
+            libinput_device_config_accel_set_profile(dev,
+                ov->second.adaptive ? LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE
+                                    : LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT);
+        } else {
+            // Map speed step 1..10 → libinput's [-1.0, +1.0].
+            uint32_t s = pointer_speed_ < 1 ? 1 : (pointer_speed_ > 10 ? 10 : pointer_speed_);
+            libinput_device_config_accel_set_speed(dev, (static_cast<double>(s) - 1.0) / 9.0 * 2.0 - 1.0);
+            libinput_device_config_accel_set_profile(dev,
+                pointer_accel_ ? LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE
+                               : LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT);
+        }
     }
     if (isTouchpad(dev))
         libinput_device_config_tap_set_enabled(dev,
@@ -155,6 +163,34 @@ void InputManager::applyDeviceConfig(libinput_device* dev) noexcept {
     applyPointerTo(dev);   // accel + tap-to-click (per current pointer prefs)
     if (libinput_device_config_scroll_has_natural_scroll(dev))
         libinput_device_config_scroll_set_natural_scroll_enabled(dev, natural_scroll_ ? 1 : 0);
+}
+
+std::vector<inputdev::DeviceInfo> InputManager::listDevices() const noexcept {
+    std::vector<inputdev::DeviceInfo> out;
+    for (libinput_device* d : devices_) {
+        inputdev::DeviceInfo i;
+        i.name    = libinput_device_get_name(d);
+        i.id      = inputdev::deviceId(i.name);
+        i.vendor  = libinput_device_get_id_vendor(d);
+        i.product = libinput_device_get_id_product(d);
+        i.type    = inputdev::pickType(
+            libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_KEYBOARD),
+            libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_POINTER),
+            libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_TOUCH),
+            libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_TABLET_TOOL));
+        if (libinput_device_config_accel_is_available(d)) {
+            i.sensitivity = inputdev::speedToSensitivity(libinput_device_config_accel_get_speed(d));
+            i.adaptive    = libinput_device_config_accel_get_profile(d) != LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT;
+        }
+        out.push_back(std::move(i));
+    }
+    return out;
+}
+
+void InputManager::setDeviceOverride(uint32_t id, uint32_t sensitivity, bool adaptive) noexcept {
+    device_overrides_[id] = {sensitivity > 100 ? 100u : sensitivity, adaptive};
+    for (libinput_device* d : devices_)
+        if (inputdev::deviceId(libinput_device_get_name(d)) == id) applyPointerTo(d);
 }
 
 void InputManager::setPointerConfig(uint32_t speed, bool acceleration, bool tap_to_click) noexcept {
@@ -200,11 +236,13 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             libinput_device_ref(dev);
             devices_.push_back(dev);
             applyDeviceConfig(dev);
+            if (on_devices_changed_) on_devices_changed_();
         } else if (type == LIBINPUT_EVENT_DEVICE_REMOVED) {
             libinput_device* dev = libinput_event_get_device(event);
             std::cout << "[xserver] Device Removed: " << libinput_device_get_name(dev) << "\n";
             auto it = std::find(devices_.begin(), devices_.end(), dev);
             if (it != devices_.end()) { libinput_device_unref(*it); devices_.erase(it); }
+            if (on_devices_changed_) on_devices_changed_();
         } else if (type == LIBINPUT_EVENT_POINTER_MOTION) {
             auto* motion = libinput_event_get_pointer_event(event);
             messages.push_back({

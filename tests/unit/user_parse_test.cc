@@ -1,7 +1,8 @@
-// Pure parsers for the per-user services (CronJobs/SshKeys/Captures/EnvVars).
+// Pure parsers for the per-user services (CronJobs/SshKeys/Captures/EnvVars/StartupItems).
 
 #include "xserver/user_parse.h"
 #include "shared/user_env.h"
+#include "shared/autostart.h"
 #include <gtest/gtest.h>
 
 using namespace fbx::xserver::userdata;
@@ -157,4 +158,75 @@ TEST(UserEnv, SetUnsetRoundTrip) {
     EXPECT_TRUE(userenv::unset(back, "EMPTY"));
     EXPECT_FALSE(userenv::unset(back, "EMPTY"));
     EXPECT_EQ(back.size(), 1u);
+}
+
+// ── autostart ────────────────────────────────────────────────────────────────
+
+namespace autostart = fbx::shared::autostart;
+
+constexpr std::string_view kDesktop =
+    "[Desktop Entry]\n"
+    "Type=Application\n"
+    "Name=Syncthing\n"
+    "Name[ko]=싱크띵\n"
+    "Exec=\"/usr/local/bin/sync thing\" -no-browser %U\n"
+    "X-GNOME-Autostart-enabled=true\n"
+    "\n"
+    "[Desktop Action Quit]\n"
+    "Hidden=true\n"
+    "Exec=killall syncthing\n";
+
+TEST(Autostart, ParsesOnlyDesktopEntryGroup) {
+    autostart::Entry e;
+    ASSERT_TRUE(autostart::parse(kDesktop, e));
+    EXPECT_EQ(e.name, "Syncthing");
+    EXPECT_EQ(e.exec, "\"/usr/local/bin/sync thing\" -no-browser %U");
+    EXPECT_FALSE(e.hidden);                       // Hidden in [Desktop Action] ignored
+    EXPECT_TRUE(autostart::enabled(e));
+    EXPECT_EQ(autostart::program(e.exec), "sync thing");
+    EXPECT_EQ(autostart::commandLine(e.exec), "\"/usr/local/bin/sync thing\" -no-browser");
+    EXPECT_EQ(autostart::commandLine("date +%%s %f"), "date +%s");
+    autostart::Entry none;
+    EXPECT_FALSE(autostart::parse("[Desktop Entry]\nName=x\n", none));   // no Exec
+}
+
+TEST(Autostart, SetEnabledRewritesHiddenAndGnomeKey) {
+    std::string off, on;
+    ASSERT_TRUE(autostart::setEnabled(kDesktop, false, off));
+    autostart::Entry e;
+    ASSERT_TRUE(autostart::parse(off, e));
+    EXPECT_TRUE(e.hidden);
+    EXPECT_FALSE(e.gnome_enabled);
+    EXPECT_NE(off.find("[Desktop Entry]\nHidden=true\n"), std::string::npos);
+    EXPECT_NE(off.find("[Desktop Action Quit]\nHidden=true\nExec=killall"), std::string::npos);
+
+    ASSERT_TRUE(autostart::setEnabled(off, true, on));
+    autostart::Entry e2;
+    ASSERT_TRUE(autostart::parse(on, e2));
+    EXPECT_TRUE(autostart::enabled(e2));
+    EXPECT_EQ(on.find("Hidden=false"), on.rfind("Hidden=false"));   // replaced, not re-added
+    std::string bad;
+    EXPECT_FALSE(autostart::setEnabled("Exec=x\n", true, bad));
+}
+
+TEST(Autostart, ShowInFilters) {
+    autostart::Entry gnome{"a", "a", false, true, "GNOME;Unity;", ""};
+    autostart::Entry ours {"b", "b", false, true, "GNOME;FreeBSD-X;", ""};
+    autostart::Entry notus{"c", "c", false, true, "", "KDE;FreeBSD-X"};
+    autostart::Entry plain{"d", "d", false, true, "", "GNOME;KDE;"};
+    autostart::Entry off  {"e", "e", true, true, "", ""};
+    EXPECT_FALSE(autostart::shouldLaunch(gnome));
+    EXPECT_TRUE(autostart::shouldLaunch(ours));
+    EXPECT_FALSE(autostart::shouldLaunch(notus));
+    EXPECT_TRUE(autostart::shouldLaunch(plain));
+    EXPECT_FALSE(autostart::shouldLaunch(off));
+}
+
+TEST(Autostart, EntryFilesAndIds) {
+    EXPECT_TRUE(autostart::isEntryFile("syncthing.desktop"));
+    EXPECT_FALSE(autostart::isEntryFile(".desktop"));
+    EXPECT_FALSE(autostart::isEntryFile(".hidden.desktop"));
+    EXPECT_FALSE(autostart::isEntryFile("notes.txt"));
+    EXPECT_EQ(autostart::itemId("a.desktop"), autostart::itemId("a.desktop"));
+    EXPECT_NE(autostart::itemId("a.desktop"), autostart::itemId("b.desktop"));
 }

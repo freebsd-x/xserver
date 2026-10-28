@@ -4,10 +4,11 @@
 #include "xserver/ipc_socket.h"
 #include <cstring>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 // Framing helpers shared by XBus service handlers: framed replies that echo
-// transaction_id_, empty acks, broadcasts, and 3-per-page list pages.
+// transaction_id_, empty acks, broadcasts, and paged lists.
 namespace fbx::xserver {
 
 void BroadcastXBusMessage(const shared::XBusMessage&);
@@ -45,14 +46,17 @@ void broadcast(const char* service, uint32_t opcode, const T* payload) {
     BroadcastXBusMessage(b);
 }
 
+// Page size comes from the contract's entries_ array (3 for most, 2 for
+// PrintJobPage).
 template <typename Page, typename Item, typename Fill>
 Page makePage(uint32_t page, const std::vector<Item>& items, Fill fill) {
+    constexpr uint32_t kPer = std::extent_v<decltype(Page::entries_)>;
     Page pg{};
     pg.page_  = page;
     pg.total_ = static_cast<uint32_t>(items.size());
-    uint64_t start = static_cast<uint64_t>(page) * 3;
+    uint64_t start = static_cast<uint64_t>(page) * kPer;
     uint32_t n = 0;
-    for (; n < 3 && start + n < items.size(); ++n) fill(pg.entries_[n], items[start + n]);
+    for (; n < kPer && start + n < items.size(); ++n) fill(pg.entries_[n], items[start + n]);
     pg.count_    = n;
     pg.has_more_ = (start + n < items.size()) ? 1u : 0u;
     return pg;

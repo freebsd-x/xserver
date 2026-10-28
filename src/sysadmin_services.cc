@@ -307,4 +307,49 @@ void NtpService::handleMessage(const shared::XBusMessage& msg,
     }
 }
 
+// ── RemoteLogin ──────────────────────────────────────────────────────────────
+
+namespace {
+
+shared::RemoteLoginState remoteLoginState() {
+    shared::RemoteLoginState st{};
+    std::ifstream f("/etc/ssh/sshd_config");
+    std::stringstream body;
+    body << f.rdbuf();
+    auto cfg = sysadmin::parseSshdConfig(body.str());
+    st.port_ = cfg.port;
+    std::strncpy(st.bind_addr_, cfg.listen.c_str(), sizeof(st.bind_addr_) - 1);
+    for (const auto& p : proc::enumerateProcesses())
+        if (std::strcmp(p.name_, "sshd") == 0) { st.enabled_ = 1; break; }
+    if (st.enabled_)
+        st.sessions_ = sysadmin::countEstablished(cachedCapture("netstat -an -p tcp 2>/dev/null"), cfg.port);
+    return st;
+}
+
+}  // namespace
+
+void RemoteLoginService::handleMessage(const shared::XBusMessage& msg,
+                                       std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::RemoteLoginOpcode;
+    constexpr const char* kName = "com.freebsdx.RemoteLogin";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::GetState: {
+        auto st = remoteLoginState();
+        reply(msg, client, kName, msg.opcode_, &st);
+        break;
+    }
+    case O::SetEnabled: {
+        shared::RemoteLoginRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        brokerOp("RemoteLoginService", req.enabled_ ? privops::kServiceStart : privops::kServiceStop, "sshd");
+        ack(msg, client, kName);
+        // Real state either way, so a failed toggle snaps the switch back.
+        auto st = remoteLoginState();
+        broadcast(kName, static_cast<uint32_t>(O::StateChanged), &st);
+        break;
+    }
+    default: break;
+    }
+}
+
 }  // namespace fbx::xserver

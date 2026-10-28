@@ -139,3 +139,34 @@ TEST(SysadminNtp, EmptyOutput) {
     EXPECT_FALSE(n.synced);
     EXPECT_TRUE(n.server.empty());
 }
+
+// ── sshd ─────────────────────────────────────────────────────────────────────
+
+TEST(SysadminSshd, DefaultsWhenAllCommentedOut) {
+    auto c = parseSshdConfig("#Port 22\n#ListenAddress 0.0.0.0\nPermitRootLogin no\n");
+    EXPECT_EQ(c.port, 22u);
+    EXPECT_EQ(c.listen, "0.0.0.0");
+}
+
+TEST(SysadminSshd, FirstValueWinsAndMatchEndsGlobals) {
+    auto c = parseSshdConfig("port 2222\nPort 22\nListenAddress 192.168.0.3:2222\n"
+                             "Match User git\n  Port 9999\n");
+    EXPECT_EQ(c.port, 2222u);
+    EXPECT_EQ(c.listen, "192.168.0.3");
+    EXPECT_EQ(parseSshdConfig("ListenAddress [::1]:22\n").listen, "::1");
+    EXPECT_EQ(parseSshdConfig("ListenAddress ::\n").listen, "::");
+    EXPECT_EQ(parseSshdConfig("Port 70000\n").port, 22u);   // invalid → default
+}
+
+TEST(SysadminSshd, CountsInboundEstablishedOnly) {
+    constexpr std::string_view kNetstat =
+        "Active Internet connections (including servers)\n"
+        "Proto     Recv-Q Send-Q Local Address          Foreign Address        (state)\n"
+        "tcp4           0      0 192.168.0.3.22         192.168.0.9.51234      ESTABLISHED\n"
+        "tcp6           0      0 fe80::1%em0.22         fe80::2%em0.40000      ESTABLISHED\n"
+        "tcp4           0      0 192.168.0.3.47060      160.79.104.10.22       ESTABLISHED\n"
+        "tcp4           0      0 192.168.0.3.222        10.0.0.1.5000          ESTABLISHED\n"
+        "tcp4           0      0 *.22                   *.*                    LISTEN\n";
+    EXPECT_EQ(countEstablished(kNetstat, 22), 2u);   // outbound-to-22 and port 222 excluded
+    EXPECT_EQ(countEstablished("", 22), 0u);
+}

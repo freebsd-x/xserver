@@ -3,6 +3,7 @@
 #include "xserver/async_shell.h"
 #include "xserver/xbus_reply.h"
 #include "shared/user_env.h"
+#include "shared/autostart.h"
 #include "shared/logger.h"
 
 #include <algorithm>
@@ -189,6 +190,41 @@ std::vector<EnvRow> envRows() {
         rows.push_back(std::move(inherited[i]));
     }
     return rows;
+}
+
+// ── Startup items ────────────────────────────────────────────────────────────
+
+struct StartupFile {
+    std::string             file;    // basename
+    shared::autostart::Entry entry;
+};
+
+std::vector<StartupFile> listStartup() {
+    std::vector<StartupFile> out;
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(shared::autostart::dirPath(homeDir()), ec)) {
+        std::string name = de.path().filename().string();
+        struct stat st{};
+        if (!shared::autostart::isEntryFile(name) ||
+            ::lstat(de.path().c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        StartupFile f{name, {}};
+        if (auto text = readFile(de.path().string()); text && shared::autostart::parse(*text, f.entry)) {
+            if (f.entry.name.empty()) f.entry.name = name.substr(0, name.size() - 8);
+            out.push_back(std::move(f));
+        }
+    }
+    std::sort(out.begin(), out.end(),
+              [](const StartupFile& a, const StartupFile& b) { return a.file < b.file; });
+    return out;
+}
+
+// The entry file for an id, or "" (stale id).
+std::string startupPath(uint32_t id) {
+    for (const auto& f : listStartup())
+        if (shared::autostart::itemId(f.file) == id)
+            return shared::autostart::dirPath(homeDir()) + "/" + f.file;
+    return {};
 }
 
 }  // namespace
@@ -394,6 +430,56 @@ void EnvVarsService::handleMessage(const shared::XBusMessage& msg,
         if (!ok) LOG_WARN("EnvVarsService: '{}' is not a user variable", req.key_);
         ack(msg, client, kEnvName);
         if (ok) broadcast<char>(kEnvName, static_cast<uint32_t>(O::EnvChanged), nullptr);
+        break;
+    }
+    default: break;
+    }
+}
+
+// ── StartupItemsService ──────────────────────────────────────────────────────
+
+void StartupItemsService::handleMessage(const shared::XBusMessage& msg,
+                                        std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::StartupOpcode;
+    constexpr const char* kName = "com.freebsdx.StartupItems";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::ListItems: {
+        auto items = listStartup();
+        auto pg = makePage<shared::StartupPage>(readPage(msg), items,
+            [](shared::StartupEntry& e, const StartupFile& f) {
+                std::strncpy(e.name_, f.entry.name.c_str(), sizeof(e.name_) - 1);
+                std::string prog = shared::autostart::program(f.entry.exec);
+                std::strncpy(e.exec_, prog.c_str(), sizeof(e.exec_) - 1);
+                e.item_id_ = shared::autostart::itemId(f.file);
+                e.enabled_ = shared::autostart::enabled(f.entry) ? 1u : 0u;
+                e.builtin_ = 0;
+            });
+        reply(msg, client, kName, msg.opcode_, &pg);
+        break;
+    }
+    case O::SetEnabled: {
+        shared::StartupToggleRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        bool ok = false;
+        std::string path = startupPath(req.item_id_), updated;
+        if (auto text = path.empty() ? std::nullopt : readFile(path);
+            text && shared::autostart::setEnabled(*text, req.enabled_ != 0, updated))
+            ok = writeFileAtomic(path, updated, 0644);
+        if (!ok) LOG_WARN("StartupItemsService: can't toggle item {}", req.item_id_);
+        ack(msg, client, kName);
+        // Broadcast either way so a failed toggle snaps the switch back.
+        broadcast<char>(kName, static_cast<uint32_t>(O::ItemsChanged), nullptr);
+        break;
+    }
+    case O::RemoveItem: {
+        shared::StartupRemoveRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        std::string path = startupPath(req.item_id_);
+        bool ok = !path.empty() && ::unlink(path.c_str()) == 0;
+        if (ok) LOG_INFO("StartupItemsService: removed {}", path);
+        else    LOG_WARN("StartupItemsService: can't remove item {}", req.item_id_);
+        ack(msg, client, kName);
+        if (ok) broadcast<char>(kName, static_cast<uint32_t>(O::ItemsChanged), nullptr);
         break;
     }
     default: break;

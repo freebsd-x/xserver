@@ -49,4 +49,14 @@ public:
                               std::shared_ptr<IpcSocket> client) noexcept;
 };
 
+// com.freebsdx.StartupItems — the user's XDG autostart entries
+// (~/.config/autostart/*.desktop, parsed by shared/autostart.h), which xshell
+// launches at login. SetEnabled rewrites Hidden=; RemoveItem deletes the file.
+// System-wide entries aren't listed (xshell doesn't launch them).
+class StartupItemsService {
+public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
 }  // namespace fbx::xserver

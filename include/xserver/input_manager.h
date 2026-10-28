@@ -1,9 +1,13 @@
 #pragma once
 
+#include "xserver/input_devices.h"
 #include "xserver/seat_manager.h"
 #include "shared/protocol.h"
 #include <libinput.h>
 #include <libudev.h>
+#include <functional>
+#include <map>
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <expected>
@@ -51,6 +55,16 @@ public:
     // (Natural scroll is handled by setNaturalScroll / com.freebsdx.ScrollDir.)
     void setPointerConfig(uint32_t speed, bool acceleration, bool tap_to_click) noexcept;
 
+    // Live devices for com.freebsdx.InputDevice.
+    [[nodiscard]] std::vector<inputdev::DeviceInfo> listDevices() const noexcept;
+
+    // Per-device speed (com.freebsdx.InputDevice): wins over the global pointer
+    // speed for that device, now and when it's re-plugged.
+    void setDeviceOverride(uint32_t id, uint32_t sensitivity, bool adaptive) noexcept;
+
+    // Called after a device is added or removed.
+    void setOnDevicesChanged(std::function<void()> cb) noexcept { on_devices_changed_ = std::move(cb); }
+
     static int openRestricted(const char* path, int flags, void* userData) noexcept;
     static void closeRestricted(int fd, void* userData) noexcept;
 
@@ -71,6 +85,8 @@ private:
     uint32_t pointer_speed_{5};        // 1-10
     bool     pointer_accel_{true};     // adaptive (vs flat)
     bool     pointer_tap_{true};       // tap-to-click on touchpads
+    std::map<uint32_t, inputdev::Override> device_overrides_;  // by device id
+    std::function<void()> on_devices_changed_;
     // A touchpad is identified by tap capability (matches applyDeviceConfig).
     static bool isTouchpad(libinput_device* dev) noexcept;
     // Apply the current pointer prefs to one device (accel speed/profile + tap).

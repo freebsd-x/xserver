@@ -24,6 +24,7 @@
 #include "xserver/kmod_service.h"
 #include "xserver/sysadmin_services.h"
 #include "xserver/user_services.h"
+#include "xserver/device_services.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -89,6 +90,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <array>
 
@@ -2376,6 +2378,154 @@ TEST_F(ServiceRoundtrip, EnvVarsSetListUnset) {
     EXPECT_EQ(readHomeFile(home_ + "/.config/freebsdx/environment").find("FBX_TEST_VAR"),
               std::string::npos);
     EXPECT_STREQ(std::getenv("HOME"), home_.c_str());
+}
+
+// ── Batch 3: RemoteLogin / StartupItems / PrintQueue / InputDevice ────────────
+
+TEST_F(ServiceRoundtrip, RemoteLoginGetStateFraming) {
+    auto p = makePipe();
+    XBusMessage req = makeReq("com.freebsdx.RemoteLogin",
+                              static_cast<uint32_t>(RemoteLoginOpcode::GetState), 0x72000001);
+    RemoteLoginService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.RemoteLogin",
+                                static_cast<uint32_t>(RemoteLoginOpcode::GetState), 0x72000001);
+    RemoteLoginState st{};
+    std::memcpy(&st, rep.payload_, sizeof(st));
+    EXPECT_LE(st.enabled_, 1u);
+    EXPECT_GT(st.port_, 0u);
+    EXPECT_LT(st.port_, 65536u);
+    EXPECT_NE(st.bind_addr_[0], '\0');
+    if (!st.enabled_) EXPECT_EQ(st.sessions_, 0u);
+}
+
+TEST_F(ServiceRoundtrip, StartupItemsListToggleRemove) {
+    std::string dir = home_ + "/.config/autostart";
+    writeHomeFile(dir + "/b-sync.desktop",
+                  "[Desktop Entry]\nName=Sync\nExec=/usr/local/bin/syncthing -no-browser\n");
+    writeHomeFile(dir + "/a-notes.desktop",
+                  "[Desktop Entry]\nName=Notes\nExec=notes %F\nHidden=true\n");
+    writeHomeFile(dir + "/readme.txt", "not an entry");
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.StartupItems",
+                                  static_cast<uint32_t>(StartupOpcode::ListItems), tid, &page, sizeof(page));
+        StartupItemsService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.StartupItems",
+                                    static_cast<uint32_t>(StartupOpcode::ListItems), tid);
+        StartupPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        expectPageInvariants(pg, 0);
+        return pg;
+    };
+    StartupPage pg = list(0x73100001);
+    ASSERT_EQ(pg.count_, 2u);
+    EXPECT_STREQ(pg.entries_[0].name_, "Notes");          // sorted by file name
+    EXPECT_EQ(pg.entries_[0].enabled_, 0u);
+    EXPECT_STREQ(pg.entries_[1].exec_, "syncthing");
+    EXPECT_EQ(pg.entries_[1].enabled_, 1u);
+    EXPECT_EQ(pg.entries_[1].builtin_, 0u);
+
+    StartupToggleRequest t{};
+    t.item_id_ = pg.entries_[0].item_id_;
+    t.enabled_ = 1;
+    XBusMessage req = makeReq("com.freebsdx.StartupItems",
+                              static_cast<uint32_t>(StartupOpcode::SetEnabled), 0x73100002, &t, sizeof(t));
+    StartupItemsService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.StartupItems",
+              static_cast<uint32_t>(StartupOpcode::SetEnabled), 0x73100002);
+    EXPECT_NE(readHomeFile(dir + "/a-notes.desktop").find("Hidden=false"), std::string::npos);
+
+    StartupRemoveRequest rm{};
+    rm.item_id_ = pg.entries_[1].item_id_;
+    req = makeReq("com.freebsdx.StartupItems",
+                  static_cast<uint32_t>(StartupOpcode::RemoveItem), 0x73100003, &rm, sizeof(rm));
+    StartupItemsService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.StartupItems",
+              static_cast<uint32_t>(StartupOpcode::RemoveItem), 0x73100003);
+    EXPECT_FALSE(std::filesystem::exists(dir + "/b-sync.desktop"));
+
+    pg = list(0x73100004);
+    ASSERT_EQ(pg.count_, 1u);
+    EXPECT_EQ(pg.entries_[0].enabled_, 1u);
+    EXPECT_TRUE(std::filesystem::exists(dir + "/readme.txt"));
+}
+
+// cupsd isn't necessarily running: the list must still frame (empty is fine)
+// and a bogus cancel must be acked, not hang.
+TEST_F(ServiceRoundtrip, PrintQueueFramingAndBogusCancel) {
+    auto p = makePipe();
+    uint32_t page = 0;
+    XBusMessage req = makeReq("com.freebsdx.PrintQueue",
+                              static_cast<uint32_t>(PrintOpcode::ListJobs), 0x70100001, &page, sizeof(page));
+    PrintQueueService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.PrintQueue",
+                                static_cast<uint32_t>(PrintOpcode::ListJobs), 0x70100001);
+    PrintJobPage pg{};
+    std::memcpy(&pg, rep.payload_, sizeof(pg));
+    EXPECT_EQ(pg.page_, 0u);
+    EXPECT_LE(pg.count_, 2u);
+    EXPECT_EQ(pg.has_more_, pg.total_ > 2 ? 1u : 0u);
+
+    PrintCancelRequest c{};
+    c.job_id_ = 0;
+    req = makeReq("com.freebsdx.PrintQueue",
+                  static_cast<uint32_t>(PrintOpcode::CancelJob), 0x70100002, &c, sizeof(c));
+    PrintQueueService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.PrintQueue",
+              static_cast<uint32_t>(PrintOpcode::CancelJob), 0x70100002);
+}
+
+TEST_F(ServiceRoundtrip, InputDeviceListAndPerDeviceSpeed) {
+    using fbx::xserver::inputdev::DeviceInfo;
+    std::vector<DeviceInfo> devs{
+        {fbx::xserver::inputdev::deviceId("AT keyboard"), "AT keyboard", 0x0001, 0x0001, 0, 50, true},
+        {fbx::xserver::inputdev::deviceId("TouchPad"),    "TouchPad",    0x06cb, 0x7e7e, 1, 50, true},
+    };
+    std::vector<std::tuple<uint32_t, uint32_t, bool>> applied;
+    InputDeviceService::init([&] { return devs; },
+                             [&](uint32_t id, uint32_t s, bool a) { applied.emplace_back(id, s, a); });
+    applied.clear();   // init may replay persisted overrides
+
+    auto p = makePipe();
+    uint32_t page = 1;
+    XBusMessage req = makeReq("com.freebsdx.InputDevice",
+                              static_cast<uint32_t>(InputDeviceOpcode::ListDevices), 0x69000001, &page, sizeof(page));
+    InputDeviceService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.InputDevice",
+                                static_cast<uint32_t>(InputDeviceOpcode::ListDevices), 0x69000001);
+    InputDevicePage dp{};
+    std::memcpy(&dp, rep.payload_, sizeof(dp));
+    EXPECT_EQ(dp.total_, 2u);
+    EXPECT_EQ(dp.valid_, 1u);
+    EXPECT_EQ(dp.has_more_, 0u);
+    EXPECT_STREQ(dp.name_, "TouchPad");
+    EXPECT_STREQ(dp.vendor_, "06cb:7e7e");
+    EXPECT_EQ(dp.type_, 1u);
+
+    for (uint32_t id : {devs[1].id, 12345u}) {       // known device, then unknown
+        InputSensitivityRequest r{};
+        r.device_id_ = id;
+        r.sensitivity_ = 80;
+        r.accel_profile_ = 0;
+        req = makeReq("com.freebsdx.InputDevice",
+                      static_cast<uint32_t>(InputDeviceOpcode::SetSensitivity), 0x69000002, &r, sizeof(r));
+        InputDeviceService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.InputDevice",
+                  static_cast<uint32_t>(InputDeviceOpcode::SetSensitivity), 0x69000002);
+    }
+    ASSERT_EQ(applied.size(), 1u);                    // unknown id ignored
+    EXPECT_EQ(std::get<0>(applied[0]), devs[1].id);
+    EXPECT_EQ(std::get<1>(applied[0]), 80u);
+    EXPECT_FALSE(std::get<2>(applied[0]));
+
+    // Persisted: a fresh init replays the override.
+    applied.clear();
+    InputDeviceService::init([&] { return devs; },
+                             [&](uint32_t id, uint32_t s, bool a) { applied.emplace_back(id, s, a); });
+    ASSERT_EQ(applied.size(), 1u);
+    EXPECT_EQ(std::get<1>(applied[0]), 80u);
+    InputDeviceService::init(nullptr, nullptr);
 }
 
 }  // namespace

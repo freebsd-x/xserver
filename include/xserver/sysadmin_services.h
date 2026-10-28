@@ -51,4 +51,13 @@ public:
                               std::shared_ptr<IpcSocket> client) noexcept;
 };
 
+// com.freebsdx.RemoteLogin — sshd running state, port/listen address from
+// sshd_config, inbound session count from netstat. SetEnabled →
+// service.start/stop sshd (runtime only; rc.conf untouched).
+class RemoteLoginService {
+public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
 }  // namespace fbx::xserver

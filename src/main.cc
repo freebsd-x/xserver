@@ -26,6 +26,7 @@
 #include "xserver/audio_service.h"
 #include "xserver/screenshot_service.h"
 #include "xserver/user_services.h"
+#include "xserver/device_services.h"
 #include "xserver/lock_service.h"
 #include "xserver/screensaver_service.h"
 #include "xserver/terminal_service.h"
@@ -458,6 +459,13 @@ int main(int argc, char** argv) {
     PointerService::init([in = input.get()](uint32_t speed, bool accel, bool tap) {
         if (in) in->setPointerConfig(speed, accel, tap);
     });
+    // Per-device pointer speed (com.freebsdx.InputDevice) + hot-plug re-list.
+    InputDeviceService::init(
+        [in = input.get()]() { return in ? in->listDevices() : std::vector<inputdev::DeviceInfo>{}; },
+        [in = input.get()](uint32_t id, uint32_t sens, bool adaptive) {
+            if (in) in->setDeviceOverride(id, sens, adaptive);
+        });
+    if (input) input->setOnDevicesChanged([] { InputDeviceService::notifyDevicesChanged(); });
     // Mic mute gates the input at the OSS mixer.
     MicMuteService::init([](bool muted) { MicMuteService::applyToMixer(muted); });
     // WakeLock inhibits the idle screensaver + idle-lock while a keep-awake holds.
