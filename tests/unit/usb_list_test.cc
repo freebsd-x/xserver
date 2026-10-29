@@ -70,3 +70,44 @@ TEST(UsbList, HubFromProductWhenClassZero) {
     parseDeviceDesc("  bDeviceClass = 0x0009 \n", v[0]);   // root HUB
     EXPECT_EQ(v[0].cls, "HUB");
 }
+
+// ── Unprivileged devinfo path + capacity by serial ───────────────────────────
+
+#include "xserver/geom_parse.h"
+
+TEST(UsbDevinfo, ListsAttachedDevicesOncePerUgen) {
+    auto devs = fbx::xserver::usb::parseDevinfo(
+        "nexus0\n"
+        "      usbus0\n"
+        "        uhub0\n"
+        "          umass0 pnpinfo vendor=0x0781 product=0x5567 devclass=0x00 devsubclass=0x00 devproto=0x00 "
+        "sernum=\"4C530001231218115283\" release=0x0126 mode=host intclass=0x08 intsubclass=0x06 intprotocol=0x50 "
+        "at bus=0 hubaddr=1 port=2 devaddr=3 interface=0 ugen=ugen0.3\n"
+        "          ukbd0 pnpinfo vendor=0x046d product=0xc52b devclass=0x00 devsubclass=0x00 devproto=0x00 "
+        "sernum=\"\" release=0x1211 mode=host intclass=0x03 intsubclass=0x01 intprotocol=0x01 "
+        "at bus=0 hubaddr=1 port=4 devaddr=5 interface=0 ugen=ugen0.5\n"
+        "          ums0 pnpinfo vendor=0x046d product=0xc52b devclass=0x00 devsubclass=0x00 devproto=0x00 "
+        "sernum=\"\" release=0x1211 mode=host intclass=0x03 intsubclass=0x01 intprotocol=0x02 "
+        "at bus=0 hubaddr=1 port=4 devaddr=5 interface=1 ugen=ugen0.5\n");
+    ASSERT_EQ(devs.size(), 2u);                       // ums0 is ukbd0's second interface
+    EXPECT_EQ(devs[0].driver, "umass0");
+    EXPECT_EQ(devs[0].bus, 0u);
+    EXPECT_EQ(devs[0].addr, 3u);
+    EXPECT_EQ(devs[0].vid, 0x0781u);
+    EXPECT_EQ(devs[0].cls, "MSC");
+    EXPECT_EQ(devs[0].serial, "4C530001231218115283");
+    EXPECT_EQ(devs[1].driver, "ukbd0");
+    EXPECT_EQ(devs[1].cls, "HID");
+    EXPECT_EQ(fbx::xserver::usb::descProduct("SanDisk Cruzer Blade, class 0/0, rev 2.00/1.26, addr 3"),
+              "SanDisk Cruzer Blade");
+}
+
+TEST(UsbDevinfo, GeomDisksCarrySerialAndSize) {
+    auto disks = fbx::xserver::geom::parseDisks(
+        "Geom name: nda0\n   Mediasize: 256060514304 (238G)\n   descr: SAMSUNG MZVLW256HEHP-00000\n   ident: S35ENX0J\n"
+        "Geom name: da0\n   Mediasize: 15728640000 (15G)\n   descr: SanDisk Cruzer Blade\n   ident: 4C530001231218115283\n");
+    ASSERT_EQ(disks.size(), 2u);
+    EXPECT_EQ(disks[1].name, "da0");
+    EXPECT_EQ(disks[1].ident, "4C530001231218115283");
+    EXPECT_EQ(disks[1].bytes >> 20, 15000u);
+}

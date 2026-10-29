@@ -1,12 +1,15 @@
 #include "xserver/usb_service.h"
 #include "xserver/usb_list.h"
 #include "xserver/async_shell.h"
+#include "xserver/geom_parse.h"
 #include "shared/logger.h"
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <sys/sysctl.h>
 
 namespace fbx::xserver {
 
@@ -17,6 +20,22 @@ namespace {
 // popen (popen deadlocks in this threaded compositor — see async_shell.h).
 std::vector<usb::UsbInfo> enumerate() {
     auto devs = usb::parseList(spawnCapture("usbconfig list 2>/dev/null"));
+    if (devs.empty()) {
+        // usbconfig sees nothing without read access to /dev/usb/* (root:
+        // operator); fall back to devinfo, which any user can read — devices
+        // with a driver attached, named by the driver's %desc.
+        devs = usb::parseDevinfo(spawnCapture("devinfo -v 2>/dev/null"));
+        for (auto& u : devs) {
+            size_t i = u.driver.find_first_of("0123456789");
+            if (i == std::string::npos) continue;
+            std::string oid = "dev." + u.driver.substr(0, i) + "." + u.driver.substr(i) + ".%desc";
+            char desc[256] = {};
+            size_t len = sizeof(desc) - 1;
+            if (::sysctlbyname(oid.c_str(), desc, &len, nullptr, 0) == 0) u.product = usb::descProduct(desc);
+            if (u.product.empty()) u.product = u.driver;
+        }
+        return devs;
+    }
     for (auto& u : devs) {
         char cmd[96];
         std::snprintf(cmd, sizeof(cmd),
@@ -24,6 +43,14 @@ std::vector<usb::UsbInfo> enumerate() {
         usb::parseDeviceDesc(spawnCapture(cmd), u);
     }
     return devs;
+}
+
+// A USB stick's size: the GEOM disk whose serial (ident) is the device's.
+uint32_t capacityMb(const usb::UsbInfo& u) {
+    if (u.cls != "MSC" || u.serial.empty()) return 0;
+    for (const auto& d : geom::parseDisks(spawnCapture("geom disk list 2>/dev/null")))
+        if (d.ident == u.serial) return static_cast<uint32_t>(d.bytes >> 20);
+    return 0;
 }
 
 uint32_t devId(const usb::UsbInfo& u) noexcept { return (u.bus << 8) | u.addr; }
@@ -65,7 +92,7 @@ void UsbService::handleMessage(const shared::XBusMessage& msg,
             const usb::UsbInfo& u = devs[page];
             std::strncpy(pg.device_.name_, u.product.c_str(), sizeof(pg.device_.name_) - 1);
             std::strncpy(pg.device_.type_, typeFor(u.cls),    sizeof(pg.device_.type_) - 1);
-            pg.device_.capacity_mb_ = 0;        // da-device correlation = follow-up
+            pg.device_.capacity_mb_ = capacityMb(u);
             pg.device_.addr_        = devId(u);
             pg.count_ = 1;
         }

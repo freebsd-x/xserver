@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +24,8 @@ struct UsbInfo {
     uint32_t    vid = 0;
     uint32_t    pid = 0;
     uint8_t     device_class = 0; // USB bDeviceClass byte
+    std::string serial;          // iSerialNumber, if known (devinfo sernum)
+    std::string driver;          // attached driver instance, e.g. "umass0" (devinfo path)
 };
 
 // Map a bDeviceClass byte (0 → derive from the product name) to a short class.
@@ -128,6 +131,60 @@ inline void parseDeviceDesc(std::string_view out, UsbInfo& u) {
         else if (line.find("iProduct")      != std::string_view::npos) { auto s = detail::angleString(line); if (!s.empty()) u.product = s; }
     });
     u.cls = classString(u.device_class, u.product);
+}
+
+// ── Unprivileged enumeration (devinfo) ──────────────────────────────────────
+// usbconfig needs read access to /dev/usb/*, which is root:operator — as the
+// session user it sees nothing. `devinfo -v` is world-readable and lists every
+// USB device that has a driver attached:
+//   umass0 pnpinfo vendor=0x0781 product=0x5567 devclass=0x00 … sernum="4C53…"
+//     … intclass=0x08 … at bus=0 hubaddr=1 port=2 devaddr=3 interface=0 ugen=ugen0.3
+// One entry per ugen (a combo device's second interface is skipped). Product
+// names come from the driver's %desc sysctl, filled in by the caller.
+inline std::string pnpValue(std::string_view line, std::string_view key) {
+    std::string needle = " " + std::string(key) + "=";
+    size_t p = line.find(needle);
+    if (p == std::string_view::npos) return {};
+    p += needle.size();
+    if (p < line.size() && line[p] == '"') {
+        size_t q = line.find('"', p + 1);
+        return std::string(line.substr(p + 1, q == std::string_view::npos ? std::string_view::npos : q - p - 1));
+    }
+    size_t e = line.find(' ', p);
+    return std::string(line.substr(p, e == std::string_view::npos ? std::string_view::npos : e - p));
+}
+
+inline std::vector<UsbInfo> parseDevinfo(std::string_view out) {
+    std::vector<UsbInfo> devs;
+    detail::forEachLine(out, [&](std::string_view line) {
+        size_t u = line.find(" ugen=ugen");
+        if (u == std::string_view::npos) return;
+        std::string loc = pnpValue(line, "ugen").substr(4);   // "0.3"
+        size_t dot = loc.find('.');
+        if (dot == std::string::npos) return;
+        UsbInfo d;
+        d.bus  = static_cast<uint32_t>(std::strtoul(loc.substr(0, dot).c_str(), nullptr, 10));
+        d.addr = static_cast<uint32_t>(std::strtoul(loc.substr(dot + 1).c_str(), nullptr, 10));
+        for (const auto& o : devs) if (o.bus == d.bus && o.addr == d.addr) return;   // 2nd interface
+        size_t b = line.find_first_not_of(' ');
+        size_t e = line.find(' ', b);
+        d.driver = std::string(line.substr(b, e - b));
+        d.vid = static_cast<uint32_t>(std::strtoul(pnpValue(line, "vendor").c_str(), nullptr, 16));
+        d.pid = static_cast<uint32_t>(std::strtoul(pnpValue(line, "product").c_str(), nullptr, 16));
+        d.serial = pnpValue(line, "sernum");
+        uint8_t dc = static_cast<uint8_t>(std::strtoul(pnpValue(line, "devclass").c_str(), nullptr, 16));
+        uint8_t ic = static_cast<uint8_t>(std::strtoul(pnpValue(line, "intclass").c_str(), nullptr, 16));
+        d.device_class = dc ? dc : ic;      // class 0 = "per interface"
+        d.cls = classString(d.device_class);
+        devs.push_back(std::move(d));
+    });
+    return devs;
+}
+
+// "SanDisk Cruzer Blade, class 0/0, rev 2.00/1.00, addr 3" → "SanDisk Cruzer Blade"
+inline std::string descProduct(std::string_view desc) {
+    size_t c = desc.find(", class ");
+    return std::string(desc.substr(0, c));
 }
 
 }  // namespace fbx::xserver::usb
