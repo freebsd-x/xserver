@@ -299,4 +299,49 @@ inline uint32_t countEstablished(std::string_view out, uint32_t port) {
     return n;
 }
 
+// ── pkg(8) ───────────────────────────────────────────────────────────────────
+
+struct PkgUpdates {
+    uint32_t    count = 0;
+    std::string first;   // "firefox 132.0" — the first outdated package + its new version
+};
+
+// `pkg version -vRl '<' -U`: "firefox-131.0   <   needs updating (remote has 132.0)".
+inline PkgUpdates parsePkgOutdated(std::string_view out) {
+    PkgUpdates u;
+    for (auto line : detail::lines(out)) {
+        auto t = detail::tokens(line);
+        if (t.size() < 2 || t[1] != "<") continue;
+        ++u.count;
+        if (!u.first.empty()) continue;
+        std::string_view pkg = t[0];
+        size_t dash = pkg.rfind('-');
+        std::string name(dash == std::string_view::npos ? pkg : pkg.substr(0, dash));
+        constexpr std::string_view kHas = "remote has ";
+        size_t h = line.find(kHas);
+        if (h != std::string_view::npos) {
+            std::string_view ver = line.substr(h + kHas.size());
+            ver = ver.substr(0, ver.find(')'));
+            u.first = name + " " + std::string(ver);
+        } else {
+            u.first = name;
+        }
+    }
+    return u;
+}
+
+// ── Wi-Fi interfaces ─────────────────────────────────────────────────────────
+
+// `ifconfig -l [-u]` → the wlanN interfaces (what airplane mode switches).
+inline std::vector<std::string> parseWlanIfaces(std::string_view out) {
+    std::vector<std::string> v;
+    for (auto t : detail::tokens(detail::trim(out.substr(0, out.find('\n'))))) {
+        if (t.size() < 5 || t.size() > 7 || t.substr(0, 4) != "wlan") continue;
+        bool digits = true;
+        for (char c : t.substr(4)) digits = digits && c >= '0' && c <= '9';
+        if (digits) v.emplace_back(t);
+    }
+    return v;
+}
+
 }  // namespace fbx::xserver::sysadmin

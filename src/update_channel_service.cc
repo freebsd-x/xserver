@@ -1,5 +1,7 @@
 #include "xserver/update_channel_service.h"
 #include "xserver/config_service.h"
+#include "xserver/async_shell.h"
+#include "xserver/sysadmin_parse.h"
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -13,7 +15,11 @@ shared::UpdateChannelState build() {
     uint32_t ch = 0;
     try { ch = static_cast<uint32_t>(std::stoul(v)); } catch (...) { ch = 0; }
     st.channel_       = ch > 1 ? 0u : ch;
-    st.pending_count_ = 0;                 // pkg query is a follow-up
+    // Outdated packages vs. the cached repo catalogue (-U: no network fetch).
+    // Off the event loop: the last result now, a refresh in the background.
+    auto pending = sysadmin::parsePkgOutdated(g_asyncShell.get("pkg version -vRl '<' -U 2>/dev/null", 20));
+    st.pending_count_ = pending.count;
+    std::strncpy(st.pending_ver_, pending.first.c_str(), sizeof(st.pending_ver_) - 1);
     std::strncpy(st.channel_name_, st.channel_ ? "Beta" : "Stable", sizeof(st.channel_name_) - 1);
     return st;
 }

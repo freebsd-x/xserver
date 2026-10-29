@@ -207,6 +207,32 @@ void session_teardown(Session& s) {
 // privops::validateOp(verb, arg) first — this re-checks the verb and acts only
 // on known ones. No shell, no arbitrary exec: a fixed file write / sysctl per
 // verb. Returns 0 on success or a negative errno.
+// posix_spawn a FIXED argv (no shell), optionally feeding `stdin_data`, and
+// wait. Returns the exit status, or -1.
+int runFixed(const char* path, std::vector<const char*> argv, const char* stdin_data = nullptr) {
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    int pipefd[2] = {-1, -1};
+    if (stdin_data) {
+        if (::pipe(pipefd) != 0) { posix_spawn_file_actions_destroy(&fa); return -1; }
+        posix_spawn_file_actions_adddup2(&fa, pipefd[0], STDIN_FILENO);
+        posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+    }
+    pid_t pid = 0;
+    int rc = ::posix_spawn(&pid, path, &fa, nullptr, const_cast<char* const*>(argv.data()), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (stdin_data) {
+        ::close(pipefd[0]);
+        if (rc == 0) (void)!::write(pipefd[1], stdin_data, std::strlen(stdin_data));
+        ::close(pipefd[1]);
+    }
+    if (rc != 0) return -1;
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 int32_t perform_privileged(const std::string& verb, const std::string& arg) {
     using namespace fbx::xserver::privops;
     if (verb == kResolvConfWrite) {
@@ -224,15 +250,42 @@ int32_t perform_privileged(const std::string& verb, const std::string& arg) {
     }
     if (verb == kFirewallEnable) {
         // FIXED argv — the (validated "0"/"1") arg only selects -d / -e; it never
-        // becomes part of the command line. posix_spawn, no shell.
-        const char* flag = (arg == "1") ? "-e" : "-d";
-        char* const argv[] = { const_cast<char*>("pfctl"), const_cast<char*>(flag), nullptr };
-        pid_t pid = 0;
-        int rc = ::posix_spawn(&pid, "/sbin/pfctl", nullptr, nullptr, argv, environ);
-        if (rc != 0) return -rc;
-        int status = 0;
-        if (::waitpid(pid, &status, 0) < 0) return -errno;
-        return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -EIO;
+        // becomes part of the command line. posix_spawn, no shell. Enabling
+        // first reloads /etc/pf.conf, which also undoes firewall.blockin.
+        if (arg == "1") {
+            // pfctl doesn't load pf itself; -n: fine if it's already loaded.
+            if (runFixed("/sbin/kldload", {"kldload", "-n", "pf"}) != 0) return -EIO;
+            // The system ruleset, or none at all — either way any block-all
+            // ruleset from firewall.blockin is replaced.
+            int lr = ::access("/etc/pf.conf", R_OK) == 0
+                   ? runFixed("/sbin/pfctl", {"pfctl", "-f", "/etc/pf.conf"})
+                   : runFixed("/sbin/pfctl", {"pfctl", "-F", "rules"});
+            if (lr != 0) return -EIO;
+        }
+        int rc = runFixed("/sbin/pfctl", {"pfctl", arg == "1" ? "-e" : "-d"});
+        // pfctl -e/-d fails if pf already is in that state; that's success here.
+        return (rc == 0 || rc == 1) ? 0 : -EIO;
+    }
+    if (verb == kFirewallBlockIn) {
+        // A FIXED ruleset (nothing from the client): loopback untouched,
+        // everything inbound blocked except replies to our own traffic and DHCP
+        // offers (so the lease still renews).
+        static constexpr char kBlockIn[] =
+            "set skip on lo0\n"
+            "block in all\n"
+            "pass in proto udp from any port 67 to any port 68\n"
+            "pass out all keep state\n";
+        if (runFixed("/sbin/kldload", {"kldload", "-n", "pf"}) != 0) return -EIO;
+        if (runFixed("/sbin/pfctl", {"pfctl", "-f", "-"}, kBlockIn) != 0) return -EIO;
+        int rc = runFixed("/sbin/pfctl", {"pfctl", "-e"});
+        return (rc == 0 || rc == 1) ? 0 : -EIO;
+    }
+    if (verb == kWlanState) {
+        // "wlanN:0|1" → ifconfig wlanN down|up. The name is validated to
+        // wlan<digits>, passed as its own argv element.
+        std::string ifname = arg.substr(0, arg.find(':'));
+        return runFixed("/sbin/ifconfig", {"ifconfig", ifname.c_str(), arg.back() == '1' ? "up" : "down"}) == 0
+               ? 0 : -EIO;
     }
     if (verb == kKmodUnload) {
         // `kldunload -n <name>`. The name is validated ([A-Za-z0-9._-], alnum

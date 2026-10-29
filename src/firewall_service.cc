@@ -63,6 +63,9 @@ void FirewallService::handleMessage(const shared::XBusMessage& msg,
         const char* arg = req.enabled_ ? "1" : "0";
         int r = runPrivilegedOp(privops::kFirewallEnable, arg);
         if (r == 0) {
+            // Enabling reloads /etc/pf.conf and disabling turns pf off: either
+            // way the emergency block-all ruleset is gone.
+            ConfigService::set("firewall.block_all", "0");
             LOG_INFO("FirewallService: pf {} via broker", req.enabled_ ? "enabled" : "disabled");
         } else {
             if (r != kBrokerUnreachable)
@@ -74,14 +77,21 @@ void FirewallService::handleMessage(const shared::XBusMessage& msg,
         broadcastStatus();
         break;
     }
-    case O::BlockAllInbound:
-        // Record the emergency flag; loading the actual block-all-inbound pf
-        // ruleset is a follow-up (needs a ruleset-load broker verb).
-        ConfigService::set("firewall.block_all", "1");
-        LOG_INFO("FirewallService: block-all-inbound flagged (ruleset load is a follow-up)");
+    case O::BlockAllInbound: {
+        // Load the block-all-inbound ruleset as root; the flag only records
+        // what actually took effect. Re-enabling the firewall undoes it.
+        int r = runPrivilegedOp(privops::kFirewallBlockIn, "1");
+        if (r == 0) {
+            ConfigService::set("firewall.block_all", "1");
+            LOG_INFO("FirewallService: all inbound traffic blocked via broker");
+        } else {
+            LOG_WARN("FirewallService: can't block inbound ({})",
+                     r == kBrokerUnreachable ? "broker unavailable — needs root" : "broker refused");
+        }
         sendStatus(client, msg, static_cast<uint32_t>(O::BlockAllInbound));
         broadcastStatus();
         break;
+    }
     default: break;
     }
 }

@@ -170,3 +170,24 @@ TEST(SysadminSshd, CountsInboundEstablishedOnly) {
     EXPECT_EQ(countEstablished(kNetstat, 22), 2u);   // outbound-to-22 and port 222 excluded
     EXPECT_EQ(countEstablished("", 22), 0u);
 }
+
+// ── pkg ──────────────────────────────────────────────────────────────────────
+
+TEST(SysadminPkg, CountsOutdatedPackages) {
+    auto u = parsePkgOutdated(
+        "firefox-131.0_1                    <   needs updating (remote has 132.0,2)\n"
+        "Imath-3.2.3_1                      =   up-to-date with remote\n"
+        "py311-pip-24.0                     <   needs updating (remote has 24.2)\n");
+    EXPECT_EQ(u.count, 2u);
+    EXPECT_EQ(u.first, "firefox 132.0,2");
+    EXPECT_EQ(parsePkgOutdated("").count, 0u);
+    EXPECT_EQ(parsePkgOutdated("").first, "");
+}
+
+TEST(SysadminWlan, OnlyWifiInterfaces) {
+    auto v = parseWlanIfaces("lo0 em0 wlan0 wlan12 wlanx bridge0\n");
+    ASSERT_EQ(v.size(), 2u);
+    EXPECT_EQ(v[0], "wlan0");
+    EXPECT_EQ(v[1], "wlan12");
+    EXPECT_TRUE(parseWlanIfaces("").empty());
+}

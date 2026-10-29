@@ -146,3 +146,26 @@ TEST(PrivOps, JailRemoveOnlyPositiveJids) {
     EXPECT_FALSE(validateOp(kJailRemove, "web"));
     EXPECT_FALSE(validateOp(kJailRemove, "1234567890"));
 }
+
+TEST(PrivOps, FirewallBlockInIsAOneWayTrigger) {
+    EXPECT_TRUE(knownVerb(kFirewallBlockIn));
+    EXPECT_TRUE(validateOp(kFirewallBlockIn, "1"));
+    EXPECT_FALSE(validateOp(kFirewallBlockIn, "0"));            // undo is firewall.enable
+    EXPECT_FALSE(validateOp(kFirewallBlockIn, ""));
+    EXPECT_FALSE(validateOp(kFirewallBlockIn, "pass in all"));  // never a client ruleset
+}
+
+TEST(PrivOps, WlanStateOnlyWifiInterfaces) {
+    EXPECT_TRUE(knownVerb(kWlanState));
+    EXPECT_TRUE(validateOp(kWlanState, "wlan0:0"));
+    EXPECT_TRUE(validateOp(kWlanState, "wlan12:1"));
+    EXPECT_TRUE(validateOp(kWlanState, "wlan999:1"));
+    EXPECT_FALSE(validateOp(kWlanState, "em0:0"));               // wired: never
+    EXPECT_FALSE(validateOp(kWlanState, "lo0:0"));
+    EXPECT_FALSE(validateOp(kWlanState, "wlan:0"));
+    EXPECT_FALSE(validateOp(kWlanState, "wlan0:2"));
+    EXPECT_FALSE(validateOp(kWlanState, "wlan0"));
+    EXPECT_FALSE(validateOp(kWlanState, "wlan0:0 destroy"));
+    EXPECT_FALSE(validateOp(kWlanState, "wlan1000:0"));
+    EXPECT_FALSE(validateOp(kWlanState, "wlanx:1"));
+}
