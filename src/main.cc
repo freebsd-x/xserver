@@ -931,7 +931,18 @@ int main(int argc, char** argv) {
                     has_focus = (g_surface_clients[focused_surface] == c_sock);
                 }
 
+                // Everything here runs on the compositor thread: a slow handler
+                // freezes input and drawing. Name any that takes over 50 ms.
+                const auto t_handler = std::chrono::steady_clock::now();
                 XBusResult x_res = XBusDispatcher::ProcessMessage(c_sock, d, f, comp.get(), &window_stack, has_focus, drm_ptr);
+                if (auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t_handler).count();
+                    ms > 50 && d.size() >= sizeof(shared::XBusMessage)) {
+                    const auto* m = reinterpret_cast<const shared::XBusMessage*>(d.data());
+                    if (m->magic_ == shared::XBUS_MAGIC)
+                        std::cerr << "[xserver] slow XBus handler: " << std::string(m->service_name_, strnlen(m->service_name_, sizeof(m->service_name_)))
+                                  << " op " << m->opcode_ << " took " << ms << " ms (blocks the desktop)\n";
+                }
                 if (x_res.consumed) return;
                 
                 // Wayland bridge title update (64 bytes, distinct from RenderMessage 36)

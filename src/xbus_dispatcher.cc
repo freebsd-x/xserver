@@ -135,6 +135,7 @@
 #include "xserver/ipc_socket.h"
 #include <iostream>
 #include <cstring>
+#include <thread>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -153,25 +154,36 @@ static uint32_t safeConfigU32(const std::string& s) noexcept {
 // Services only the trusted shell may call (see the gate in ProcessMessage).
 using ServiceHandler = void (*)(const shared::XBusMessage&, std::shared_ptr<IpcSocket>) noexcept;
 
-static ServiceHandler shellOnlyService(const char* name) noexcept {
-    static constexpr struct { const char* name; ServiceHandler fn; } kTable[] = {
-        {"com.freebsdx.Services", &RcServicesService::handleMessage},
-        {"com.freebsdx.Jails",    &JailsService::handleMessage},
-        {"com.freebsdx.ZfsPools", &ZfsPoolsService::handleMessage},
-        {"com.freebsdx.BootEnv",  &BootEnvService::handleMessage},
-        {"com.freebsdx.NTP",      &NtpService::handleMessage},
-        {"com.freebsdx.CronJobs", &CronJobsService::handleMessage},
+struct ShellOnlyService {
+    const char*    name;
+    ServiceHandler fn;
+    // Runs commands that can take a while (rc scripts, bectl, zpool, ntpq,
+    // crontab, podman, the root broker…): handled on a worker thread so the
+    // compositor never freezes. Only for handlers that touch nothing but
+    // files, child processes and the broker — anything using compositor,
+    // input or IME state must stay false.
+    bool           slow = false;
+};
+
+static const ShellOnlyService* shellOnlyService(const char* name) noexcept {
+    static constexpr ShellOnlyService kTable[] = {
+        {"com.freebsdx.Services", &RcServicesService::handleMessage, true},
+        {"com.freebsdx.Jails",    &JailsService::handleMessage, true},
+        {"com.freebsdx.ZfsPools", &ZfsPoolsService::handleMessage, true},
+        {"com.freebsdx.BootEnv",  &BootEnvService::handleMessage, true},
+        {"com.freebsdx.NTP",      &NtpService::handleMessage, true},
+        {"com.freebsdx.CronJobs", &CronJobsService::handleMessage, true},
         {"com.freebsdx.SshKeys",  &SshKeysService::handleMessage},
         {"com.freebsdx.Captures", &CapturesService::handleMessage},
         {"com.freebsdx.EnvVars",  &EnvVarsService::handleMessage},
-        {"com.freebsdx.RemoteLogin",  &RemoteLoginService::handleMessage},
+        {"com.freebsdx.RemoteLogin",  &RemoteLoginService::handleMessage, true},
         {"com.freebsdx.StartupItems", &StartupItemsService::handleMessage},
-        {"com.freebsdx.PrintQueue",   &PrintQueueService::handleMessage},
+        {"com.freebsdx.PrintQueue",   &PrintQueueService::handleMessage, true},
         {"com.freebsdx.InputDevice",  &InputDeviceService::handleMessage},
-        {"com.freebsdx.NetworkShares",   &NetworkSharesService::handleMessage},
-        {"com.freebsdx.NetworkShare",    &NetworkShareService::handleMessage},
+        {"com.freebsdx.NetworkShares",   &NetworkSharesService::handleMessage, true},
+        {"com.freebsdx.NetworkShare",    &NetworkShareService::handleMessage, true},
         {"com.freebsdx.VirtualMachines", &VirtualMachinesService::handleMessage},
-        {"com.freebsdx.Containers",      &ContainersService::handleMessage},
+        {"com.freebsdx.Containers",      &ContainersService::handleMessage, true},
         {"com.freebsdx.Totp",            &TotpService::handleMessage},
         {"com.freebsdx.Reminder",        &ReminderService::handleMessage},
         {"com.freebsdx.TextReplacement", &TextReplacementService::handleMessage},
@@ -182,7 +194,7 @@ static ServiceHandler shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.AppPerms",        &AppPermsService::handleMessage},
         {"com.freebsdx.Presentation",    &PresentationService::handleMessage},
         {"com.freebsdx.Backup",          &BackupService::handleMessage},
-        {"com.freebsdx.GameController",  &GameControllerService::handleMessage},
+        {"com.freebsdx.GameController",  &GameControllerService::handleMessage, true},
         {"com.freebsdx.AudioEq",         &AudioEqService::handleMessage},
         {"com.freebsdx.FastCharging",    &FastChargingService::handleMessage},
         {"com.freebsdx.InputMethod",     &InputMethodService::handleMessage},
@@ -190,7 +202,7 @@ static ServiceHandler shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.DevOverlay",      &DevOverlayService::handleMessage},
     };
     for (const auto& e : kTable)
-        if (std::strcmp(name, e.name) == 0) return e.fn;
+        if (std::strcmp(name, e.name) == 0) return &e;
     return nullptr;
 }
 
@@ -1006,7 +1018,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         KmodService::handleMessage(*msg, client);
         return {true, std::nullopt};
     }
-    else if (auto handler = shellOnlyService(msg->service_name_)) {
+    else if (const ShellOnlyService* svc = shellOnlyService(msg->service_name_)) {
         // Root actions via the broker (Services/Jails/ZfsPools/BootEnv/NTP/
         // RemoteLogin), the user's crontab, SSH keys, captures, env and
         // autostart files, print jobs, input devices, network mounts, VMs,
@@ -1015,9 +1027,13 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // app permissions, presentation mode, backups, game controllers, the
         // EQ, charging and the input method: shell panels only.
         // Apps get no reply, like the other trusted-only services.
-        if (trusted) handler(*msg, client);
-        else std::cerr << "[XBusDispatcher] DENIED: untrusted app attempted "
-                       << msg->service_name_ << "\n";
+        if (!trusted)
+            std::cerr << "[XBusDispatcher] DENIED: untrusted app attempted "
+                      << msg->service_name_ << "\n";
+        else if (svc->slow)
+            std::thread([fn = svc->fn, m = *msg, client] { fn(m, client); }).detach();
+        else
+            svc->fn(*msg, client);
         return {true, std::nullopt};
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.BatteryHealth") == 0) {

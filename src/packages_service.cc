@@ -15,7 +15,10 @@ namespace {
 // posix_spawn, not popen (popen forks + deadlocks the child on a libc stdio lock
 // in this multithreaded compositor — see async_shell.h).
 std::string runPkgUpgrade() {
-    return spawnCapture("pkg upgrade -n 2>/dev/null");
+    // Can take a while (may consult the repo catalogue) and handlers run on
+    // the compositor thread: answer from the last result, refresh in the
+    // background (capped at 30 s).
+    return g_asyncShell.get("pkg upgrade -n 2>/dev/null", 30);
 }
 }  // namespace
 

@@ -15,6 +15,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -40,6 +41,10 @@ using userfiles::writeFileAtomic;
 // ── Cron ─────────────────────────────────────────────────────────────────────
 
 constexpr const char* kCronName = "com.freebsdx.CronJobs";
+
+// CronJobs runs on dispatcher worker threads; a toggle is read-modify-install
+// of the whole crontab, so two at once must not interleave.
+std::mutex g_cron_mu;
 
 // The user's crontab text; nullopt when they have none (crontab -l exits 1).
 std::optional<std::string> readCrontab() {
@@ -209,6 +214,7 @@ void CronJobsService::handleMessage(const shared::XBusMessage& msg,
     case O::SetJobEnabled: {
         shared::CronJobToggleRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
+        std::lock_guard lk(g_cron_mu);
         bool ok = false;
         std::string updated;
         if (auto text = readCrontab();
