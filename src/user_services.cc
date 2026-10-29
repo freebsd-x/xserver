@@ -2,6 +2,7 @@
 #include "xserver/user_parse.h"
 #include "xserver/async_shell.h"
 #include "xserver/xbus_reply.h"
+#include "xserver/config_service.h"
 #include "xserver/user_files.h"
 #include "shared/user_env.h"
 #include "shared/autostart.h"
@@ -9,6 +10,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <map>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <climits>
 #include <cstring>
@@ -547,6 +551,121 @@ void StartupItemsService::handleMessage(const shared::XBusMessage& msg,
         if (ok) broadcast<char>(kName, static_cast<uint32_t>(O::ItemsChanged), nullptr);
         break;
     }
+    default: break;
+    }
+}
+
+// ── Downloads / Transfer ─────────────────────────────────────────────────────
+
+namespace {
+
+struct DownloadFile {
+    std::string name;
+    uint64_t    size  = 0;
+    time_t      mtime = 0;
+    bool        partial = false;
+};
+
+std::vector<DownloadFile> downloadFiles() {
+    std::vector<DownloadFile> out;
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(homeDir() + "/Downloads", ec)) {
+        std::string name = de.path().filename().string();
+        struct stat st{};
+        if (name.empty() || name[0] == '.' || ::lstat(de.path().c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        out.push_back({name, static_cast<uint64_t>(st.st_size), st.st_mtime, userdata::isPartialDownload(name)});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const DownloadFile& a, const DownloadFile& b) { return a.mtime > b.mtime; });
+    return out;
+}
+
+// Bytes/time last seen per partial file, for a growth-rate speed.
+std::mutex g_transfer_mu;
+std::map<std::string, std::pair<uint64_t, std::chrono::steady_clock::time_point>> g_transfer_seen;
+
+uint32_t speedKbps(const DownloadFile& f) {
+    std::lock_guard lk(g_transfer_mu);
+    auto now = std::chrono::steady_clock::now();
+    auto it = g_transfer_seen.find(f.name);
+    uint32_t kbps = 0;
+    if (it != g_transfer_seen.end()) {
+        double secs = std::chrono::duration<double>(now - it->second.second).count();
+        if (secs > 0.2 && f.size >= it->second.first)
+            kbps = static_cast<uint32_t>(static_cast<double>(f.size - it->second.first) / 1024.0 / secs);
+    }
+    g_transfer_seen[f.name] = {f.size, now};
+    return kbps;
+}
+
+}  // namespace
+
+void DownloadsService::handleMessage(const shared::XBusMessage& msg,
+                                     std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::DownloadOpcode;
+    constexpr const char* kName = "com.freebsdx.Downloads";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::ListDownloads: {
+        const time_t cleared = static_cast<time_t>(
+            std::strtoll(ConfigService::get("downloads.cleared_at", "0").c_str(), nullptr, 10));
+        std::vector<DownloadFile> files;
+        for (auto& f : downloadFiles())
+            if (f.partial || f.mtime > cleared) files.push_back(std::move(f));
+        auto pg = makePage<shared::DownloadPage>(readPage(msg), files,
+            [](shared::DownloadEntry& e, const DownloadFile& f) {
+                e.id_             = userdata::fileId(f.name);
+                e.state_          = f.partial ? 0u : 1u;
+                e.received_bytes_ = f.size;
+                e.total_bytes_    = f.partial ? 0 : f.size;   // a browser's final size is unknown here
+                e.speed_kbps_     = f.partial ? speedKbps(f) : 0;
+                std::strncpy(e.filename_, f.name.c_str(), sizeof(e.filename_) - 1);
+            });
+        reply(msg, client, kName, msg.opcode_, &pg);
+        break;
+    }
+    case O::ClearCompleted:
+        // Hide what's finished now; files are never deleted.
+        ConfigService::set("downloads.cleared_at", std::to_string(std::time(nullptr)));
+        broadcast<char>(kName, static_cast<uint32_t>(O::DownloadComplete), nullptr);
+        break;
+    case O::OpenFile:
+        LOG_INFO("DownloadsService: OpenFile is handled by the shell (default app via MIME)");
+        break;
+    default: break;
+    }
+}
+
+void TransferService::handleMessage(const shared::XBusMessage& msg,
+                                    std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::TransferOpcode;
+    constexpr const char* kName = "com.freebsdx.Transfer";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::ListActive: {
+        std::vector<DownloadFile> active;
+        for (auto& f : downloadFiles()) if (f.partial) active.push_back(std::move(f));
+        uint32_t page = readPage(msg);
+        shared::TransferPage pg{};
+        pg.page_  = page;
+        pg.total_ = static_cast<uint32_t>(active.size());
+        if (page < active.size()) {
+            const auto& f = active[page];
+            pg.valid_       = 1;
+            pg.has_more_    = page + 1 < active.size() ? 1u : 0u;
+            std::snprintf(pg.id_, sizeof(pg.id_), "%08x", userdata::fileId(f.name));
+            std::strncpy(pg.filename_, f.name.c_str(), sizeof(pg.filename_) - 1);
+            pg.bytes_done_  = f.size;
+            pg.bytes_total_ = 0;            // unknown: the browser holds it
+            pg.speed_kbps_  = speedKbps(f);
+            pg.direction_   = 0;            // download
+        }
+        reply(msg, client, kName, msg.opcode_, &pg);
+        break;
+    }
+    case O::CancelTransfer:
+        LOG_WARN("TransferService: can't cancel — the download belongs to another program");
+        ack(msg, client, kName);
+        break;
     default: break;
     }
 }

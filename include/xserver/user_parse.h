@@ -264,4 +264,21 @@ inline bool pngSize(std::string_view head, uint32_t& w, uint32_t& h) {
     return true;
 }
 
+// ── Downloads ────────────────────────────────────────────────────────────────
+
+// A file a browser is still writing: Firefox ".part", Chromium ".crdownload",
+// Safari/WebKit ".download", and the generic ".partial".
+inline bool isPartialDownload(std::string_view name) {
+    for (std::string_view ext : {".part", ".crdownload", ".download", ".partial"})
+        if (name.size() > ext.size() && name.substr(name.size() - ext.size()) == ext) return true;
+    return false;
+}
+
+// Stable id from the file name (FNV-1a); never 0.
+inline uint32_t fileId(std::string_view name) {
+    uint32_t h = 2166136261u;
+    for (char c : name) { h ^= static_cast<uint8_t>(c); h *= 16777619u; }
+    return h ? h : 1u;
+}
+
 }  // namespace fbx::xserver::userdata

@@ -200,6 +200,8 @@ static const ShellOnlyService* shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.InputMethod",     &InputMethodService::handleMessage},
         {"com.freebsdx.AudioRouting",    &AudioRoutingService::handleMessage},
         {"com.freebsdx.DevOverlay",      &DevOverlayService::handleMessage},
+        {"com.freebsdx.Downloads",       &DownloadsService::handleMessage},
+        {"com.freebsdx.Transfer",        &TransferService::handleMessage},
     };
     for (const auto& e : kTable)
         if (std::strcmp(name, e.name) == 0) return &e;

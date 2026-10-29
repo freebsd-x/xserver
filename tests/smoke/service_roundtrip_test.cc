@@ -3513,4 +3513,68 @@ TEST_F(ServiceRoundtrip, DevOverlayDrivesTheGpuOverlay) {
     DevOverlayService::init(nullptr, nullptr);
 }
 
+// ── Batch 15: Downloads / Transfer ────────────────────────────────────────────
+
+TEST_F(ServiceRoundtrip, DownloadsListFinishedAndPartialAndClearHidesOnly) {
+    std::string dl = home_ + "/Downloads";
+    writeHomeFile(dl + "/report.pdf", std::string(3000, 'p'));
+    writeHomeFile(dl + "/movie.mkv.part", std::string(500, 'm'));
+    writeHomeFile(dl + "/.hidden", "h");
+    struct timespec old[2] = {{std::time(nullptr) - 3600, 0}, {std::time(nullptr) - 3600, 0}};
+    ::utimensat(AT_FDCWD, (dl + "/report.pdf").c_str(), old, 0);
+
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.Downloads", static_cast<uint32_t>(DownloadOpcode::ListDownloads),
+                                  tid, &page, sizeof(page));
+        DownloadsService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.Downloads",
+                                    static_cast<uint32_t>(DownloadOpcode::ListDownloads), tid);
+        DownloadPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    DownloadPage pg = list(0x44100001);
+    ASSERT_EQ(pg.total_, 2u);
+    EXPECT_STREQ(pg.entries_[0].filename_, "movie.mkv.part");     // newest first
+    EXPECT_EQ(pg.entries_[0].state_, 0u);                         // still being written
+    EXPECT_STREQ(pg.entries_[1].filename_, "report.pdf");
+    EXPECT_EQ(pg.entries_[1].state_, 1u);
+    EXPECT_EQ(pg.entries_[1].total_bytes_, 3000u);
+
+    XBusMessage req = makeReq("com.freebsdx.Downloads", static_cast<uint32_t>(DownloadOpcode::ClearCompleted), 0x44100002);
+    DownloadsService::handleMessage(req, p.svc);
+    pg = list(0x44100003);
+    ASSERT_EQ(pg.total_, 1u);                                     // finished one hidden...
+    EXPECT_STREQ(pg.entries_[0].filename_, "movie.mkv.part");
+    EXPECT_TRUE(std::filesystem::exists(dl + "/report.pdf"));     // ...but never deleted
+}
+
+TEST_F(ServiceRoundtrip, TransferListsInProgressDownloadsWithSpeed) {
+    std::string part = home_ + "/Downloads/iso.img.crdownload";
+    writeHomeFile(part, std::string(1000, 'x'));
+    writeHomeFile(home_ + "/Downloads/done.txt", "d");
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.Transfer", static_cast<uint32_t>(TransferOpcode::ListActive),
+                                  tid, &page, sizeof(page));
+        TransferService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.Transfer",
+                                    static_cast<uint32_t>(TransferOpcode::ListActive), tid);
+        TransferPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    TransferPage pg = list(0x54100001);
+    ASSERT_EQ(pg.total_, 1u);
+    EXPECT_STREQ(pg.filename_, "iso.img.crdownload");
+    EXPECT_EQ(pg.bytes_done_, 1000u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::ofstream(part, std::ios::app) << std::string(1024 * 100, 'y');   // +100 KiB
+    pg = list(0x54100002);
+    EXPECT_GT(pg.speed_kbps_, 0u);                                // growth measured
+}
+
 }  // namespace

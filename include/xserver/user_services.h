@@ -71,4 +71,25 @@ public:
                               std::shared_ptr<IpcSocket> client) noexcept;
 };
 
+// com.freebsdx.Downloads — the files in ~/Downloads, newest first (2 per
+// page). Ones a browser is still writing (.part/.crdownload/…) are "active";
+// the rest are done. Nothing on this desktop produces downloads itself, so
+// this reflects what browsers and tools put there. ClearCompleted hides the
+// finished ones from the list (a cut-off time, never deleting files); OpenFile
+// is done by the shell (it launches the default app), so it's only logged.
+class DownloadsService {
+public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
+// com.freebsdx.Transfer — the in-progress downloads above, one per page, with
+// the speed measured from how fast each file grows between polls. Cancel is
+// refused: the transfer belongs to another program.
+class TransferService {
+public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
 }  // namespace fbx::xserver
