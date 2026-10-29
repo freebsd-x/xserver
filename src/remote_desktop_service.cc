@@ -1,4 +1,5 @@
 #include "xserver/remote_desktop_service.h"
+#include "xserver/vnc_auth.h"
 #include "xserver/vulkan_compositor.h"
 #include "shared/protocol.h"
 #include <sys/types.h>
@@ -9,6 +10,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <thread>
@@ -33,6 +35,7 @@ std::atomic<uint32_t>             RemoteDesktopService::client_count_{0};
 int                               RemoteDesktopService::listen_fd_    = -1;
 std::thread                       RemoteDesktopService::accept_thread_;
 std::string                       RemoteDesktopService::password_;
+std::mutex                        RemoteDesktopService::password_mutex_;
 std::mutex                        RemoteDesktopService::inject_mutex_;
 std::deque<shared::InputMessage>  RemoteDesktopService::inject_queue_;
 std::mutex                        RemoteDesktopService::capture_mutex_;
@@ -299,18 +302,16 @@ void RemoteDesktopService::clientLoop(int fd, uint32_t w, uint32_t h) noexcept {
     char ver[12]{};
     if (!read_all(fd, ver, 12)) { ::close(fd); --client_count_; broadcastStatus(); return; }
 
-    // 2. Security
-    if (password_.empty()) {
-        // Security type 1 (None)
-        uint8_t sec[2] = {1, 1};
-        if (!write_all(fd, sec, 2)) { ::close(fd); --client_count_; broadcastStatus(); return; }
-
-        uint8_t picked = 0;
-        if (!read_all(fd, &picked, 1)) { ::close(fd); --client_count_; broadcastStatus(); return; }
-
-        // SecurityResult: OK
-        uint8_t ok[4] = {0, 0, 0, 0};
-        if (!write_all(fd, ok, 4)) { ::close(fd); --client_count_; broadcastStatus(); return; }
+    // 2. Security. Never security type None: this socket gives full keyboard
+    // and mouse control of the desktop to anyone on the network.
+    const std::string password = currentPassword();
+    if (password.empty()) {
+        // RFB 3.8: zero security types + a reason, then close.
+        static constexpr char kReason[] = "Remote desktop needs a password (Settings)";
+        uint8_t none[5] = {0, 0, 0, 0, static_cast<uint8_t>(sizeof(kReason) - 1)};
+        write_all(fd, none, 5);
+        write_all(fd, kReason, sizeof(kReason) - 1);
+        ::close(fd); --client_count_; broadcastStatus(); return;
     } else {
         // Security type 2 (VNC Auth)
         uint8_t sec[2] = {1, 2};
@@ -319,7 +320,9 @@ void RemoteDesktopService::clientLoop(int fd, uint32_t w, uint32_t h) noexcept {
         uint8_t picked = 0;
         if (!read_all(fd, &picked, 1)) { ::close(fd); --client_count_; broadcastStatus(); return; }
 
-        if (!doVncAuth(fd)) {
+        if (!doVncAuth(fd, password)) {
+            std::cerr << "[RemoteDesktop] VNC auth failed — closing\n";
+            std::this_thread::sleep_for(std::chrono::seconds(1));   // slow down guessing
             // SecurityResult: fail
             uint8_t fail[4] = {0, 0, 0, 1};
             write_all(fd, fail, 4);
@@ -441,7 +444,7 @@ done:
 
 // ─── VNC Auth ─────────────────────────────────────────────────────────────────
 
-bool RemoteDesktopService::doVncAuth(int fd) noexcept {
+bool RemoteDesktopService::doVncAuth(int fd, const std::string& password) noexcept {
     // Generate 16-byte random challenge
     uint8_t challenge[16]{};
     arc4random_buf(challenge, 16);
@@ -451,14 +454,13 @@ bool RemoteDesktopService::doVncAuth(int fd) noexcept {
     uint8_t response[16]{};
     if (!read_all(fd, response, 16)) return false;
 
-    // Simplified: without OpenSSL DES we can't verify the VNC auth response
-    // properly. Accept the connection if a password is set — the password
-    // protects via the security type negotiation (type 2 = VNC Auth is offered,
-    // clients that don't know the password won't be able to produce the correct
-    // DES-encrypted response). For now, always accept to complete the handshake.
-    // TODO: implement full DES verification via OpenSSL DES_ecb_encrypt.
-    (void)response;
-    return true;
+    // The response must be the challenge DES-encrypted with the password.
+    return vnc::verify(password, challenge, response);
+}
+
+std::string RemoteDesktopService::currentPassword() noexcept {
+    std::lock_guard<std::mutex> lk(password_mutex_);
+    return password_;
 }
 
 // ─── Frame capture and send ───────────────────────────────────────────────────
@@ -640,20 +642,24 @@ bool RemoteDesktopService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         st.running_      = running_.load() ? 1u : 0u;
         st.port_         = kPort;
         st.client_count_ = client_count_.load();
-        st.password_set_ = password_.empty() ? 0u : 1u;
+        st.password_set_ = currentPassword().empty() ? 0u : 1u;
         std::memcpy(response.payload_, &st, sizeof(st));
         (void)client->sendMessage(
             {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
         break;
     }
     case Op::Enable: {
-        startServer();
+        // No password, no server: it would hand the desktop to anyone.
+        if (currentPassword().empty())
+            std::cerr << "[RemoteDesktop] Not starting: set a password first\n";
+        else
+            startServer();
         // Ack: send current status
         shared::RemoteDesktopStatus st{};
         st.running_      = running_.load() ? 1u : 0u;
         st.port_         = kPort;
         st.client_count_ = client_count_.load();
-        st.password_set_ = password_.empty() ? 0u : 1u;
+        st.password_set_ = currentPassword().empty() ? 0u : 1u;
         std::memcpy(response.payload_, &st, sizeof(st));
         (void)client->sendMessage(
             {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
@@ -665,7 +671,7 @@ bool RemoteDesktopService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         st.running_      = 0;
         st.port_         = kPort;
         st.client_count_ = 0;
-        st.password_set_ = password_.empty() ? 0u : 1u;
+        st.password_set_ = currentPassword().empty() ? 0u : 1u;
         std::memcpy(response.payload_, &st, sizeof(st));
         (void)client->sendMessage(
             {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
@@ -675,9 +681,15 @@ bool RemoteDesktopService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         shared::RemoteDesktopPasswordRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         req.password_[sizeof(req.password_) - 1] = '\0';
-        password_ = std::string(req.password_, strnlen(req.password_, sizeof(req.password_)));
-        std::cout << "[RemoteDesktop] Password "
-                  << (password_.empty() ? "cleared" : "set") << "\n";
+        bool cleared;
+        {
+            std::lock_guard<std::mutex> lk(password_mutex_);
+            password_ = std::string(req.password_, strnlen(req.password_, sizeof(req.password_)));
+            cleared = password_.empty();
+        }
+        OPENSSL_cleanse(req.password_, sizeof(req.password_));
+        std::cout << "[RemoteDesktop] Password " << (cleared ? "cleared" : "set") << "\n";
+        if (cleared && running_.load()) stopServer();   // no password → no server
         // Ack
         (void)client->sendMessage(
             {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
@@ -703,7 +715,7 @@ void RemoteDesktopService::broadcastStatus() noexcept {
     st.running_      = running_.load() ? 1u : 0u;
     st.port_         = kPort;
     st.client_count_ = client_count_.load();
-    st.password_set_ = password_.empty() ? 0u : 1u;
+    st.password_set_ = currentPassword().empty() ? 0u : 1u;
     std::memcpy(msg.payload_, &st, sizeof(st));
 
     BroadcastXBusMessage(msg);

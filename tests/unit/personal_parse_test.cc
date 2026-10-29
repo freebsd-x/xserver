@@ -3,6 +3,7 @@
 #include "xserver/totp.h"
 #include "xserver/personal_parse.h"
 #include "shared/text_replace.h"
+#include <cstring>
 #include <gtest/gtest.h>
 
 using namespace fbx::xserver;
@@ -148,4 +149,26 @@ TEST(License, KeyValuesAndMask) {
     EXPECT_EQ(m.find("ABCD"), std::string::npos);
     EXPECT_EQ(personal::maskKey("1234"), "****-****-****-");          // too short: show nothing
     EXPECT_EQ(personal::maskKey(""), "");
+}
+
+// ── VNC authentication (remote desktop) ──────────────────────────────────────
+
+#include "xserver/vnc_auth.h"
+
+TEST(VncAuth, MatchesReferenceDesAndRejectsWrongPasswords) {
+    const uint8_t challenge[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
+    // Reference: openssl enc -des-ecb -K cea6c64ea62e0000 (bit-reversed "secret").
+    const uint8_t ref[16] = {0x75,0x24,0x40,0xee,0x2b,0xfc,0xc2,0xa0,0xd9,0x01,0x3f,0xd2,0x03,0x71,0xe2,0x3b};
+    uint8_t got[16];
+    vnc::expectedResponse("secret", challenge, got);
+    EXPECT_EQ(0, std::memcmp(got, ref, 16));
+    EXPECT_TRUE(vnc::verify("secret", challenge, ref));
+    EXPECT_FALSE(vnc::verify("Secret", challenge, ref));
+    EXPECT_FALSE(vnc::verify("", challenge, ref));             // no password never passes
+    uint8_t zeros[16] = {};
+    EXPECT_FALSE(vnc::verify("secret", challenge, zeros));
+    EXPECT_TRUE(vnc::verify("secret12IGNORED", challenge,       // VNC keys use 8 chars
+                            [&] { static uint8_t r[16]; vnc::expectedResponse("secret12", challenge, r); return r; }()));
+    EXPECT_EQ(vnc::reverseBits(0x01), 0x80);
+    EXPECT_EQ(vnc::reverseBits(0x73), 0xce);                    // 's'
 }

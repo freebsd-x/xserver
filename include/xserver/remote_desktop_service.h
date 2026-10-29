@@ -35,7 +35,8 @@ private:
     static void stopServer() noexcept;
     static void acceptLoop() noexcept;
     static void clientLoop(int client_fd, uint32_t screen_w, uint32_t screen_h) noexcept;
-    static bool doVncAuth(int fd) noexcept;
+    static bool doVncAuth(int fd, const std::string& password) noexcept;
+    static std::string currentPassword() noexcept;
     static void sendFrameUpdate(int fd, uint32_t w, uint32_t h) noexcept;
     static void injectKeyEvent(uint32_t keysym, uint8_t down) noexcept;
     static void injectPointerEvent(uint8_t btn, uint16_t x, uint16_t y) noexcept;
@@ -46,7 +47,8 @@ private:
     static std::atomic<uint32_t>     client_count_;
     static int                       listen_fd_;
     static std::thread               accept_thread_;
-    static std::string               password_;
+    static std::string               password_;   // guarded by password_mutex_
+    static std::mutex                password_mutex_;
     static constexpr uint16_t        kPort = 5900;
 
     static std::mutex                       inject_mutex_;

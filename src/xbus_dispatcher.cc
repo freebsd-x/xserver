@@ -461,8 +461,11 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         const bool is_write =
             msg->opcode_ >= static_cast<uint32_t>(shared::RemoteDesktopOpcode::Enable) &&
             msg->opcode_ <= static_cast<uint32_t>(shared::RemoteDesktopOpcode::SetPassword);
-        if (client->isSandboxed() && is_write) {
-            std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted RemoteDesktop write\n";
+        // Turning remote control on or setting its password is for the shell
+        // only (sandboxing is opt-in, so checking it alone let any app enable
+        // remote desktop).
+        if (!trusted && is_write) {
+            std::cerr << "[XBusDispatcher] DENIED: untrusted app attempted RemoteDesktop write\n";
         } else {
             RemoteDesktopService::ProcessMessage(client, *msg);
         }
