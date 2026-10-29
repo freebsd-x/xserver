@@ -23,6 +23,7 @@ static const std::string& configPath() noexcept {
 }
 
 void ConfigService::load() noexcept {
+    std::lock_guard lk(mutex_);
     if (loaded_) return;
 
     const auto& path = configPath();
@@ -42,21 +43,30 @@ void ConfigService::load() noexcept {
 }
 
 void ConfigService::save() noexcept {
+    std::lock_guard lk(mutex_);
     const auto& path = configPath();
-    std::ofstream file(path);
-    for (const auto& [key, val] : settings_) {
-        file << key << "=" << val << "\n";
+    // Write a temp file and rename it over the config, so a crash mid-save
+    // can't leave a truncated settings file.
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::trunc);
+        for (const auto& [key, val] : settings_) file << key << "=" << val << "\n";
+        if (!file) { LOG_WARN("Configuration: can't write {}", tmp); return; }
     }
-    LOG_INFO("Configuration saved to {}", path);
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) LOG_WARN("Configuration: can't replace {}: {}", path, ec.message());
 }
 
 std::string ConfigService::get(const std::string& key, const std::string& default_val) noexcept {
+    std::lock_guard lk(mutex_);
     load();
-    if (settings_.contains(key)) return settings_[key];
-    return default_val;
+    auto it = settings_.find(key);
+    return it != settings_.end() ? it->second : default_val;
 }
 
 void ConfigService::set(const std::string& key, const std::string& value) noexcept {
+    std::lock_guard lk(mutex_);
     load();
     settings_[key] = value;
     save();
