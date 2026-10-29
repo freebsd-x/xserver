@@ -166,6 +166,27 @@ void InputManager::applyDeviceConfig(libinput_device* dev) noexcept {
         libinput_device_config_scroll_set_natural_scroll_enabled(dev, natural_scroll_ ? 1 : 0);
 }
 
+bool InputManager::setKeymap(const std::string& layout, const std::string& variant) noexcept {
+    if (!xkb_ctx_) xkb_ctx_.reset(xkb_context_new(XKB_CONTEXT_NO_FLAGS));
+    if (!xkb_ctx_) return false;
+    xkb_rule_names names{};
+    names.rules   = "evdev";
+    names.model   = "pc105";
+    names.layout  = layout.c_str();
+    names.variant = variant.empty() ? nullptr : variant.c_str();
+    xkb_keymap* km = xkb_keymap_new_from_names(xkb_ctx_.get(), &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (!km) {
+        std::cerr << "[xserver] XKB: can't build layout '" << layout << "' variant '" << variant << "'\n";
+        return false;
+    }
+    xkb_state* st = xkb_state_new(km);
+    if (!st) { xkb_keymap_unref(km); return false; }
+    xkb_state_.reset(st);
+    xkb_keymap_.reset(km);
+    std::cout << "[xserver] Keyboard layout: " << layout << (variant.empty() ? "" : "(" + variant + ")") << "\n";
+    return true;
+}
+
 std::vector<inputdev::DeviceInfo> InputManager::listDevices() const noexcept {
     std::vector<inputdev::DeviceInfo> out;
     for (libinput_device* d : devices_) {
@@ -272,6 +293,16 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             else if (key == 29 || key == 97) { if (pressed) modifiers_ |= 2; else modifiers_ &= ~2; }
             else if (key == 56 || key == 100) { if (pressed) modifiers_ |= 4; else modifiers_ &= ~4; }
             else if (key == 125 || key == 126) { if (pressed) modifiers_ |= 8; else modifiers_ &= ~8; }
+
+            // XKB: look the character up before feeding the key to the state
+            // (xkbcommon's order), and feed every key — including ones a
+            // shortcut consumes below — so Shift/AltGr/Caps stay right.
+            // evdev keycode + 8 = XKB keycode.
+            uint32_t xkb_cp = 0;
+            if (xkb_state_) {
+                if (pressed) xkb_cp = xkb_state_key_get_utf32(xkb_state_.get(), key + 8);
+                xkb_state_update_key(xkb_state_.get(), key + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+            }
 
             // EMERGENCY EXIT: Ctrl+Alt+Esc
             if (key == 1 && state == LIBINPUT_KEY_STATE_PRESSED
@@ -592,6 +623,9 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
             {
                 bool shifted = (modifiers_ & 1) != 0;
                 int32_t ch = (state == LIBINPUT_KEY_STATE_PRESSED) ? translateKey(key, shifted) : 0;
+                // The layout's character, except control codes: Enter/Tab/
+                // Backspace/Esc keep the values apps already expect.
+                if (xkb_cp >= 0x20 && xkb_cp != 0x7F) ch = static_cast<int32_t>(xkb_cp);
                 messages.push_back({
                     .type_ = shared::InputEventType::KeyPress,
                     .value_a_ = static_cast<int32_t>(key),

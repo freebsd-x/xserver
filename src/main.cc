@@ -32,6 +32,7 @@
 #include "xserver/personal_services.h"
 #include "xserver/desktop_services.h"
 #include "xserver/keyboard_shortcuts_service.h"
+#include "xserver/keymap_service.h"
 #include "xserver/opt_storage_service.h"
 #include "xserver/notif_services.h"
 #include "xserver/lock_service.h"
@@ -478,6 +479,10 @@ int main(int argc, char** argv) {
         },
         [](const std::string& app, const std::string& path) { AudioService::getInstance().setAppRoute(app, path); },
         nullptr,
+    });
+    // Keyboard layout (com.freebsdx.Keymap) → XKB in the input path.
+    KeymapService::init([in = input.get()](const std::string& layout, const std::string& variant) {
+        return in ? in->setKeymap(layout, variant) : false;
     });
     // Saved shortcut on/off switches (com.freebsdx.KeyboardShortcuts).
     KeyboardShortcutsService::init();

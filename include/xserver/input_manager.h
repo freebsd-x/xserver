@@ -4,6 +4,7 @@
 #include "xserver/seat_manager.h"
 #include "shared/protocol.h"
 #include <libinput.h>
+#include <xkbcommon/xkbcommon.h>
 #include <libudev.h>
 #include <functional>
 #include <map>
@@ -62,6 +63,11 @@ public:
     // speed for that device, now and when it's re-plugged.
     void setDeviceOverride(uint32_t id, uint32_t sensitivity, bool adaptive) noexcept;
 
+    // Keyboard layout (com.freebsdx.Keymap): characters come from this XKB
+    // layout instead of the built-in US table. False (old layout kept) if
+    // xkbcommon can't build it.
+    bool setKeymap(const std::string& layout, const std::string& variant) noexcept;
+
     // Called after a device is added or removed.
     void setOnDevicesChanged(std::function<void()> cb) noexcept { on_devices_changed_ = std::move(cb); }
 
@@ -94,6 +100,11 @@ private:
     UniqueUdev udev_{nullptr};
 
     uint32_t modifiers_{0};
+
+    // XKB keymap + state for character translation (null → US table).
+    std::unique_ptr<xkb_context, decltype(&xkb_context_unref)> xkb_ctx_{nullptr, &xkb_context_unref};
+    std::unique_ptr<xkb_keymap,  decltype(&xkb_keymap_unref)>  xkb_keymap_{nullptr, &xkb_keymap_unref};
+    std::unique_ptr<xkb_state,   decltype(&xkb_state_unref)>   xkb_state_{nullptr, &xkb_state_unref};
 
     // Screen dimensions used to transform touch/stylus absolute coordinates.
     uint32_t screen_w_{1920};

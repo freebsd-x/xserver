@@ -4,11 +4,24 @@
 #include "shared/logger.h"
 
 #include <cstring>
+#include <functional>
 #include <string>
 
 namespace fbx::xserver {
 
 void BroadcastXBusMessage(const shared::XBusMessage&);
+
+namespace {
+std::function<bool(const std::string&, const std::string&)> g_apply;
+}  // namespace
+
+void KeymapService::init(std::function<bool(const std::string&, const std::string&)> apply) noexcept {
+    g_apply = std::move(apply);
+    std::string layout  = ConfigService::get("keymap.layout", "us");
+    std::string variant = ConfigService::get("keymap.variant", "");
+    if (!keymap::isValidLayout(layout) || !keymap::isValidVariant(variant)) { layout = "us"; variant.clear(); }
+    if (g_apply && !g_apply(layout, variant) && layout != "us") g_apply("us", "");
+}
 
 void KeymapService::handleMessage(const shared::XBusMessage& msg,
                                   std::shared_ptr<IpcSocket> client) noexcept {
@@ -27,10 +40,13 @@ void KeymapService::handleMessage(const shared::XBusMessage& msg,
         return;   // don't persist or confirm a bogus layout
     }
 
+    if (g_apply && !g_apply(req.layout_, req.variant_)) {
+        LOG_WARN("KeymapService: XKB has no layout '{}' variant '{}'", req.layout_, req.variant_);
+        return;   // nothing changed; don't persist or confirm it
+    }
     ConfigService::set("keymap.layout",  req.layout_);
     ConfigService::set("keymap.variant", req.variant_);
-    LOG_INFO("KeymapService: layout set to '{}' variant '{}' (persisted; xkb remap is a follow-up)",
-             req.layout_, req.variant_);
+    LOG_INFO("KeymapService: layout set to '{}' variant '{}'", req.layout_, req.variant_);
 
     // Confirm via LayoutChanged broadcast (echo the request).
     shared::XBusMessage b{};
