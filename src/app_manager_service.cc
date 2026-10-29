@@ -404,7 +404,9 @@ void AppManagerService::ProcessMessage(std::shared_ptr<IpcSocket> client,
             }
 
             broadcastProgress(identifier, 20, 0, "Extracting archive…");
-            std::string extract_cmd = "tar -xzf '" + src_path + "' -C '" + tmp_dir + "'";
+            // src_path comes from the client: quote it properly (a bare '…'
+            // let a file named "x';cmd;'.xpkg" run cmd).
+            std::string extract_cmd = "tar -xzf " + shellQuote(src_path) + " -C " + shellQuote(tmp_dir);
             if (!runCmd(extract_cmd)) {
                 broadcastProgress(identifier, 0, 2, "Extraction failed");
                 fs::remove_all(tmp_dir);

@@ -6,11 +6,13 @@
 
 #include "xserver/weather_service.h"
 #include "xserver/async_shell.h"
+#include "xserver/url_encode.h"
 
 namespace fbx::xserver { void BroadcastXBusMessage(const shared::XBusMessage& msg); }
 using fbx::xserver::BroadcastXBusMessage;
 
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -112,9 +114,10 @@ bool WeatherService::fetchAndStore() noexcept {
         city = city_;
     }
 
-    // URL-encode: space → +
-    std::string encoded;
-    for (char c : city) encoded += (c == ' ') ? '+' : c;
+    // Strictly URL-encoded: the URL goes into a shell command, so nothing from
+    // the (client-supplied) city may survive as a shell metacharacter — it
+    // used to be passed through verbatim (only spaces became '+').
+    std::string encoded = xserver::urlEncodeQuery(city);
 
     // Use fetch (FreeBSD base); fall back to curl. posix_spawn, not popen: popen
     // forks and deadlocks the child on a libc stdio lock in this multithreaded

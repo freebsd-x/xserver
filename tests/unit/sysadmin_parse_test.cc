@@ -191,3 +191,17 @@ TEST(SysadminWlan, OnlyWifiInterfaces) {
     EXPECT_EQ(v[1], "wlan12");
     EXPECT_TRUE(parseWlanIfaces("").empty());
 }
+
+// ── URL encoding (weather location → shell command) ──────────────────────────
+
+#include "xserver/url_encode.h"
+
+TEST(UrlEncode, NoShellMetacharactersSurvive) {
+    EXPECT_EQ(fbx::xserver::urlEncodeQuery("New York"), "New+York");
+    EXPECT_EQ(fbx::xserver::urlEncodeQuery("Seoul';id;'"), "Seoul%27%3Bid%3B%27");
+    EXPECT_EQ(fbx::xserver::urlEncodeQuery("$(reboot)`x`"), "%24%28reboot%29%60x%60");
+    EXPECT_EQ(fbx::xserver::urlEncodeQuery("서울"), "%EC%84%9C%EC%9A%B8");
+    for (char c : fbx::xserver::urlEncodeQuery("a'b\"c;d|e&f$g`h\\i\nj<k>l(m)n*o?p!q{r}s"))
+        EXPECT_TRUE(std::isalnum(static_cast<unsigned char>(c)) || c == '%' || c == '+' ||
+                    c == '-' || c == '.' || c == '_' || c == '~') << c;
+}
