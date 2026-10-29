@@ -3,6 +3,8 @@
 #include "shared/protocol.h"
 #include "xserver/ipc_socket.h"
 #include <memory>
+#include <functional>
+#include <array>
 
 namespace fbx::xserver {
 
@@ -13,6 +15,9 @@ namespace fbx::xserver {
 // follow-up; this persists + confirms the selection.
 class ColorProfileService {
 public:
+    // Install the hook that puts a profile's matrix into the CRTC colour
+    // pipeline (main), and apply the saved profile.
+    static void init(std::function<void(const std::array<double, 9>&)> apply) noexcept;
     static void handleMessage(const shared::XBusMessage& msg,
                               std::shared_ptr<IpcSocket> client) noexcept;
 };

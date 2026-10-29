@@ -13,6 +13,8 @@ void BroadcastXBusMessage(const shared::XBusMessage&);
 namespace {
 constexpr const char* kSvc = "com.freebsdx.ColorProfile";
 
+std::function<void(const std::array<double, 9>&)> g_apply;
+
 shared::ColorProfileState build() {
     shared::ColorProfileState st{};
     uint32_t p = 0;
@@ -23,6 +25,11 @@ shared::ColorProfileState build() {
     return st;
 }
 }  // namespace
+
+void ColorProfileService::init(std::function<void(const std::array<double, 9>&)> apply) noexcept {
+    g_apply = std::move(apply);
+    if (g_apply) g_apply(colorprofile::matrixFor(build().profile_));
+}
 
 void ColorProfileService::handleMessage(const shared::XBusMessage& msg,
                                         std::shared_ptr<IpcSocket> client) noexcept {
@@ -45,8 +52,8 @@ void ColorProfileService::handleMessage(const shared::XBusMessage& msg,
         std::memcpy(&req, msg.payload_, sizeof(req));
         uint32_t p = colorprofile::clampProfile(req.profile_);
         ConfigService::set("colorprofile.profile", std::to_string(p));
-        LOG_INFO("ColorProfileService: profile set to {} ({}) — persisted; CMS transform is a follow-up",
-                 p, colorprofile::profileName(p));
+        if (g_apply) g_apply(colorprofile::matrixFor(p));
+        LOG_INFO("ColorProfileService: profile set to {} ({})", p, colorprofile::profileName(p));
         // No direct reply per contract — confirm via ProfileChanged broadcast.
         auto st = build();
         shared::XBusMessage b{};

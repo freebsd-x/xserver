@@ -33,6 +33,7 @@
 #include "xserver/desktop_services.h"
 #include "xserver/keyboard_shortcuts_service.h"
 #include "xserver/keymap_service.h"
+#include "xserver/color_profile_service.h"
 #include "xserver/opt_storage_service.h"
 #include "xserver/notif_services.h"
 #include "xserver/lock_service.h"
@@ -593,15 +594,20 @@ int main(int argc, char** argv) {
     // pushed to the hardware. No-op if the CRTC lacks a CTM property.
     static std::array<double, 9> g_colorfilter_mat = {1,0,0, 0,1,0, 0,0,1};
     static std::array<double, 9> g_nightlight_mat  = {1,0,0, 0,1,0, 0,0,1};
+    // Display colour profile (sRGB content → the display's gamut): applied
+    // last of all, after the filter and the warm tint.
+    static std::array<double, 9> g_profile_mat     = {1,0,0, 0,1,0, 0,0,1};
     auto apply_color_pipeline = [drm_ptr]() {
         if (!drm_ptr) return;
-        const auto& a = g_nightlight_mat;   // left factor (applied last)
-        const auto& b = g_colorfilter_mat;  // right factor (applied first)
-        std::array<double, 9> p{};
-        for (int r = 0; r < 3; ++r)
-            for (int c = 0; c < 3; ++c)
-                p[r*3+c] = a[r*3+0]*b[0*3+c] + a[r*3+1]*b[1*3+c] + a[r*3+2]*b[2*3+c];
-        (void)drm_ptr->setColorMatrix(0, p);
+        auto mul = [](const std::array<double, 9>& a, const std::array<double, 9>& b) {
+            std::array<double, 9> p{};
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                    p[r*3+c] = a[r*3+0]*b[0*3+c] + a[r*3+1]*b[1*3+c] + a[r*3+2]*b[2*3+c];
+            return p;
+        };
+        // profile × night-light × filter: the filter acts first, the profile last.
+        (void)drm_ptr->setColorMatrix(0, mul(g_profile_mat, mul(g_nightlight_mat, g_colorfilter_mat)));
     };
     ColorFilterService::init([apply_color_pipeline](const std::array<double, 9>& m) {
         g_colorfilter_mat = m;
@@ -609,6 +615,10 @@ int main(int argc, char** argv) {
     });
     NightLightService::init([apply_color_pipeline](const std::array<double, 9>& m) {
         g_nightlight_mat = m;
+        apply_color_pipeline();
+    });
+    ColorProfileService::init([apply_color_pipeline](const std::array<double, 9>& m) {
+        g_profile_mat = m;
         apply_color_pipeline();
     });
 
