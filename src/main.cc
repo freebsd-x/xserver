@@ -1660,7 +1660,7 @@ int main(int argc, char** argv) {
                         } else if (msg.value_a_ == -2) {
                             window_stack.cycleLayoutMode();
                         } else if (msg.value_a_ == -3) {
-                            // Super+H/L: grow/shrink the tiling master column.
+                            // Super+[ / Super+]: shrink/grow the tiling master column.
                             window_stack.adjustMasterRatio(msg.value_b_ > 0 ? 0.05f : -0.05f);
                         } else if (msg.value_a_ == -4) {
                             // Super+Shift+H/J/K/L: move focus to the nearest window

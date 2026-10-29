@@ -678,7 +678,7 @@ public:
         updateLayout();
     }
 
-    // Grow/shrink the master column in Tiling mode (e.g. Super+H/L). Clamped to
+    // Grow/shrink the master column in Tiling mode (Super+[ / Super+]). Clamped to
     // [0.1, 0.9]; re-tiles immediately.
     void adjustMasterRatio(float delta) noexcept {
         auto& ws = workspaces_[active_workspace_];

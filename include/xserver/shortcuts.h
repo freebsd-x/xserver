@@ -37,7 +37,7 @@ inline constexpr Def kAll[kCount] = {
     {kSwitchWindows, "Switch windows",                 "Alt+Tab"},
     {kWorkspaces,    "Switch workspace",               "Super+1..9"},
     {kSnap,          "Snap / maximize / move window",  "Super+Arrows"},
-    {kTiling,        "Tiling (layout, resize, focus)", "Super+A/H/M"},
+    {kTiling,        "Tiling (layout, resize, focus)", "Super+A/[/]/M"},
     {kDebugOverlay,  "GPU frame-time overlay",         "Super+F3"},
 };
 

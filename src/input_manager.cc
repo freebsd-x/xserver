@@ -486,14 +486,15 @@ std::expected<std::vector<shared::InputMessage>, std::error_code> InputManager::
                 });
             }
 
-            // MASTER RATIO: Super+H shrink (35), Super+L grow (38) — tiling mode.
-            // (Super WITHOUT Shift; Super+Shift+H/L is directional focus below.)
-            if (shortcuts::enabled(shortcuts::kTiling) && (key == 35 || key == 38) && state == LIBINPUT_KEY_STATE_PRESSED &&
+            // MASTER RATIO: Super+[ narrower (26), Super+] wider (27) — tiling mode.
+            // (Super+L is Lock Screen; it used to also grow the master column.
+            // Super+Shift+H/J/K/L is directional focus below.)
+            if (shortcuts::enabled(shortcuts::kTiling) && (key == 26 || key == 27) && state == LIBINPUT_KEY_STATE_PRESSED &&
                 (modifiers_ & 8) && !(modifiers_ & 1)) {
                 messages.push_back({
                     .type_      = shared::InputEventType::WorkspaceSwitch,
                     .value_a_   = -3,               // -3 = adjust master ratio
-                    .value_b_   = (key == 38) ? 1 : -1, // +1 grow, -1 shrink
+                    .value_b_   = (key == 27) ? 1 : -1, // +1 grow, -1 shrink
                     .modifiers_ = modifiers_
                 });
             }
