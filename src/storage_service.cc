@@ -1,5 +1,7 @@
 #include "xserver/storage_service.h"
 #include "xserver/ipc_socket.h"
+#include "xserver/async_shell.h"
+#include "xserver/geom_parse.h"
 #include <iostream>
 #include <cstring>
 #include <string>
@@ -15,27 +17,21 @@ bool StorageService::ProcessMessage(std::shared_ptr<IpcSocket> client, const sha
     shared::XBusMessage response = msg;
 
     if (msg.opcode_ == 0x01) { // GetDisks
-        std::cout << "[StorageService] -> Fulfilling GetDisks request.\n";
-        // Mock disk list: comma-separated list of disk names
-        std::string disks = "nvd0 (1TB NVMe),ada0 (500GB SSD)";
+        // The real disks, from GEOM (readable without root).
+        std::string disks = geom::diskSummary(spawnCapture("geom disk list 2>/dev/null"));
+        std::memset(response.payload_, 0, sizeof(response.payload_));
         std::strncpy(reinterpret_cast<char*>(response.payload_), disks.c_str(), sizeof(response.payload_) - 1);
-        response.payload_[sizeof(response.payload_) - 1] = '\0';
     } else if (msg.opcode_ == 0x02) { // InstallToDisk
-        std::string target_disk(reinterpret_cast<const char*>(msg.payload_));
-        std::cout << "[StorageService] -> Fulfilling InstallToDisk request for target: " << target_disk << "\n";
-        
-        // Mock installation logic for safety during development
-        std::cout << "   [DRY RUN] Executing: gpart destroy -F " << target_disk << "\n";
-        std::cout << "   [DRY RUN] Executing: gpart create -s gpt " << target_disk << "\n";
-        std::cout << "   [DRY RUN] Executing: gpart add -t efi -s 260M " << target_disk << "\n";
-        std::cout << "   [DRY RUN] Executing: gpart add -t freebsd-zfs " << target_disk << "\n";
-        std::cout << "   [DRY RUN] Executing: zpool create zroot /dev/" << target_disk << "p2\n";
-        std::cout << "   [DRY RUN] Copying rootfs to /mnt...\n";
-        std::cout << "   [DRY RUN] Configuring boot environment...\n";
-        
-        // Return success code
-        uint32_t success = 1;
-        std::memcpy(response.payload_, &success, sizeof(success));
+        std::string target_disk(reinterpret_cast<const char*>(msg.payload_),
+                                strnlen(reinterpret_cast<const char*>(msg.payload_), sizeof(msg.payload_)));
+        // A desktop session never repartitions disks: installing runs as root
+        // from the installer. This used to print a dry run and report
+        // success, which would tell an installer UI a system was installed.
+        std::cerr << "[StorageService] InstallToDisk(" << target_disk
+                  << ") refused: installing needs the root installer, not the desktop session\n";
+        uint32_t failure = 0;
+        std::memset(response.payload_, 0, sizeof(response.payload_));
+        std::memcpy(response.payload_, &failure, sizeof(failure));
     } else {
         std::cerr << "[StorageService] -> Unknown opcode requested.\n";
     }

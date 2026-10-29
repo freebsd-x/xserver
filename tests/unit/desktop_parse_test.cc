@@ -194,3 +194,16 @@ TEST(OptStorage, StaleMeansUntouchedFor30Days) {
     EXPECT_FALSE(OptStorageService::isStale(now - 31 * day, now - 2 * day, now));   // read recently
     EXPECT_FALSE(OptStorageService::isStale(now - 2 * day, now - 31 * day, now));   // written recently
 }
+
+// ── GEOM disks (com.freebsdx.Storage) ────────────────────────────────────────
+
+#include "xserver/geom_parse.h"
+
+TEST(Geom, DiskSummaryFromRealOutput) {
+    EXPECT_EQ(geom::diskSummary(
+        "Geom name: nda0\nProviders:\n1. Name: nda0\n   Mediasize: 256060514304 (238G)\n"
+        "   Sectorsize: 512\n   descr: SAMSUNG MZVLW256HEHP-00000\n   ident: S35ENX0J\n\n"
+        "Geom name: da0\nProviders:\n1. Name: da0\n   Mediasize: 15728640000 (15G)\n   descr: USB Stick\n"),
+        "nda0 (238G SAMSUNG MZVLW256HEHP-00000),da0 (15G USB Stick)");
+    EXPECT_EQ(geom::diskSummary(""), "");
+}
