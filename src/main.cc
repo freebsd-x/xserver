@@ -487,6 +487,15 @@ int main(int argc, char** argv) {
     });
     // Saved shortcut on/off switches (com.freebsdx.KeyboardShortcuts).
     KeyboardShortcutsService::init();
+    // App time limits notify through the normal notification path.
+    AppTimeLimitService::init([](const std::string& title, const std::string& message) {
+        shared::NotificationPayload n{};
+        n.timeout_ms_ = 8000;
+        std::strncpy(n.title_, title.c_str(), sizeof(n.title_) - 1);
+        std::strncpy(n.message_, message.c_str(), sizeof(n.message_) - 1);
+        std::strncpy(n.app_name_, "Screen Time", sizeof(n.app_name_) - 1);
+        NotificationService::post(n);
+    });
     // Saved EQ → the audio mixer (com.freebsdx.AudioEq).
     AudioEqService::init([](const eq::Gains& g) { AudioService::getInstance().setEq(g); });
     // Restore the saved auto-lock policy (com.freebsdx.ScreenLock).
@@ -1238,6 +1247,13 @@ int main(int argc, char** argv) {
         ScreenSaverService::pollIdle();
         LockService::pollIdle();
         OptStorageService::poll();   // ≤ hourly: old-cache measurement / cleanup
+        // App time limits: credit 10 s to the app in the foreground (not the
+        // shell or lock screen, and not while locked).
+        if (!LockService::isLocked() && focused_surface != 999u && focused_surface != 998u) {
+            auto it = g_surface_clients.find(focused_surface);
+            if (it != g_surface_clients.end() && it->second && !it->second->appId().empty())
+                AppTimeLimitService::tick(it->second->appId(), 10);
+        }
     });
 
     // Poll calendar reminders and delayed screenshots every second (timer id=5).

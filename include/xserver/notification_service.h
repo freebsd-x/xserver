@@ -23,6 +23,9 @@ class NotificationService {
 public:
     static bool ProcessMessage(std::shared_ptr<IpcSocket> client, const shared::XBusMessage& msg) noexcept;
     static const std::vector<Notification>& getActiveNotifications() noexcept;
+    // Post a notification from inside the compositor (same path as a client's
+    // Post: mute, quiet hours, sound). Returns its id, or 0 if muted.
+    static uint32_t post(shared::NotificationPayload payload) noexcept;
     // Prune expired notifications and broadcast Dismiss for each removed one;
     // release held notifications once quiet time is over.
     static void cleanup() noexcept;

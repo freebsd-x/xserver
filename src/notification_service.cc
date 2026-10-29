@@ -17,6 +17,37 @@ namespace {
 constexpr size_t kMaxHeld = 50;
 }  // namespace
 
+uint32_t NotificationService::post(shared::NotificationPayload payload) noexcept {
+    payload.title_[sizeof(payload.title_) - 1]       = '\0';
+    payload.message_[sizeof(payload.message_) - 1]   = '\0';
+    payload.app_name_[sizeof(payload.app_name_) - 1] = '\0';
+    const std::string app_name(payload.app_name_);
+
+    // Drop silently if app is muted
+    if (!app_name.empty() && muted_apps_.count(app_name)) {
+        std::cout << "[NotificationService] Suppressed (muted app=" << app_name << ")\n";
+        return 0;
+    }
+
+    // Assign a server-side ID
+    payload.id_ = next_id_++;
+    NotifSoundService::noteApp(app_name);
+
+    if (NotifScheduleService::holdNow(app_name)) {
+        // Do Not Disturb / quiet hours: keep it for later instead of
+        // dropping it; cleanup() shows it when the quiet time ends.
+        if (held_.size() >= kMaxHeld) held_.erase(held_.begin());
+        held_.push_back(payload);
+        std::cout << "[NotificationService] Held #" << payload.id_ << " (quiet time)\n";
+    } else {
+        std::cout << "[NotificationService] Posted #" << payload.id_
+                  << ": " << payload.title_ << " — " << payload.message_ << "\n";
+        deliver(payload);
+        NotifSoundService::playFor(app_name);
+    }
+    return payload.id_;
+}
+
 void NotificationService::deliver(const shared::NotificationPayload& payload) noexcept {
     uint32_t timeout_ms = payload.timeout_ms_ ? payload.timeout_ms_ : 5000u;
     active_notifications_.push_back({
@@ -57,35 +88,8 @@ bool NotificationService::ProcessMessage(std::shared_ptr<IpcSocket> client, cons
         shared::NotificationPayload payload{};
         std::memcpy(&payload, msg.payload_, sizeof(payload));
 
-        // Drop silently if app is muted
-        const std::string app_name(payload.app_name_);
-        if (!app_name.empty() && muted_apps_.count(app_name)) {
-            std::cout << "[NotificationService] Suppressed (muted app=" << app_name << ")\n";
-            shared::XBusMessage response = msg;
-            uint32_t zero = 0;
-            std::memcpy(response.payload_, &zero, sizeof(zero));
-            (void)client->sendMessage(
-                {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
-            return true;
-        }
-
-        // Assign a server-side ID
-        payload.id_ = next_id_++;
-        payload.app_name_[sizeof(payload.app_name_) - 1] = '\0';
-        NotifSoundService::noteApp(app_name);
-
-        if (NotifScheduleService::holdNow(app_name)) {
-            // Do Not Disturb / quiet hours: keep it for later instead of
-            // dropping it; cleanup() shows it when the quiet time ends.
-            if (held_.size() >= kMaxHeld) held_.erase(held_.begin());
-            held_.push_back(payload);
-            std::cout << "[NotificationService] Held #" << payload.id_ << " (quiet time)\n";
-        } else {
-            std::cout << "[NotificationService] Posted #" << payload.id_
-                      << ": " << payload.title_ << " — " << payload.message_ << "\n";
-            deliver(payload);
-            NotifSoundService::playFor(app_name);
-        }
+        uint32_t id = post(payload);   // 0 = muted app, dropped
+        payload.id_ = id;
 
         // Return the assigned ID so the sender can dismiss later
         shared::XBusMessage response = msg;

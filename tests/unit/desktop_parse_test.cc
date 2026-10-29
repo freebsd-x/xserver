@@ -207,3 +207,35 @@ TEST(Geom, DiskSummaryFromRealOutput) {
         "nda0 (238G SAMSUNG MZVLW256HEHP-00000),da0 (15G USB Stick)");
     EXPECT_EQ(geom::diskSummary(""), "");
 }
+
+// ── App time limits / security keys ──────────────────────────────────────────
+
+#include "xserver/applimit_parse.h"
+#include "xserver/usb_list.h"
+
+TEST(AppLimit, UsageResetsOnANewDayAndNotifiesOnce) {
+    EXPECT_EQ(applimit::parseUsage("2026-10-29|com.a=600;com.b=60", "2026-10-29").at("com.a"), 600u);
+    EXPECT_TRUE(applimit::parseUsage("2026-10-28|com.a=600", "2026-10-29").empty());   // yesterday
+    auto u = applimit::parseUsage(applimit::formatUsage("D", {{"x", 5}, {"y", 9}}), "D");
+    EXPECT_EQ(u.size(), 2u);
+    auto told = applimit::parseNotified("D|com.a;com.b", "D");
+    EXPECT_EQ(told.size(), 2u);
+    EXPECT_TRUE(applimit::parseNotified("C|com.a", "D").empty());
+    EXPECT_EQ(applimit::parseNotified(applimit::formatNotified("D", told), "D"), told);
+    EXPECT_TRUE(applimit::crossed(590, 600, 10));        // 10 min = 600 s
+    EXPECT_FALSE(applimit::crossed(600, 610, 10));       // already over: not again
+    EXPECT_FALSE(applimit::crossed(10, 20, 0));          // no limit
+    EXPECT_EQ(applimit::parseMap("a=1;bad;b=x;c=;=3;d=4294967296;e=7").size(), 2u);
+    EXPECT_EQ(applimit::dayKey(0).size(), 10u);
+}
+
+TEST(SecurityKeys, RecognisedByVendor) {
+    fbx::xserver::usb::UsbInfo yubi; yubi.vid = 0x1050; yubi.pid = 0x0407;
+    fbx::xserver::usb::UsbInfo titan; titan.vid = 0x18d1; titan.pid = 0x5026;
+    fbx::xserver::usb::UsbInfo pixel; pixel.vid = 0x18d1; pixel.pid = 0x4ee1;   // a Google phone
+    fbx::xserver::usb::UsbInfo stick; stick.vid = 0x0781; stick.pid = 0x5567;
+    EXPECT_TRUE(fbx::xserver::usb::isSecurityKey(yubi));
+    EXPECT_TRUE(fbx::xserver::usb::isSecurityKey(titan));
+    EXPECT_FALSE(fbx::xserver::usb::isSecurityKey(pixel));
+    EXPECT_FALSE(fbx::xserver::usb::isSecurityKey(stick));
+}

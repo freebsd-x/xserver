@@ -187,4 +187,22 @@ inline std::string descProduct(std::string_view desc) {
     return std::string(desc.substr(0, c));
 }
 
+// FIDO2/U2F security keys, by USB vendor (and product where a vendor makes
+// other things too).
+inline bool isSecurityKey(const UsbInfo& u) {
+    switch (u.vid) {
+    case 0x1050:                 // Yubico
+    case 0x20a0:                 // Nitrokey
+    case 0x096e:                 // Feitian
+    case 0x1ea8:                 // Thetis
+    case 0x2581:                 // Plug-up / Ledger U2F
+        return true;
+    case 0x18d1: return u.pid == 0x5026;                 // Google Titan
+    case 0x0483: return u.pid == 0xa2ca;                 // SoloKeys (STM vid)
+    case 0x1209: return u.pid == 0xbeee || u.pid == 0x5070;  // Solo / pid.codes FIDO
+    case 0x1d50: return u.pid == 0x60fc;                 // OnlyKey
+    default: return false;
+    }
+}
+
 }  // namespace fbx::xserver::usb

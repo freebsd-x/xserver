@@ -101,6 +101,21 @@ public:
                               std::shared_ptr<IpcSocket> client) noexcept;
 };
 
+// com.freebsdx.AppTimeLimit — daily limits on how long an app may be in the
+// foreground. The compositor credits the focused app (its XAPP_ID) every tick
+// (main's 10 s timer, not while locked); usage resets each local day. When an
+// app passes its limit you get one notification for the day — the app isn't
+// closed (that could lose unsaved work). Limits name an installed app by its
+// display name; persisted in ConfigService "applimit.*".
+class AppTimeLimitService {
+public:
+    using Notify = std::function<void(const std::string& title, const std::string& message)>;
+    static void init(Notify notify) noexcept;
+    static void tick(const std::string& app_id, uint32_t seconds) noexcept;
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
 // com.freebsdx.AudioEq — 5-band EQ (audio_eq.h) persisted in ConfigService
 // "audioeq.*"; init() installs the hook (AudioService::setEq in main) and
 // applies the saved settings.

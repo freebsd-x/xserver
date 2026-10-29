@@ -202,6 +202,8 @@ static const ShellOnlyService* shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.DevOverlay",      &DevOverlayService::handleMessage},
         {"com.freebsdx.Downloads",       &DownloadsService::handleMessage},
         {"com.freebsdx.Transfer",        &TransferService::handleMessage},
+        {"com.freebsdx.AppTimeLimit",    &AppTimeLimitService::handleMessage},
+        {"com.freebsdx.SecurityKey",     &SecurityKeyService::handleMessage},
     };
     for (const auto& e : kTable)
         if (std::strcmp(name, e.name) == 0) return &e;

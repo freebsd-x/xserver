@@ -1,6 +1,8 @@
 #include "xserver/device_services.h"
 #include "xserver/config_service.h"
 #include "xserver/xbus_reply.h"
+#include "xserver/async_shell.h"
+#include "xserver/usb_list.h"
 #include "shared/logger.h"
 
 #include <cups/cups.h>
@@ -9,6 +11,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <sys/sysctl.h>
 
 namespace fbx::xserver {
 
@@ -151,6 +155,59 @@ void InputDeviceService::handleMessage(const shared::XBusMessage& msg,
         ack(msg, client, kName);
         break;
     }
+    default: break;
+    }
+}
+
+// ── SecurityKeyService ───────────────────────────────────────────────────────
+
+namespace {
+std::vector<usb::UsbInfo> securityKeys() {
+    std::vector<usb::UsbInfo> keys;
+    for (auto& u : usb::parseDevinfo(spawnCapture("devinfo -v 2>/dev/null"))) {
+        if (!usb::isSecurityKey(u)) continue;
+        size_t i = u.driver.find_first_of("0123456789");
+        if (i != std::string::npos) {
+            std::string oid = "dev." + u.driver.substr(0, i) + "." + u.driver.substr(i) + ".%desc";
+            char desc[256] = {};
+            size_t len = sizeof(desc) - 1;
+            if (::sysctlbyname(oid.c_str(), desc, &len, nullptr, 0) == 0) u.product = usb::descProduct(desc);
+        }
+        if (u.product.empty()) u.product = "Security key";
+        keys.push_back(std::move(u));
+    }
+    return keys;
+}
+}  // namespace
+
+void SecurityKeyService::handleMessage(const shared::XBusMessage& msg,
+                                       std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::SecurityKeyOpcode;
+    constexpr const char* kName = "com.freebsdx.SecurityKey";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::ListKeys: {
+        auto keys = securityKeys();
+        uint32_t page = readPage(msg);
+        shared::SecurityKeyPage pg{};
+        pg.page_  = page;
+        pg.total_ = static_cast<uint32_t>(keys.size());
+        if (page < keys.size()) {
+            const auto& k = keys[page];
+            pg.valid_    = 1;
+            pg.has_more_ = page + 1 < keys.size() ? 1u : 0u;
+            pg.key_id_   = (k.bus << 8) | k.addr;
+            pg.added_ts_ = 0;   // plugged in, not registered
+            std::strncpy(pg.label_, k.product.c_str(), sizeof(pg.label_) - 1);
+        }
+        reply(msg, client, kName, msg.opcode_, &pg);
+        break;
+    }
+    case O::RegisterKey:
+    case O::RemoveKey:
+        LOG_WARN("SecurityKeyService: registering keys for login needs pam_u2f (security/pam_u2f), "
+                 "which isn't installed");
+        ack(msg, client, kName);
+        break;
     default: break;
     }
 }

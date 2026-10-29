@@ -1,5 +1,6 @@
 #include "xserver/desktop_services.h"
 #include "xserver/desktop_parse.h"
+#include "xserver/applimit_parse.h"
 #include "xserver/app_sandbox_service.h"
 #include "xserver/async_shell.h"
 #include "xserver/config_service.h"
@@ -8,10 +9,12 @@
 #include "shared/logger.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -465,6 +468,144 @@ void DevOverlayService::handleMessage(const shared::XBusMessage& msg,
         else LOG_INFO("DevOverlayService: mode {} isn't supported (FPS or Off)", req.mode_);
         ack(msg, client, kName);
         notifyChanged();
+        break;
+    }
+    default: break;
+    }
+}
+
+// ── AppTimeLimitService ──────────────────────────────────────────────────────
+
+namespace {
+
+constexpr const char* kLimitsKey   = "applimit.limits";     // id=minutes
+constexpr const char* kUsageKey    = "applimit.usage";      // day|id=secs
+constexpr const char* kNotifiedKey = "applimit.notified";   // day|id;id
+
+std::mutex g_limit_mu;
+AppTimeLimitService::Notify g_limit_notify;
+std::string g_usage_day;
+std::map<std::string, uint32_t> g_usage;          // today's seconds by app id
+std::chrono::steady_clock::time_point g_usage_saved{};
+
+// Load today's usage (or start fresh on a new day). Caller holds g_limit_mu.
+void syncDay(const std::string& today) {
+    if (g_usage_day == today) return;
+    g_usage_day = today;
+    g_usage = applimit::parseUsage(ConfigService::get(kUsageKey), today);
+}
+
+// An installed app by display name (case-insensitive) or identifier.
+const InstalledApp* findApp(const std::vector<InstalledApp>& apps, std::string_view name) {
+    auto lower = [](std::string_view v) {
+        std::string o(v);
+        for (char& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return o;
+    };
+    std::string want = lower(name);
+    for (const auto& a : apps)
+        if (lower(a.name) == want || a.id == name) return &a;
+    return nullptr;
+}
+
+}  // namespace
+
+void AppTimeLimitService::init(Notify notify) noexcept {
+    std::lock_guard lk(g_limit_mu);
+    g_limit_notify = std::move(notify);
+}
+
+void AppTimeLimitService::tick(const std::string& app_id, uint32_t seconds) noexcept {
+    if (app_id.empty() || seconds == 0) return;
+    std::lock_guard lk(g_limit_mu);
+    const std::string today = applimit::dayKey(std::time(nullptr));
+    syncDay(today);
+    uint32_t before = g_usage[app_id];
+    uint32_t after  = before + seconds;
+    g_usage[app_id] = after;
+
+    auto limits = applimit::parseMap(ConfigService::get(kLimitsKey));
+    bool hit = false;
+    if (auto it = limits.find(app_id); it != limits.end() && applimit::crossed(before, after, it->second)) {
+        auto told = applimit::parseNotified(ConfigService::get(kNotifiedKey), today);
+        if (told.insert(app_id).second) {
+            ConfigService::set(kNotifiedKey, applimit::formatNotified(today, told));
+            std::string name = app_id;
+            for (const auto& a : installedApps()) if (a.id == app_id) name = a.name;
+            LOG_INFO("AppTimeLimit: {} reached its {} min limit", name, it->second);
+            if (g_limit_notify)
+                g_limit_notify("Time limit reached",
+                               name + ": today's " + std::to_string(it->second) + "-minute limit is up.");
+        }
+        hit = true;
+    }
+    // Persist about once a minute (and right away when a limit is hit).
+    auto now = std::chrono::steady_clock::now();
+    if (hit || now - g_usage_saved >= std::chrono::minutes(1)) {
+        ConfigService::set(kUsageKey, applimit::formatUsage(today, g_usage));
+        g_usage_saved = now;
+    }
+}
+
+void AppTimeLimitService::handleMessage(const shared::XBusMessage& msg,
+                                        std::shared_ptr<IpcSocket> client) noexcept {
+    using O = shared::AppTimeLimitOpcode;
+    constexpr const char* kName = "com.freebsdx.AppTimeLimit";
+    switch (static_cast<O>(msg.opcode_)) {
+    case O::ListLimits: {
+        auto limits = applimit::parseMap(ConfigService::get(kLimitsKey));
+        std::vector<std::pair<std::string, uint32_t>> rows(limits.begin(), limits.end());
+        auto apps = installedApps();
+        uint32_t page = readPage(msg);
+        shared::AppTimeLimitPage pg{};
+        pg.page_  = page;
+        pg.total_ = static_cast<uint32_t>(rows.size());
+        if (page < rows.size()) {
+            const auto& [id, minutes] = rows[page];
+            const InstalledApp* a = findApp(apps, id);
+            std::string name = a ? a->name : id;
+            uint32_t used;
+            {
+                std::lock_guard lk(g_limit_mu);
+                syncDay(applimit::dayKey(std::time(nullptr)));
+                used = g_usage.count(id) ? g_usage[id] : 0;
+            }
+            pg.valid_    = 1;
+            pg.has_more_ = page + 1 < rows.size() ? 1u : 0u;
+            std::strncpy(pg.app_name_, name.c_str(), sizeof(pg.app_name_) - 1);
+            pg.limit_minutes_      = minutes;
+            pg.used_minutes_today_ = used / 60;
+        }
+        reply(msg, client, kName, msg.opcode_, &pg);
+        break;
+    }
+    case O::SetLimit:
+    case O::RemoveLimit: {
+        bool set = static_cast<O>(msg.opcode_) == O::SetLimit;
+        char name_buf[64] = {};
+        uint32_t minutes = 0;
+        if (set) {
+            shared::AppTimeLimitSetRequest req{};
+            std::memcpy(&req, msg.payload_, sizeof(req));
+            std::memcpy(name_buf, req.app_name_, sizeof(name_buf) - 1);
+            minutes = req.limit_minutes_;
+        } else {
+            shared::AppTimeLimitRemoveRequest req{};
+            std::memcpy(&req, msg.payload_, sizeof(req));
+            std::memcpy(name_buf, req.app_name_, sizeof(name_buf) - 1);
+        }
+        auto apps = installedApps();
+        const InstalledApp* a = findApp(apps, name_buf);
+        bool ok = a && (!set || (minutes >= 1 && minutes <= 24 * 60));
+        if (ok) {
+            auto limits = applimit::parseMap(ConfigService::get(kLimitsKey));
+            if (set) limits[a->id] = minutes;
+            else ok = limits.erase(a->id) > 0;
+            if (ok) ConfigService::set(kLimitsKey, applimit::formatMap(limits));
+        }
+        if (!ok) LOG_WARN("AppTimeLimit: can't {} limit for '{}'", set ? "set" : "remove", name_buf);
+        ack(msg, client, kName);
+        if (ok) broadcast<char>(kName, static_cast<uint32_t>(O::LimitsChanged), nullptr);
         break;
     }
     default: break;

@@ -34,4 +34,14 @@ public:
                               std::shared_ptr<IpcSocket> client) noexcept;
 };
 
+// com.freebsdx.SecurityKey — the FIDO2/U2F keys plugged in now (USB devices
+// from devinfo, recognised by vendor), labelled by their device description.
+// Registering a key for login needs pam_u2f (not installed), so RegisterKey
+// and RemoveKey are refused with a logged reason.
+class SecurityKeyService {
+public:
+    static void handleMessage(const shared::XBusMessage& msg,
+                              std::shared_ptr<IpcSocket> client) noexcept;
+};
+
 }  // namespace fbx::xserver
