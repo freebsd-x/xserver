@@ -10,10 +10,10 @@ namespace fbx::xserver {
 
 std::atomic<uint32_t> TrueToneService::enabled_   {0};
 std::atomic<uint32_t> TrueToneService::strength_  {70};
-// Measured ambient color temperature. A real implementation would read an
-// ambient-light/color sensor; we report a fixed warm-indoor value (5000 K) so
-// the display-only field is always populated.
-std::atomic<uint32_t> TrueToneService::ambient_k_ {5000};
+// Measured ambient colour temperature, 0 = no reading. There's no ambient
+// light/colour sensor on this hardware (no ALS sysctl), so nothing to measure;
+// this used to report an invented 5000 K.
+std::atomic<uint32_t> TrueToneService::ambient_k_ {0};
 
 void TrueToneService::broadcastState() noexcept {
     shared::XBusMessage bcast{};
