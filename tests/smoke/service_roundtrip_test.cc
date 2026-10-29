@@ -29,6 +29,7 @@
 #include "xserver/personal_services.h"
 #include "xserver/notif_services.h"
 #include "xserver/desktop_services.h"
+#include "xserver/extras_services.h"
 #include "xserver/ime_service.h"
 #include "xserver/login_items_service.h"
 #include "xserver/shortcuts.h"
@@ -3641,6 +3642,81 @@ TEST_F(ServiceRoundtrip, SecurityKeyListFraming) {
     SecurityKeyPage pg{};
     std::memcpy(&pg, rep.payload_, sizeof(pg));
     EXPECT_EQ(pg.valid_, pg.total_ > 0 ? 1u : 0u);   // no key plugged in here → empty
+}
+
+// ── Batch 17: the last five answer truthfully ─────────────────────────────────
+
+TEST_F(ServiceRoundtrip, HotspotStaysOffAndSaysSo) {
+    auto p = makePipe();
+    HotspotEnableRequest on{};
+    on.enabled_ = 1;
+    XBusMessage req = makeReq("com.freebsdx.Hotspot", static_cast<uint32_t>(HotspotOpcode::SetEnabled), 0x48000001, &on, sizeof(on));
+    HotspotService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.Hotspot", static_cast<uint32_t>(HotspotOpcode::SetEnabled), 0x48000001);
+    req = makeReq("com.freebsdx.Hotspot", static_cast<uint32_t>(HotspotOpcode::GetStatus), 0x48000002);
+    HotspotService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.Hotspot", static_cast<uint32_t>(HotspotOpcode::GetStatus), 0x48000002);
+    HotspotStatus st{};
+    std::memcpy(&st, rep.payload_, sizeof(st));
+    EXPECT_EQ(st.enabled_, 0u);
+}
+
+TEST_F(ServiceRoundtrip, LiveCaptionsKeepPrefsButStayOff) {
+    auto p = makePipe();
+    LiveCaptionsRequest r{};
+    r.enabled_ = 1; r.position_ = 1; r.font_size_ = 2;
+    XBusMessage req = makeReq("com.freebsdx.LiveCaptions", static_cast<uint32_t>(LiveCaptionsOpcode::SetState), 0x4c200001, &r, sizeof(r));
+    LiveCaptionsService::handleMessage(req, p.svc);
+    recvReply(p.peer, "com.freebsdx.LiveCaptions", static_cast<uint32_t>(LiveCaptionsOpcode::SetState), 0x4c200001);
+    req = makeReq("com.freebsdx.LiveCaptions", static_cast<uint32_t>(LiveCaptionsOpcode::GetState), 0x4c200002);
+    LiveCaptionsService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.LiveCaptions", static_cast<uint32_t>(LiveCaptionsOpcode::GetState), 0x4c200002);
+    LiveCaptionsState st{};
+    std::memcpy(&st, rep.payload_, sizeof(st));
+    EXPECT_EQ(st.enabled_, 0u);                       // no speech engine
+    EXPECT_EQ(st.position_, 1u);
+    EXPECT_EQ(st.font_size_, 2u);
+}
+
+TEST_F(ServiceRoundtrip, CastAndBtAudioHaveNothingToOffer) {
+    auto p = makePipe();
+    XBusMessage req = makeReq("com.freebsdx.Cast", static_cast<uint32_t>(CastOpcode::Scan), 0x43000001);
+    CastService::handleMessage(req, p.svc);
+    XBusMessage rep = recvReply(p.peer, "com.freebsdx.Cast", static_cast<uint32_t>(CastOpcode::Scan), 0x43000001);
+    CastReceiverPage cp{};
+    std::memcpy(&cp, rep.payload_, sizeof(cp));
+    EXPECT_EQ(cp.total_, 0u);
+
+    uint32_t page = 0;
+    req = makeReq("com.freebsdx.BtAudio", static_cast<uint32_t>(BtAudioOpcode::ListDevices), 0x42000001, &page, sizeof(page));
+    BtAudioService::handleMessage(req, p.svc);
+    rep = recvReply(p.peer, "com.freebsdx.BtAudio", static_cast<uint32_t>(BtAudioOpcode::ListDevices), 0x42000001);
+    BtAudioPage bp{};
+    std::memcpy(&bp, rep.payload_, sizeof(bp));
+    EXPECT_EQ(bp.valid_, bp.total_ > 0 ? 1u : 0u);     // no controller here → empty
+}
+
+TEST_F(ServiceRoundtrip, FileSyncReadsSyncthingConfig) {
+    auto p = makePipe();
+    auto list = [&](uint32_t tid) {
+        uint32_t page = 0;
+        XBusMessage req = makeReq("com.freebsdx.FileSync", static_cast<uint32_t>(FileSyncOpcode::ListJobs), tid, &page, sizeof(page));
+        FileSyncService::handleMessage(req, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.FileSync", static_cast<uint32_t>(FileSyncOpcode::ListJobs), tid);
+        FileSyncPage pg{};
+        std::memcpy(&pg, rep.payload_, sizeof(pg));
+        return pg;
+    };
+    EXPECT_EQ(list(0x46100001).total_, 0u);           // no Syncthing → empty
+    writeHomeFile(home_ + "/.local/state/syncthing/config.xml",
+                  "<configuration><folder id=\"docs\" label=\"Docs\" path=\"/home/u/Docs\"></folder>"
+                  "<folder id=\"pics\" label=\"Pics\" path=\"/home/u/Pics\" paused=\"true\"></folder>"
+                  "<gui><address>127.0.0.1:1</address><apikey>k</apikey></gui></configuration>");
+    FileSyncPage pg = list(0x46100002);
+    ASSERT_EQ(pg.total_, 2u);
+    EXPECT_STREQ(pg.entries_[0].name_, "Docs");
+    EXPECT_EQ(pg.entries_[0].state_, 3u);             // API unreachable (port 1) → error
+    EXPECT_EQ(pg.entries_[1].state_, 2u);             // paused
 }
 
 }  // namespace

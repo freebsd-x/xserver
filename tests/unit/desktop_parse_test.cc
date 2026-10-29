@@ -239,3 +239,47 @@ TEST(SecurityKeys, RecognisedByVendor) {
     EXPECT_FALSE(fbx::xserver::usb::isSecurityKey(pixel));
     EXPECT_FALSE(fbx::xserver::usb::isSecurityKey(stick));
 }
+
+// ── Hotspot capability / Syncthing ───────────────────────────────────────────
+
+#include "xserver/extras_parse.h"
+
+TEST(Extras, HostapCapabilityFromDrivercaps) {
+    // This laptop's iwm0: station only.
+    EXPECT_FALSE(extras::driverSupportsHostap("drivercaps=580c201<STA,PMGT,SHSLOT,SHPREAMBLE,WPA1,WPA2,WME>\n"));
+    EXPECT_TRUE(extras::driverSupportsHostap("drivercaps=..<STA,IBSS,HOSTAP,AHDEMO,WPA2>"));
+    EXPECT_FALSE(extras::driverSupportsHostap("drivercaps=..<STA,HOSTAPX>"));
+    EXPECT_FALSE(extras::driverSupportsHostap(""));
+}
+
+TEST(Extras, SyncthingConfigAndStatus) {
+    constexpr std::string_view kXml =
+        "<configuration version=\"37\">\n"
+        "  <folder id=\"abcd-1234\" label=\"Documents\" path=\"/home/u/Documents\" type=\"sendreceive\">\n"
+        "    <paused>false</paused>\n  </folder>\n"
+        "  <folder id=\"photos\" label=\"\" path=\"/home/u/Photos\" paused=\"true\">\n  </folder>\n"
+        "  <gui enabled=\"true\"><address>127.0.0.1:8384</address><apikey>Xy12-ab_C</apikey></gui>\n"
+        "</configuration>\n";
+    auto f = extras::parseFolders(kXml);
+    ASSERT_EQ(f.size(), 2u);
+    EXPECT_EQ(f[0].label, "Documents");
+    EXPECT_FALSE(f[0].paused);
+    EXPECT_EQ(f[1].label, "photos");                 // empty label → id
+    EXPECT_TRUE(f[1].paused);
+    EXPECT_EQ(extras::parseApiKey(kXml), "Xy12-ab_C");
+
+    uint32_t state = 9, progress = 9;
+    extras::folderState(R"({"globalBytes": 1000, "needBytes": 250, "state": "syncing"})", false, state, progress);
+    EXPECT_EQ(state, 1u);
+    EXPECT_EQ(progress, 75u);
+    extras::folderState(R"({"globalBytes":1000,"needBytes":0,"state":"idle"})", false, state, progress);
+    EXPECT_EQ(state, 0u);
+    EXPECT_EQ(progress, 100u);
+    extras::folderState("", false, state, progress);                 // API unreachable
+    EXPECT_EQ(state, 3u);
+    extras::folderState("", true, state, progress);
+    EXPECT_EQ(state, 2u);
+    EXPECT_TRUE(extras::safeFolderId("abcd-1234"));
+    EXPECT_FALSE(extras::safeFolderId("a/../b"));
+    EXPECT_FALSE(extras::safeFolderId("x;rm"));
+}

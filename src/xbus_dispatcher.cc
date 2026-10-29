@@ -64,6 +64,7 @@
 #include "xserver/personal_services.h"
 #include "xserver/notif_services.h"
 #include "xserver/desktop_services.h"
+#include "xserver/extras_services.h"
 #include "xserver/battery_health_service.h"
 #include "xserver/audio_output_service.h"
 #include "xserver/gpu_monitor_service.h"
@@ -204,6 +205,11 @@ static const ShellOnlyService* shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.Transfer",        &TransferService::handleMessage},
         {"com.freebsdx.AppTimeLimit",    &AppTimeLimitService::handleMessage},
         {"com.freebsdx.SecurityKey",     &SecurityKeyService::handleMessage},
+        {"com.freebsdx.Hotspot",         &HotspotService::handleMessage, true},
+        {"com.freebsdx.BtAudio",         &BtAudioService::handleMessage, true},
+        {"com.freebsdx.FileSync",        &FileSyncService::handleMessage, true},
+        {"com.freebsdx.LiveCaptions",    &LiveCaptionsService::handleMessage},
+        {"com.freebsdx.Cast",            &CastService::handleMessage},
     };
     for (const auto& e : kTable)
         if (std::strcmp(name, e.name) == 0) return &e;
