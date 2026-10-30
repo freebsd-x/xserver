@@ -170,6 +170,8 @@ struct ShellOnlyService {
 static const ShellOnlyService* shellOnlyService(const char* name) noexcept {
     static constexpr ShellOnlyService kTable[] = {
         {"com.freebsdx.Services", &RcServicesService::handleMessage, true},
+        // Writes /etc/hosts through the broker; downloads its list (slow).
+        {"com.freebsdx.AdBlock",  &AdBlockService::handleMessage, true},
         {"com.freebsdx.Jails",    &JailsService::handleMessage, true},
         {"com.freebsdx.ZfsPools", &ZfsPoolsService::handleMessage, true},
         {"com.freebsdx.BootEnv",  &BootEnvService::handleMessage, true},
@@ -1089,10 +1091,6 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.Keymap") == 0) {
         KeymapService::handleMessage(*msg, client);
-        return {true, std::nullopt};
-    }
-    else if (std::strcmp(msg->service_name_, "com.freebsdx.AdBlock") == 0) {
-        AdBlockService::handleMessage(*msg, client);
         return {true, std::nullopt};
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.LocationServices") == 0 ||

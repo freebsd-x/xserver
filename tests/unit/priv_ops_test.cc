@@ -169,3 +169,12 @@ TEST(PrivOps, WlanStateOnlyWifiInterfaces) {
     EXPECT_FALSE(validateOp(kWlanState, "wlan1000:0"));
     EXPECT_FALSE(validateOp(kWlanState, "wlanx:1"));
 }
+
+TEST(PrivOps, AdBlockApplyIsOnlyOnOrOff) {
+    EXPECT_TRUE(knownVerb(kAdBlockApply));
+    EXPECT_TRUE(validateOp(kAdBlockApply, "1"));
+    EXPECT_TRUE(validateOp(kAdBlockApply, "0"));
+    EXPECT_FALSE(validateOp(kAdBlockApply, ""));
+    EXPECT_FALSE(validateOp(kAdBlockApply, "/etc/master.passwd"));   // never a path
+    EXPECT_FALSE(validateOp(kAdBlockApply, "0.0.0.0 ads.example.com"));
+}

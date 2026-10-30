@@ -46,6 +46,7 @@
 #include "xserver/battery_drain_service.h"
 #include "xserver/keymap_service.h"
 #include "xserver/adblock_service.h"
+#include "xserver/adblock_apply.h"
 #include "xserver/location_service.h"
 #include "xserver/kbd_backlight_service.h"
 #include "xserver/energy_service.h"
@@ -699,33 +700,77 @@ TEST_F(ServiceRoundtrip, LocationSetAppPolicyPersistsClamped) {
     EXPECT_EQ(ConfigService::get("location.app.com.example.maps", ""), "2");
 }
 
-// ── AdBlock: SetEnabled persists + GetStatus reflects; UpdateList stamps date ─
-// SetEnabled/UpdateList have no direct reply (StatusChanged broadcast, swallowed
-// by the stub) — read back via GetStatus / ConfigService.
+// ── AdBlock: download → normalized list → /etc/hosts block, and back ──────────
+// The backend is faked only at the edges: "download" writes a fixture list and
+// "the broker" runs the real root-side applyToHosts on a temp hosts file.
 
-TEST_F(ServiceRoundtrip, AdBlockToggleAndUpdate) {
+void writeHomeFile(const std::string& path, const std::string& body);   // defined below
+std::string readHomeFile(const std::string& path);
+
+TEST_F(ServiceRoundtrip, AdBlockDownloadsAppliesAndRemoves) {
+    const std::string hosts = home_ + "/hosts";
+    writeHomeFile(hosts, "127.0.0.1 localhost\n");
+    std::string next_list = "0.0.0.0 ads.example.com\n0.0.0.0 tracker.net\n1.2.3.4 bank.com\n";
+    int downloads = 0;
+    bool download_ok = true;
+    AdBlockService::Backend be;
+    be.download = [&](const std::string&, const std::string& dest) {
+        ++downloads;
+        if (!download_ok) return false;
+        writeHomeFile(dest, next_list);
+        return true;
+    };
+    be.apply = [&](bool on) { return fbx::xserver::adblock::applyToHosts(on, ::getuid(), home_, hosts); };
+    be.hosts_path = hosts;
+    AdBlockService::setBackend(be);
+
     auto p = makePipe();
-    AdBlockEnableRequest on{}; on.enabled_ = 1;
-    XBusMessage set = makeReq("com.freebsdx.AdBlock",
-                              static_cast<uint32_t>(AdBlockOpcode::SetEnabled),
-                              0x6f000001, &on, sizeof(on));
-    AdBlockService::handleMessage(set, p.svc);   // no reply
+    uint32_t tid = 0x6f000001;
+    auto status = [&] {
+        XBusMessage get = makeReq("com.freebsdx.AdBlock", static_cast<uint32_t>(AdBlockOpcode::GetStatus), tid);
+        AdBlockService::handleMessage(get, p.svc);
+        XBusMessage rep = recvReply(p.peer, "com.freebsdx.AdBlock", static_cast<uint32_t>(AdBlockOpcode::GetStatus), tid++);
+        AdBlockStatus st{};
+        std::memcpy(&st, rep.payload_, sizeof(st));
+        return st;
+    };
+    auto send = [&](AdBlockOpcode op, uint32_t enabled) {
+        AdBlockEnableRequest r{}; r.enabled_ = enabled;
+        XBusMessage m = makeReq("com.freebsdx.AdBlock", static_cast<uint32_t>(op), tid++, &r, sizeof(r));
+        AdBlockService::handleMessage(m, p.svc);   // no direct reply
+    };
 
-    XBusMessage get = makeReq("com.freebsdx.AdBlock",
-                              static_cast<uint32_t>(AdBlockOpcode::GetStatus), 0x6f000002);
-    AdBlockService::handleMessage(get, p.svc);
-    XBusMessage rep = recvReply(p.peer, "com.freebsdx.AdBlock",
-                                static_cast<uint32_t>(AdBlockOpcode::GetStatus), 0x6f000002);
-    AdBlockStatus st{};
-    std::memcpy(&st, rep.payload_, sizeof(st));
+    AdBlockStatus st = status();
+    EXPECT_EQ(st.enabled_, 0u);
+    EXPECT_STREQ(st.list_updated_, "");              // never fetched: no made-up date
+
+    send(AdBlockOpcode::SetEnabled, 1);              // no list yet → download, then apply
+    EXPECT_EQ(downloads, 1);
+    st = status();
     EXPECT_EQ(st.enabled_, 1u);
+    EXPECT_EQ(st.domain_count_, 2u);                 // the redirect line never made it
+    EXPECT_NE(st.list_updated_[0], '\0');
     EXPECT_EQ(st.updating_, 0u);
+    auto written = readHomeFile(hosts);
+    EXPECT_NE(written.find("0.0.0.0 tracker.net"), std::string::npos);
+    EXPECT_EQ(written.find("bank.com"), std::string::npos);
 
-    // UpdateList stamps a real date into list_updated_ (was "never").
-    XBusMessage upd = makeReq("com.freebsdx.AdBlock",
-                              static_cast<uint32_t>(AdBlockOpcode::UpdateList), 0x6f000003);
-    AdBlockService::handleMessage(upd, p.svc);   // no reply
-    EXPECT_NE(ConfigService::get("adblock.list_date", "never"), "never");
+    // A newer list goes live straight away while AdBlock is on.
+    next_list = "ads.example.com\nthird.example.org\nfourth.example.org\n";
+    send(AdBlockOpcode::UpdateList, 0);
+    EXPECT_EQ(status().domain_count_, 3u);
+
+    // A failed download keeps the current list and block.
+    download_ok = false;
+    send(AdBlockOpcode::UpdateList, 0);
+    EXPECT_EQ(status().domain_count_, 3u);
+
+    send(AdBlockOpcode::SetEnabled, 0);
+    st = status();
+    EXPECT_EQ(st.enabled_, 0u);
+    EXPECT_EQ(readHomeFile(hosts), "127.0.0.1 localhost\n");
+
+    AdBlockService::setBackend({});
 }
 
 // ── Keymap: SetLayout persists a valid layout, rejects a bogus one ────────────

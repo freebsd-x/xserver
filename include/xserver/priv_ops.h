@@ -24,13 +24,15 @@ inline constexpr const char* kBeDestroy        = "be.destroy";         // arg = 
 inline constexpr const char* kJailRemove       = "jail.remove";        // arg = decimal jid
 inline constexpr const char* kFirewallBlockIn  = "firewall.blockin";   // arg = "1": load the block-all-inbound ruleset
 inline constexpr const char* kWlanState        = "net.wlan";           // arg = "wlanN:0" (down) / "wlanN:1" (up)
+inline constexpr const char* kAdBlockApply     = "adblock.apply";      // arg = "1" (apply the user's list) / "0" (remove)
 
 inline bool knownVerb(std::string_view v) noexcept {
     return v == kResolvConfWrite || v == kAudioDefaultUnit ||
            v == kFirewallEnable  || v == kKmodUnload ||
            v == kServiceStart    || v == kServiceStop ||
            v == kZfsScrub        || v == kBeActivate || v == kBeDestroy ||
-           v == kJailRemove      || v == kFirewallBlockIn || v == kWlanState;
+           v == kJailRemove      || v == kFirewallBlockIn || v == kWlanState ||
+           v == kAdBlockApply;
 }
 
 // A name passed to a root command as its own argv element: 1..max chars from
@@ -131,6 +133,11 @@ inline bool validateOp(std::string_view verb, std::string_view arg) noexcept {
         if (colon == std::string_view::npos || colon < 5 || colon > 7 || colon + 2 != arg.size()) return false;
         for (char c : arg.substr(4, colon - 4)) if (c < '0' || c > '9') return false;
         return arg.back() == '0' || arg.back() == '1';
+    }
+    if (verb == kAdBlockApply) {
+        // Exactly "0"/"1". The domains never travel in the arg: the daemon reads
+        // the caller's own list file (see xsessiond) and re-validates every name.
+        return arg == "0" || arg == "1";
     }
     return false;   // unknown verb
 }

@@ -21,6 +21,7 @@
 
 #include "xserver/xsessiond_protocol.h"
 #include "xserver/priv_ops.h"
+#include "xserver/adblock_apply.h"
 
 #include <security/pam_appl.h>
 #include <sys/sysctl.h>
@@ -40,6 +41,8 @@
 #include <fcntl.h>
 #include <map>
 #include <poll.h>
+#include <pwd.h>
+#include <optional>
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
@@ -233,8 +236,15 @@ int runFixed(const char* path, std::vector<const char*> argv, const char* stdin_
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-int32_t perform_privileged(const std::string& verb, const std::string& arg) {
+int32_t perform_privileged(const std::string& verb, const std::string& arg, uid_t caller_uid) {
     using namespace fbx::xserver::privops;
+    if (verb == kAdBlockApply) {
+        // Only a regular session user's own list (never root's).
+        if (caller_uid == 0 || caller_uid == static_cast<uid_t>(-1)) return -EPERM;
+        const passwd* pw = ::getpwuid(caller_uid);
+        if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/') return -ENOENT;
+        return fbx::xserver::adblock::applyToHosts(arg == "1", caller_uid, pw->pw_dir, "/etc/hosts");
+    }
     if (verb == kResolvConfWrite) {
         int wfd = ::open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (wfd < 0) return -errno;
@@ -613,7 +623,10 @@ bool dispatch_datagram(int fd, Session& s, const unsigned char* buf, size_t n) {
             send_reply(fd, hdr.serial, Reply::PrivilegedResult, -EINVAL);  // refuse
             break;
         }
-        send_reply(fd, hdr.serial, Reply::PrivilegedResult, perform_privileged(verb, arg));
+        uid_t peer_uid = static_cast<uid_t>(-1);
+        gid_t peer_gid = 0;
+        if (::getpeereid(fd, &peer_uid, &peer_gid) != 0) peer_uid = static_cast<uid_t>(-1);
+        send_reply(fd, hdr.serial, Reply::PrivilegedResult, perform_privileged(verb, arg, peer_uid));
         break;
     }
 
