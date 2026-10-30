@@ -499,13 +499,13 @@ libseat_seat_listener g_libseat_listener = {
 // fd reads every keystroke), the root broker — was open to any local process
 // of any user. A connection is served only if its peer runs one of the
 // compositor binaries in XSESSIOND_COMPOSITOR (':'-separated absolute paths;
-// default /usr/local/bin/freebsdx), checked by the peer's pid → executable.
+// default: the installed freebsdx / xserver), checked by the peer's pid → executable.
 static std::vector<std::string> g_allowed_compositors;   // real paths
 
 // Read before scrub_environment() wipes environ.
 static void load_allowed_compositors() {
     const char* env = ::getenv("XSESSIOND_COMPOSITOR");
-    std::string list = (env && env[0]) ? env : "/usr/local/bin/freebsdx";
+    std::string list = (env && env[0]) ? env : "/usr/local/bin/freebsdx:/usr/local/bin/xserver";
     size_t start = 0;
     while (start <= list.size()) {
         size_t colon = list.find(':', start);

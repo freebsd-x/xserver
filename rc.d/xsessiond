@@ -23,7 +23,7 @@ load_rc_config $name
 : ${xsessiond_enable:="NO"}
 # The compositor binaries allowed to use the daemon (':'-separated absolute
 # paths). Every other client — any process of any user — is refused.
-: ${xsessiond_compositor:="/usr/local/bin/freebsdx"}
+: ${xsessiond_compositor:="/usr/local/bin/freebsdx:/usr/local/bin/xserver"}
 xsessiond_env="XSESSIOND_COMPOSITOR=${xsessiond_compositor}"
 
 pidfile="/var/run/xsessiond.pid"
