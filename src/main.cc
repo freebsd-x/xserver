@@ -87,6 +87,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/sysctl.h>
+#include <sys/ucred.h>
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -144,6 +146,44 @@ static void releaseSurfaceImages(VulkanCompositor* comp, uint32_t id) {
 
 static constexpr uint32_t kMaxSurfaces = 64; // hard cap — prevents Vulkan descriptor pool exhaustion
 static pid_t g_shell_pid = -1;
+
+// --headless (a test harness: no seat, no spawned shell). --strict-shell-trust
+// keeps the live seat's shell-surface check on in headless (to test it).
+static bool g_headless = false;
+static bool g_strict_shell_trust = false;
+
+// May this client register a shell surface (the desktop shell, lock screen or
+// greeter)? A shell surface is trusted: it may call the shell-only services,
+// which reach the root broker (firewall, rc services, /etc/hosts…). Before,
+// any client could send ShellSurfaceCreated and be trusted. Now its process
+// must be running one of the shell binaries (kern.proc.pathname of the peer's
+// pid, LOCAL_PEERCRED) — a sandboxed app can't exec one. Headless allows any
+// client: whoever runs a headless compositor can already reach the broker.
+static bool mayRegisterShellSurface(int fd) {
+    if (g_headless && !g_strict_shell_trust) return true;
+    struct xucred xu{};
+    socklen_t len = sizeof(xu);
+    if (::getsockopt(fd, 0 /* SOL_LOCAL */, LOCAL_PEERCRED, &xu, &len) != 0 ||
+        xu.cr_version != XUCRED_VERSION || xu.cr_pid <= 0)
+        return false;
+    char path[PATH_MAX] = {};
+    size_t plen = sizeof(path) - 1;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, xu.cr_pid};
+    if (::sysctl(mib, 4, path, &plen, nullptr, 0) != 0) return false;
+    static const std::vector<std::string> trusted = [] {
+        std::vector<std::string> v;
+        for (const char* bin : {"xshell", "lockscreen", "xlogin"})
+            for (const std::string& cand : {std::string("./") + bin, std::string("./out/") + bin,
+                                            std::string("/usr/local/bin/") + bin}) {
+                char real[PATH_MAX];
+                if (::realpath(cand.c_str(), real)) v.emplace_back(real);
+            }
+        return v;
+    }();
+    char real[PATH_MAX];   // e.g. /home → /usr/home on FreeBSD
+    std::string exe = ::realpath(path, real) ? real : path;
+    return std::find(trusted.begin(), trusted.end(), exe) != trusted.end();
+}
 static bool g_flip_pending = false; // single-threaded event loop — no race
 // When the current page flip was issued. A page-flip completion event clears
 // g_flip_pending; if that event is ever dropped (e.g. a modeset during the
@@ -348,7 +388,8 @@ int main(int argc, char** argv) {
         if (arg == "--no-input")  enable_input = false;
         if (arg == "--virtual")   virtual_boot = true;
         if (arg == "--no-greeter") skip_greeter = true;
-        if (arg == "--headless") { headless = true; virtual_boot = true; }
+        if (arg == "--headless") { headless = true; virtual_boot = true; g_headless = true; }
+        if (arg == "--strict-shell-trust") g_strict_shell_trust = true;
         if (arg.starts_with("--headless-size=")) {
             auto sz = arg.substr(16);
             auto xp = sz.find('x');
@@ -983,8 +1024,17 @@ int main(int argc, char** argv) {
                 if (x_res.consumed) return;
                 
                 // Wayland bridge title update (64 bytes, distinct from RenderMessage 36)
+                // A client may only touch surfaces it registered. Surface ids
+                // are chosen by clients, so without this an app could close,
+                // draw into or retitle another app's window — or take over the
+                // shell's id 999.
+                auto owned_by_other = [&](uint32_t id) {
+                    auto it = g_surface_clients.find(id);
+                    return it != g_surface_clients.end() && it->second != c_sock;
+                };
                 if (d.size() == sizeof(BridgeTitleMessage)) {
                     const auto* t = reinterpret_cast<const BridgeTitleMessage*>(d.data());
+                    if (owned_by_other(t->surface_id_)) return;
                     window_stack.setWindowTitle(t->surface_id_, t->title_);
                     RebuildAndBroadcastWindowList(&window_stack);
                     return;
@@ -992,6 +1042,37 @@ int main(int argc, char** argv) {
 
                 if (d.size() >= sizeof(RenderMessage)) {
                     const auto* r = reinterpret_cast<const RenderMessage*>(d.data());
+                    if (owned_by_other(r->surface_id_)) {
+                        std::cerr << "[xserver] DENIED: surface " << r->surface_id_
+                                  << " belongs to another client\n";
+                        if (r->status_ == RenderMessageStatus::SurfaceCreated ||
+                            r->status_ == RenderMessageStatus::ShellSurfaceCreated) {
+                            RenderMessage rej{};   // zero size: the client unblocks and gives up
+                            rej.surface_id_ = r->surface_id_; rej.status_ = RenderMessageStatus::SurfaceReady;
+                            (void)c_sock->sendMessage({reinterpret_cast<const uint8_t*>(&rej), sizeof(rej)});
+                        }
+                        return;
+                    }
+                    // 998/999 are the lock screen's and the shell's: only an
+                    // approved shell surface may take them.
+                    const bool shell_id = r->surface_id_ == 998u || r->surface_id_ == 999u;
+                    const bool creating = r->status_ == RenderMessageStatus::SurfaceCreated ||
+                                          r->status_ == RenderMessageStatus::SubsurfaceCreated ||
+                                          r->status_ == RenderMessageStatus::LayerSurfaceCreated;
+                    if (shell_id && creating) {
+                        std::cerr << "[xserver] DENIED: surface id " << r->surface_id_ << " is reserved for the shell\n";
+                        if (r->status_ == RenderMessageStatus::SurfaceCreated) {
+                            RenderMessage rej{};
+                            rej.surface_id_ = r->surface_id_; rej.status_ = RenderMessageStatus::SurfaceReady;
+                            (void)c_sock->sendMessage({reinterpret_cast<const uint8_t*>(&rej), sizeof(rej)});
+                        }
+                        return;
+                    }
+                    if (r->status_ == RenderMessageStatus::SubsurfaceCreated && owned_by_other(r->stride_)) {
+                        std::cerr << "[xserver] DENIED: subsurface " << r->surface_id_
+                                  << " on another client's window " << r->stride_ << "\n";
+                        return;
+                    }
                     if (r->status_ == RenderMessageStatus::SubsurfaceCreated) {
                         // stride_ = parent_id, damage_x_ = sub_x, damage_y_ = sub_y
                         if (g_surface_clients.size() >= kMaxSurfaces) {
@@ -1060,6 +1141,14 @@ int main(int argc, char** argv) {
                             return;
                         }
                         bool is_s = (r->status_ == RenderMessageStatus::ShellSurfaceCreated);
+                        if (is_s && !mayRegisterShellSurface(c_sock->fd())) {
+                            std::cerr << "[xserver] DENIED: shell surface " << r->surface_id_
+                                      << " from a process that isn't a shell binary\n";
+                            RenderMessage rej{};   // zero size: the client unblocks and gives up
+                            rej.surface_id_ = r->surface_id_; rej.status_ = RenderMessageStatus::SurfaceReady;
+                            (void)c_sock->sendMessage({reinterpret_cast<const uint8_t*>(&rej), sizeof(rej)});
+                            return;
+                        }
                         // Logical screen dims (apps lay out in logical pixels; the
                         // compositor scales to physical).
                         float sc0 = window_stack.getOutputScale(0);
