@@ -327,7 +327,10 @@ XBusDispatcher::RaiseCallback       XBusDispatcher::raise_cb_        = nullptr;
 
 static std::vector<std::weak_ptr<IpcSocket>> g_active_clients;
 static std::mutex g_clients_mutex;
-static bool g_dark_mode  = false;
+// Dark by default: the shell and the apps are designed dark, and themed text
+// (the light theme's dark text) was invisible on them. A saved choice
+// (~/.freebsdx-theme, LoadTheme) still wins.
+static bool g_dark_mode  = true;
 static int  g_accent_idx = 0; // 0=Blue, 1=Purple, 2=Orange
 
 static std::string GetThemeConfigPath() {
