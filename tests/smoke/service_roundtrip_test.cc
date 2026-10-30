@@ -3585,9 +3585,19 @@ TEST_F(ServiceRoundtrip, AppTimeLimitTracksUsageAndNotifiesOnceAtTheLimit) {
     writeHomeFile(apps + "/Browser.xapp/manifest.json", R"({"name": "Browser", "identifier": "com.freebsdx.browser"})");
     AppPermsService::init([apps] { return apps; });
     std::vector<std::string> notes;
-    AppTimeLimitService::init([&](const std::string&, const std::string& m) { notes.push_back(m); });
+    std::vector<std::string> closed;
+    AppTimeLimitService::init([&](const std::string&, const std::string& m) { notes.push_back(m); },
+                              [&](const std::string& id) { closed.push_back(id); });
 
     auto p = makePipe();
+    auto appReq = [&](AppTimeLimitOpcode op, const char* id, uint32_t min, uint32_t tid) {
+        AppTimeLimitAppRequest r{};
+        std::strncpy(r.app_id_, id, sizeof(r.app_id_) - 1);
+        r.minutes_ = min;
+        XBusMessage req = makeReq("com.freebsdx.AppTimeLimit", static_cast<uint32_t>(op), tid, &r, sizeof(r));
+        AppTimeLimitService::handleMessage(req, p.svc);
+        recvReply(p.peer, "com.freebsdx.AppTimeLimit", static_cast<uint32_t>(op), tid);
+    };
     auto setLimit = [&](const char* name, uint32_t min, uint32_t tid) {
         AppTimeLimitSetRequest r{};
         std::strncpy(r.app_name_, name, sizeof(r.app_name_) - 1);
@@ -3621,13 +3631,28 @@ TEST_F(ServiceRoundtrip, AppTimeLimitTracksUsageAndNotifiesOnceAtTheLimit) {
     EXPECT_EQ(notes.size(), 1u);                     // once per day
     EXPECT_EQ(list(0x41200004).used_minutes_today_, 2u);
 
+    // "15 more minutes" (here 2, out of range refused): the card returns when
+    // the extra time is used up, once.
+    appReq(AppTimeLimitOpcode::Extend, "com.freebsdx.browser", 0, 0x41200010);     // refused
+    appReq(AppTimeLimitOpcode::Extend, "com.freebsdx.browser", 2, 0x41200011);     // allowed: 3 min
+    AppTimeLimitService::tick("com.freebsdx.browser", 50);                          // 170 s
+    EXPECT_EQ(notes.size(), 1u);
+    AppTimeLimitService::tick("com.freebsdx.browser", 10);                          // 180 s
+    EXPECT_EQ(notes.size(), 2u);
+    AppTimeLimitService::tick("com.freebsdx.browser", 60);
+    EXPECT_EQ(notes.size(), 2u);
+
+    appReq(AppTimeLimitOpcode::CloseApp, "com.freebsdx.browser", 0, 0x41200012);
+    ASSERT_EQ(closed.size(), 1u);
+    EXPECT_EQ(closed[0], "com.freebsdx.browser");
+
     AppTimeLimitRemoveRequest rm{};
     std::strncpy(rm.app_name_, "Browser", sizeof(rm.app_name_) - 1);
     XBusMessage req = makeReq("com.freebsdx.AppTimeLimit", static_cast<uint32_t>(AppTimeLimitOpcode::RemoveLimit), 0x41200005, &rm, sizeof(rm));
     AppTimeLimitService::handleMessage(req, p.svc);
     recvReply(p.peer, "com.freebsdx.AppTimeLimit", static_cast<uint32_t>(AppTimeLimitOpcode::RemoveLimit), 0x41200005);
     EXPECT_EQ(list(0x41200006).total_, 0u);
-    AppTimeLimitService::init(nullptr);
+    AppTimeLimitService::init(nullptr, nullptr);
     AppPermsService::init(nullptr);
 }
 

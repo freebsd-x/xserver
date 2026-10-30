@@ -1,3 +1,4 @@
+#include "xserver/shell_input_region.h"
 #include "xserver/xbus_dispatcher.h"
 #include "xserver/vulkan_compositor.h"
 #include "xserver/display_service.h"
@@ -743,6 +744,18 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // LaunchWithFile: broadcast to all clients so the shell can handle it.
         if (msg->opcode_ == static_cast<uint32_t>(shared::ShellOpcode::LaunchWithFile)) {
             BroadcastXBusMessage(*msg);
+        }
+        // Only the shell itself may say where its popups are.
+        else if (msg->opcode_ == static_cast<uint32_t>(shared::ShellOpcode::SetInputRegion) &&
+                 client->isTrusted()) {
+            shared::ShellInputRegion r{};
+            std::memcpy(&r, msg->payload_, sizeof(r));
+            shellregion::set(r);
+            std::string desc;
+            for (uint32_t i = 0; i < std::min<uint32_t>(r.count_, std::size(r.rects_)); ++i)
+                desc += " " + std::to_string(r.rects_[i].w_) + "x" + std::to_string(r.rects_[i].h_) + "@" +
+                        std::to_string(r.rects_[i].x_) + "," + std::to_string(r.rects_[i].y_);
+            std::cout << "[Shell] Input region:" << (desc.empty() ? " (none)" : desc) << "\n";
         }
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.Ping") == 0) {

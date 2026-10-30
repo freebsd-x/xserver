@@ -7,6 +7,7 @@
 #include "xserver/input_manager.h"
 #include <spawn.h>
 #include "xserver/shortcuts.h"
+#include "xserver/shell_input_region.h"
 #include "xserver/scrolldir_service.h"
 #include "xserver/touchpad_service.h"
 #include "xserver/pointer_service.h"
@@ -267,6 +268,14 @@ static bool g_pointer_button_down = false;
 // previous surface's cursor would linger over the new one.
 static uint32_t g_hover_surface = 999;
 
+// The surface pointer input at this point belongs to: the shell where one of
+// its popups is (shellregion), else the app window under it (nullopt over the
+// bare desktop).
+static std::optional<uint32_t> pointerTarget(fbx::xkit::Offset p) {
+    if (shellregion::contains(p.x_, p.y_) && g_surface_clients.contains(999u)) return 999u;
+    return window_stack.bodyHitTest(p);
+}
+
 // Modifier bitmask (Shift=1, Ctrl=2, Alt=4, Super=8) from the most recent
 // pointer motion, so the drag-and-drop cursor can pick copy (Ctrl) vs move.
 static uint32_t g_pointer_modifiers = 0;
@@ -495,6 +504,25 @@ int main(int argc, char** argv) {
         std::strncpy(n.message_, message.c_str(), sizeof(n.message_) - 1);
         std::strncpy(n.app_name_, "Screen Time", sizeof(n.app_name_) - 1);
         NotificationService::post(n);
+    }, [](const std::string& app_id) {
+        // Close every window of the app, as Super+Q / the title-bar close does.
+        std::vector<uint32_t> ids;
+        for (const auto& [sid, c] : g_surface_clients)
+            if (sid != 999 && sid != 998 && c && c->appId() == app_id) ids.push_back(sid);
+        for (uint32_t sid : ids) {
+            RenderMessage close_msg{};
+            close_msg.surface_id_ = sid;
+            close_msg.status_ = RenderMessageStatus::SurfaceClosed;
+            (void)g_surface_clients[sid]->sendMessage(
+                {reinterpret_cast<const uint8_t*>(&close_msg), sizeof(close_msg)});
+            window_stack.removeWindow(sid);
+            if (focused_surface == sid) focused_surface = 999;
+        }
+        LOG_INFO("AppTimeLimit: closed {} window(s) of {}", ids.size(), app_id);
+        if (!ids.empty()) {
+            RebuildAndBroadcastWindowList(&window_stack);
+            g_scene_dirty = true;
+        }
     });
     // Saved EQ → the audio mixer (com.freebsdx.AudioEq).
     AudioEqService::init([](const eq::Gains& g) { AudioService::getInstance().setEq(g); });
@@ -1200,7 +1228,7 @@ int main(int argc, char** argv) {
             else if (e & 8u)         want = 18;  // right        → e_resize
             else if (e & 2u)         want = 22;  // bottom       → s_resize
         } else {
-            auto hit = window_stack.bodyHitTest({cursor_x, cursor_y});
+            auto hit = pointerTarget({cursor_x, cursor_y});
             uint32_t hov = hit.value_or(UINT32_MAX);
             bool crossed = (hov != g_hover_surface);
             g_hover_surface = hov;
@@ -1263,7 +1291,9 @@ int main(int argc, char** argv) {
     });
 
 
-    (void)loop->addTimer(1, 16, [comp, screen_w, screen_h, drm_ptr, &process_pointer_motion]() {
+    // Defined with the input loop below; the frame timer feeds it injected input.
+    std::function<void(shared::InputMessage&)> handle_input;
+    (void)loop->addTimer(1, 16, [comp, screen_w, screen_h, drm_ptr, &process_pointer_motion, &handle_input]() {
         if (!g_seat_active) return;   // seat handed to another VT — don't touch the GPU
         if (g_flip_pending) {
             // Watchdog: a healthy flip completes in ~1 frame (16ms @60Hz). If one
@@ -1382,31 +1412,10 @@ int main(int argc, char** argv) {
         {
             auto injected = RemoteDesktopService::drainInjectedInput();
             if (!injected.empty()) g_scene_dirty = true;  // remote input moves things
-            for (const auto& imsg : injected) {
-                LockService::resetIdleTimer();
-                ScreenSaverService::resetIdleTimer();
-                if (imsg.type_ == InputEventType::MouseMove) {
-                    cursor_x += static_cast<float>(imsg.value_a_);
-                    cursor_y += static_cast<float>(imsg.value_b_);
-                    cursor_x = std::clamp(cursor_x, 0.0f, static_cast<float>(screen_w));
-                    cursor_y = std::clamp(cursor_y, 0.0f, static_cast<float>(screen_h));
-                    // Same processing as real input: hover arbitration + cursor move.
-                    g_pointer_modifiers = imsg.modifiers_;
-                    process_pointer_motion();
-                }
-                if (g_surface_clients.contains(focused_surface)) {
-                    shared::InputMessage out = imsg;
-                    if (out.type_ == InputEventType::MouseMove) {
-                        // Deliver surface-local absolute coordinates (see primary
-                        // input path); clients no longer accumulate relative deltas.
-                        auto o = window_stack.windowOrigin(focused_surface);
-                        out.value_a_ = static_cast<int32_t>(cursor_x - o.x_);
-                        out.value_b_ = static_cast<int32_t>(cursor_y - o.y_);
-                    }
-                    (void)g_surface_clients[focused_surface]->sendMessage(
-                        {reinterpret_cast<const uint8_t*>(&out), sizeof(out)});
-                }
-            }
+            // Same handling as hardware input: focus on click, motion/scroll to the
+            // surface under the pointer, shortcuts. (It used to go straight to the
+            // focused surface, so a remote click never reached the window under it.)
+            for (auto imsg : injected) handle_input(imsg);
         }
 
         // Drain virtual keyboard injected keys → focused surface
@@ -1422,6 +1431,550 @@ int main(int argc, char** argv) {
         }
     });
 
+    // One input event from libinput or injected (VNC, the headless harness):
+    // shortcuts, focus, pointer routing, delivery to the right surface.
+    handle_input = [&](shared::InputMessage& msg) {
+        // --- Reset idle timers on any user input ---
+        LockService::resetIdleTimer();
+        ScreenSaverService::resetIdleTimer();
+
+        // Always track the hardware cursor on pointer motion, even
+        // when input is redirected to the greeter or lock screen —
+        // otherwise the cursor freezes on those screens (it's a DRM
+        // plane the compositor owns, not the client's to move).
+        if (msg.type_ == InputEventType::MouseMove &&
+            (LoginService::isGreeterActive() || LockService::isLocked())) {
+            cursor_x = std::clamp(cursor_x + static_cast<float>(msg.value_a_),
+                                  0.0f, static_cast<float>(screen_w));
+            cursor_y = std::clamp(cursor_y + static_cast<float>(msg.value_b_),
+                                  0.0f, static_cast<float>(screen_h));
+            g_pointer_modifiers = msg.modifiers_;
+            process_pointer_motion();
+        }
+
+        // ── While login greeter is active, redirect all input to it ────────────
+        if (LoginService::isGreeterActive()) {
+            auto greeter = LoginService::greeterClient();
+            if (greeter) {
+                // The greeter is a fullscreen surface at the origin,
+                // and its client treats incoming mouse coordinates as
+                // absolute (surface-local). libinput motion is a
+                // *relative* delta, though, so forward the tracked
+                // absolute cursor position instead — otherwise the
+                // greeter's cursor stays pinned near (0,0) and clicks
+                // can't land on fields (e.g. the password box).
+                shared::InputMessage gm = msg;
+                if (gm.type_ == InputEventType::MouseMove) {
+                    gm.value_a_ = static_cast<int32_t>(cursor_x);
+                    gm.value_b_ = static_cast<int32_t>(cursor_y);
+                }
+                (void)greeter->sendMessage(
+                    {reinterpret_cast<const uint8_t*>(&gm), sizeof(gm)});
+                return;   // next event
+            }
+        }
+
+        // --- While locked, redirect all input to the lock screen ---
+        if (LockService::isLocked()) {
+            auto ls_client = LockService::lockscreenClient();
+            if (ls_client) {
+                // Allow media keys through even while locked
+                bool is_media_key =
+                    msg.type_ == InputEventType::AudioVolumeUp   ||
+                    msg.type_ == InputEventType::AudioVolumeDown ||
+                    msg.type_ == InputEventType::AudioMute       ||
+                    msg.type_ == InputEventType::BrightnessUp    ||
+                    msg.type_ == InputEventType::BrightnessDown;
+                if (!is_media_key) {
+                    (void)ls_client->sendMessage(
+                        {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
+                    return;   // next event
+                }
+            }
+        }
+
+        // --- Mouse Move ---
+        if (msg.type_ == InputEventType::MouseMove) {
+            cursor_x += static_cast<float>(msg.value_a_);
+            cursor_y += static_cast<float>(msg.value_b_);
+            cursor_x = std::clamp(cursor_x, 0.0f, static_cast<float>(screen_w));
+            cursor_y = std::clamp(cursor_y, 0.0f, static_cast<float>(screen_h));
+            window_stack.updateDrag({cursor_x, cursor_y});
+
+            // Active-resize drive + hover-cursor arbitration + hardware
+            // cursor move (shared with the injected-input path).
+            g_pointer_modifiers = msg.modifiers_;
+            process_pointer_motion();
+        }
+
+        // --- Mouse Button ---
+        if (msg.type_ == InputEventType::MouseButton) {
+            fbx::xkit::Offset mpos{cursor_x, cursor_y};
+            if (msg.value_b_ == 1) { // press
+                // Window-management chrome — resize edges, title bar and
+                // its close/min/max buttons — responds to the LEFT button
+                // only. Other buttons fall through to focus and are still
+                // forwarded to the client (context menu, middle-click paste).
+                const bool is_left = (msg.value_a_ == 272 /* BTN_LEFT */);
+                // A click on one of the shell's popups goes to the shell,
+                // even over an app window (no window chrome, no raise).
+                const bool on_shell_popup = pointerTarget(mpos) == std::optional<uint32_t>(999u);
+                if (on_shell_popup) focused_surface = 999;
+                // Check for resize zone first (takes priority over drag/focus)
+                auto resize_hit = on_shell_popup ? decltype(window_stack.resizeHitTest(mpos)){}
+                                                 : window_stack.resizeHitTest(mpos);
+                if (is_left && resize_hit) {
+                    auto [rsid, redges] = *resize_hit;
+                    focused_surface = rsid;
+                    window_stack.raiseToFocus(rsid);
+                    window_stack.startResize(rsid, mpos, redges);
+                } else {
+                auto title_hit = on_shell_popup ? decltype(window_stack.hitTest(mpos)){}
+                                                : window_stack.hitTest(mpos);
+                if (is_left && title_hit) {
+                    uint32_t win_id = *title_hit;
+                    focused_surface = win_id;
+                    window_stack.raiseToFocus(win_id);
+
+                    // Identify which zone within the title bar was clicked
+                    const auto& wins = window_stack.getWindows();
+                    auto wit = std::find_if(wins.begin(), wins.end(),
+                        [win_id](const Window& w){ return w.surface_id_ == win_id; });
+                    if (wit != wins.end()) {
+                        float wx = wit->position_.x_;
+                        float wy = wit->position_.y_;
+                        // Accept a click anywhere in the title-bar band
+                        // (not just the 12px dot) so the close/min/max
+                        // buttons are easy to hit with the mouse.
+                        float btn_top = wy - kTitleBarHeight;
+                        float btn_bot = wy;
+
+                        if (cursor_y >= btn_top && cursor_y <= btn_bot) {
+                            // Within the button row — check which button
+                            if (cursor_x >= wx + kCloseX && cursor_x <= wx + kCloseX + kButtonSize) {
+                                // Close button — notify client then remove
+                                if (g_surface_clients.contains(win_id)) {
+                                    RenderMessage close_msg{
+                                        .surface_id_ = win_id,
+                                        .status_ = RenderMessageStatus::SurfaceClosed
+                                    };
+                                    (void)g_surface_clients[win_id]->sendMessage(
+                                        {reinterpret_cast<const uint8_t*>(&close_msg), sizeof(close_msg)});
+                                }
+                                window_stack.removeWindow(win_id);
+                                focused_surface = 999; // fall back to shell
+                            } else if (cursor_x >= wx + kMinimizeX && cursor_x <= wx + kMinimizeX + kButtonSize) {
+                                window_stack.minimizeWindow(win_id);
+                                focused_surface = 999;
+                            } else if (cursor_x >= wx + kMaximizeX && cursor_x <= wx + kMaximizeX + kButtonSize) {
+                                window_stack.maximizeWindow(win_id);
+                            } else {
+                                window_stack.startDrag(win_id, mpos);
+                            }
+                        } else {
+                            // Click in title bar but outside button row — drag
+                            window_stack.startDrag(win_id, mpos);
+                        }
+                    }
+                } else {
+                    // Click in window body — focus without drag
+                    auto body_hit = on_shell_popup ? std::optional<uint32_t>{}
+                                                   : window_stack.bodyHitTest(mpos);
+                    if (body_hit) {
+                        focused_surface = *body_hit;
+                        window_stack.raiseToFocus(*body_hit);
+                    }
+                }
+                } // end else (not resize_hit)
+            } else if (msg.value_a_ == 272 /* BTN_LEFT */) { // left release
+                // End resize/drag and deliver a drop only on the left
+                // release — the button these interactions start on — so a
+                // stray right/middle click mid-drag doesn't cancel or drop.
+                window_stack.endResize();
+                window_stack.endDrag();
+
+                // ── DnD: deliver drop ──────────────────────────────────────
+                auto& dnd = GetDnDState();
+                if (dnd.active) {
+                    if (dnd.current_target != UINT32_MAX &&
+                        g_surface_clients.contains(dnd.current_target)) {
+                        const auto& wins = window_stack.getWindows();
+                        auto wit = std::find_if(wins.begin(), wins.end(),
+                            [&dnd](const Window& w){
+                                return w.surface_id_ == dnd.current_target; });
+                        float rx = cursor_x - (wit != wins.end() ? wit->position_.x_ : 0);
+                        float ry = cursor_y - (wit != wins.end() ? wit->position_.y_ : 0);
+                        DnDSendToClient(g_surface_clients[dnd.current_target],
+                            shared::DnDOpcode::Drop,
+                            rx, ry, dnd.mime_type, dnd.data);
+                        std::cout << "[DnD] Drop on surface " << dnd.current_target
+                                  << " data=" << dnd.data << "\n";
+                    }
+                    // Notify source that drag has ended
+                    DnDSendToClient(dnd.source_client,
+                        shared::DnDOpcode::DragEnd,
+                        0.0f, 0.0f, dnd.mime_type);
+                    ClearDnDState();
+                }
+            }
+        }
+
+        // --- TouchDown: focus the surface under the finger (slot 0 only) ---
+        if (msg.type_ == InputEventType::TouchDown && msg.modifiers_ == 0) {
+            fbx::xkit::Offset tpos{
+                static_cast<float>(msg.value_a_),
+                static_cast<float>(msg.value_b_)
+            };
+            auto title_hit = window_stack.hitTest(tpos);
+            if (pointerTarget(tpos) == std::optional<uint32_t>(999u)) {
+                focused_surface = 999;   // a tap on one of the shell's popups
+            } else if (title_hit) {
+                focused_surface = *title_hit;
+                window_stack.raiseToFocus(*title_hit);
+            } else {
+                auto body_hit = window_stack.bodyHitTest(tpos);
+                if (body_hit) {
+                    focused_surface = *body_hit;
+                    window_stack.raiseToFocus(*body_hit);
+                }
+            }
+        }
+
+        // --- Hardware brightness keys ---
+        if (msg.type_ == InputEventType::BrightnessUp ||
+            msg.type_ == InputEventType::BrightnessDown) {
+            int delta = (msg.type_ == InputEventType::BrightnessUp)
+                        ? msg.value_a_ : -msg.value_a_;
+            BacklightService::step(delta);
+            return;   // next event
+        }
+
+        // --- Audio media keys ---
+        if (msg.type_ == InputEventType::AudioVolumeUp  ||
+            msg.type_ == InputEventType::AudioVolumeDown ||
+            msg.type_ == InputEventType::AudioMute) {
+            auto& audio = AudioService::getInstance();
+            if (msg.type_ == InputEventType::AudioMute)
+                audio.toggleMute();
+            else {
+                int delta = (msg.type_ == InputEventType::AudioVolumeUp)
+                            ? msg.value_a_ : -msg.value_a_;
+                audio.adjustVolume(delta);
+            }
+            return;   // next event
+        }
+
+        // --- Screenshot / screen-recording shortcuts ---
+        if (msg.type_ == InputEventType::ScreenshotCapture ||
+            msg.type_ == InputEventType::ScreenshotCaptureRegion) {
+            auto& ss = ScreenshotService::getInstance();
+            if (msg.type_ == InputEventType::ScreenshotCapture)
+                ss.captureFullScreen(static_cast<uint32_t>(msg.value_a_));
+            else
+                ss.triggerRegionSelector();
+            return;   // next event
+        }
+
+        // --- Workspace switching ---
+        if (msg.type_ == InputEventType::WorkspaceSwitch) {
+            if (msg.value_a_ == -1) {
+                // Super+Left/Right: snap focused window if one is active,
+                // otherwise slide the workspace.
+                if (focused_surface != 999u) {
+                    window_stack.snapWindow(focused_surface, msg.value_b_);
+                } else {
+                    window_stack.slideWorkspace(msg.value_b_);
+                    BroadcastWorkspaceChanged(
+                        static_cast<uint32_t>(window_stack.getActiveWorkspace()));
+                }
+            } else if (msg.value_a_ == -2) {
+                window_stack.cycleLayoutMode();
+            } else if (msg.value_a_ == -3) {
+                // Super+[ / Super+]: shrink/grow the tiling master column.
+                window_stack.adjustMasterRatio(msg.value_b_ > 0 ? 0.05f : -0.05f);
+            } else if (msg.value_a_ == -4) {
+                // Super+Shift+H/J/K/L: move focus to the nearest window
+                // in that direction (no reorder — tiles stay put).
+                using D = fbx::xserver::layout::Dir;
+                D d = msg.value_b_ == 0 ? D::Left : msg.value_b_ == 1 ? D::Right
+                    : msg.value_b_ == 2 ? D::Up   : D::Down;
+                uint32_t nf = window_stack.focusDirection(focused_surface, d);
+                if (nf != focused_surface) focused_surface = nf;
+            } else if (msg.value_a_ == -5) {
+                // Super+M: promote the focused window to master.
+                window_stack.swapWithMaster(focused_surface);
+            } else {
+                window_stack.setWorkspace(static_cast<size_t>(msg.value_a_));
+            }
+            if (msg.value_a_ >= 0) {
+                BroadcastWorkspaceChanged(
+                    static_cast<uint32_t>(window_stack.getActiveWorkspace()));
+            }
+        }
+
+        // --- Move focused window to adjacent output: Super+Shift+Left/Right ---
+        if (msg.type_ == InputEventType::MoveWindowToOutput
+                && focused_surface != 999u) {
+            const auto& layout = window_stack.outputLayout();
+            uint32_t cur_oi = window_stack.getWindowOutput(focused_surface);
+            uint32_t new_oi = cur_oi;
+            if (msg.value_b_ == -1 && cur_oi > 0)
+                new_oi = cur_oi - 1;
+            else if (msg.value_b_ == 1 && cur_oi + 1 < layout.size())
+                new_oi = cur_oi + 1;
+
+            if (new_oi != cur_oi) {
+                window_stack.moveWindowToOutput(focused_surface, new_oi);
+                // Notify the moved app about its new display environment
+                if (g_surface_clients.contains(focused_surface)) {
+                    shared::XBusMessage disp_msg{};
+                    std::strncpy(disp_msg.service_name_, "com.freebsdx.Display",
+                                 sizeof(disp_msg.service_name_) - 1);
+                    disp_msg.opcode_ = static_cast<uint32_t>(
+                        shared::DisplayOpcode::OutputChanged);
+                    shared::DisplayWindowInfo wi{};
+                    wi.output_idx_    = new_oi;
+                    wi.output_width_  = static_cast<uint32_t>(layout[new_oi].width_);
+                    wi.output_height_ = static_cast<uint32_t>(layout[new_oi].height_);
+                    wi.x_offset_      = layout[new_oi].x_offset_;
+                    std::memcpy(disp_msg.payload_, &wi, sizeof(wi));
+                    (void)g_surface_clients[focused_surface]->sendMessage(
+                        {reinterpret_cast<const uint8_t*>(&disp_msg),
+                         sizeof(disp_msg)});
+                }
+                std::cout << "[wm] Window " << focused_surface
+                          << " moved to output " << new_oi
+                          << " via Super+Shift+"
+                          << (msg.value_b_ < 0 ? "Left" : "Right") << "\n";
+            }
+        }
+
+        // --- Alt+Tab: cycle window focus ---
+        if (msg.type_ == InputEventType::CycleFocus) {
+            const auto& wins = window_stack.getWindows();
+            std::vector<uint32_t> switchable;
+            for (const auto& w : wins) {
+                if (!w.is_shell_ && w.layer_ < 0 && !w.is_subsurface_)
+                    switchable.push_back(w.surface_id_);
+            }
+            if (!switchable.empty()) {
+                int cur = -1;
+                for (int i = 0; i < (int)switchable.size(); ++i)
+                    if (switchable[i] == focused_surface) { cur = i; break; }
+                int dir = msg.value_b_;
+                int next = (cur < 0)
+                    ? (dir > 0 ? 0 : (int)switchable.size() - 1)
+                    : (int)(((cur + dir) % (int)switchable.size()
+                             + (int)switchable.size()) % (int)switchable.size());
+                focused_surface = switchable[next];
+                window_stack.raiseToFocus(focused_surface);
+
+                // Build and broadcast switcher payload
+                shared::SwitcherPayload sp{};
+                sp.focused_id_ = focused_surface;
+                sp.count_ = static_cast<uint32_t>(
+                    std::min(switchable.size(), size_t{7}));
+                for (uint32_t i = 0; i < sp.count_; ++i) {
+                    sp.entries_[i].surface_id_ = switchable[i];
+                    // Find title from window list
+                    auto wit = std::find_if(wins.begin(), wins.end(),
+                        [sid = switchable[i]](const Window& w){
+                            return w.surface_id_ == sid; });
+                    if (wit != wins.end()) {
+                        std::strncpy(sp.entries_[i].title_,
+                            wit->title_.empty()
+                                ? ("App " + std::to_string(switchable[i])).c_str()
+                                : wit->title_.c_str(),
+                            sizeof(sp.entries_[i].title_) - 1);
+                    }
+                }
+                BroadcastSwitcherUpdate(sp);
+            }
+        }
+
+        // --- Alt release: dismiss switcher ---
+        if (msg.type_ == InputEventType::SwitcherDismiss) {
+            BroadcastSwitcherDismiss();
+        }
+
+        // --- Snap: maximize / half / quarter / restore ---
+        if (msg.type_ == InputEventType::SnapWindow && focused_surface != 999u) {
+            switch (msg.value_a_) {
+            case 0: window_stack.maximizeWindow(focused_surface);          break;
+            case 1: window_stack.snapWindow(focused_surface, -1);          break; // left half
+            case 2: window_stack.restoreWindow(focused_surface);           break;
+            case 3: window_stack.snapWindow(focused_surface, +1);          break; // right half
+            case 4: window_stack.snapWindowQuarter(focused_surface,-1,-1); break; // top-left
+            case 5: window_stack.snapWindowQuarter(focused_surface,+1,-1); break; // top-right
+            case 6: window_stack.snapWindowQuarter(focused_surface,-1,+1); break; // bottom-left
+            case 7: window_stack.snapWindowQuarter(focused_surface,+1,+1); break; // bottom-right
+            default: break;
+            }
+        }
+
+        // --- Dashboard / Search: forward to shell ---
+        if (msg.type_ == InputEventType::DashboardToggle ||
+            msg.type_ == InputEventType::SearchToggle) {
+            if (g_surface_clients.contains(999u)) {
+                (void)g_surface_clients[999u]->sendMessage(
+                    {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
+            }
+        }
+
+        // --- Super+F3: toggle compositor GPU debug overlay ---
+        if (msg.type_ == InputEventType::DebugOverlayToggle) {
+            comp->toggleDebugOverlay();
+            std::cout << "[xserver] Debug overlay: "
+                      << (comp->isDebugOverlayVisible() ? "ON" : "OFF") << "\n";
+            DevOverlayService::notifyChanged();
+        }
+
+        // --- XF86 playback media keys → MediaPlayerService broadcast ---
+        if (msg.type_ == InputEventType::MediaPlay ||
+            msg.type_ == InputEventType::MediaStop ||
+            msg.type_ == InputEventType::MediaNext ||
+            msg.type_ == InputEventType::MediaPrev) {
+            uint32_t key = (msg.type_ == InputEventType::MediaPlay) ? 0u :
+                           (msg.type_ == InputEventType::MediaStop) ? 1u :
+                           (msg.type_ == InputEventType::MediaNext) ? 2u : 3u;
+            MediaPlayerService::broadcastMediaKey(key);
+        }
+
+        // --- Super+Enter: launch terminal ---
+        if (shortcuts::enabled(shortcuts::kTerminal)
+            && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
+            && msg.value_b_ != 0 && msg.value_a_ == 28
+            && access("./out/terminal", X_OK) == 0) {
+            // posix_spawn, not fork+setenv: the compositor is
+            // multithreaded, and the child may only run
+            // async-signal-safe code before exec.
+            std::vector<std::string> env;
+            for (char** e = environ; e && *e; ++e) {
+                std::string_view kv(*e);
+                if (kv.starts_with("LD_LIBRARY_PATH=") || kv.starts_with("XBUS_SOCKET=")) continue;
+                env.emplace_back(kv);
+            }
+            env.push_back("LD_LIBRARY_PATH=./out");
+            env.push_back(std::string("XBUS_SOCKET=") + kSocketPath);
+            std::vector<char*> envp;
+            for (auto& kv : env) envp.push_back(kv.data());
+            envp.push_back(nullptr);
+            char arg0[] = "terminal";
+            char* argv[] = {arg0, nullptr};
+            pid_t pid = -1;
+            if (posix_spawn(&pid, "./out/terminal", nullptr, nullptr, argv, envp.data()) != 0)
+                std::cerr << "[xserver] Super+Enter: can't start the terminal\n";
+        }
+
+        // --- Super+Q: close the focused app window (reliable keyboard
+        // fallback for the small title-bar close button). Never closes
+        // the shell (999). Mirrors the title-bar close path. ---
+        if (shortcuts::enabled(shortcuts::kClose)
+            && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
+            && msg.value_b_ != 0 && msg.value_a_ == 16 /* KEY_Q */) {
+            uint32_t fid = focused_surface;
+            if (fid != 0 && fid != 999 && g_surface_clients.contains(fid)) {
+                RenderMessage close_msg{};
+                close_msg.surface_id_ = fid;
+                close_msg.status_ = RenderMessageStatus::SurfaceClosed;
+                (void)g_surface_clients[fid]->sendMessage(
+                    {reinterpret_cast<const uint8_t*>(&close_msg), sizeof(close_msg)});
+                window_stack.removeWindow(fid);
+                focused_surface = 999;
+                RebuildAndBroadcastWindowList(&window_stack);
+                g_scene_dirty = true;
+            }
+        }
+
+        // --- Super+L: lock the screen (spawns the lock screen via
+        // LockService, same path as the Quick Settings Lock button). ---
+        if (shortcuts::enabled(shortcuts::kLock) && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
+            && msg.value_b_ != 0 && msg.value_a_ == 38 /* KEY_L */) {
+            LockService::lock();
+        }
+
+        // --- Forward keyboard, mouse, touch, stylus, and pinch to apps ---
+        // Suppress mouse move/button while a DnD drag is active.
+        const bool dnd_active = GetDnDState().active;
+
+        // Track the implicit pointer grab: a held button keeps motion
+        // on the surface that received the press.
+        if (msg.type_ == InputEventType::MouseButton)
+            g_pointer_button_down = (msg.value_b_ != 0);
+
+        if (!dnd_active && msg.type_ == InputEventType::MouseMove) {
+            // Pointer focus: motion follows the surface under the cursor,
+            // unless a button is held (implicit grab → keep it on the
+            // focused surface). Falls back to the shell (999) over the
+            // desktop. Coordinates are rewritten to surface-local
+            // absolute so any surface can hit-test correctly regardless
+            // of when it started receiving motion.
+            uint32_t target = g_pointer_button_down
+                ? focused_surface
+                : pointerTarget({cursor_x, cursor_y}).value_or(999u);
+            if (g_surface_clients.contains(target)) {
+                shared::InputMessage local = msg;
+                auto o = window_stack.windowOrigin(target);
+                local.value_a_ = static_cast<int32_t>(cursor_x - o.x_);
+                local.value_b_ = static_cast<int32_t>(cursor_y - o.y_);
+                (void)g_surface_clients[target]->sendMessage(
+                    {reinterpret_cast<const uint8_t*>(&local), sizeof(local)});
+            }
+        } else if (msg.type_ == InputEventType::MouseWheel) {
+            // Scroll targets the surface under the pointer, not the
+            // keyboard-focused one (scroll never updates focus, so there
+            // is nothing to correct it otherwise).
+            uint32_t target =
+                pointerTarget({cursor_x, cursor_y}).value_or(999u);
+            if (g_surface_clients.contains(target)) {
+                (void)g_surface_clients[target]->sendMessage(
+                    {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
+            }
+        } else if (msg.type_ == InputEventType::KeyPress          ||
+            msg.type_ == InputEventType::TouchDown         ||
+            msg.type_ == InputEventType::TouchMove         ||
+            msg.type_ == InputEventType::TouchUp           ||
+            msg.type_ == InputEventType::StylusDown        ||
+            msg.type_ == InputEventType::StylusMove        ||
+            msg.type_ == InputEventType::StylusUp          ||
+            msg.type_ == InputEventType::StylusProximity   ||
+            msg.type_ == InputEventType::GesturePinchBegin ||
+            msg.type_ == InputEventType::GesturePinchUpdate||
+            msg.type_ == InputEventType::GesturePinchEnd   ||
+            (!dnd_active && msg.type_ == InputEventType::MouseButton)) {
+            if (g_surface_clients.contains(focused_surface)) {
+                auto& focused_client = g_surface_clients[focused_surface];
+                // IME intercepts KeyPress events — if consumed, do not forward.
+                if (msg.type_ == InputEventType::KeyPress &&
+                    ImeService::FilterKeyPress(focused_client, msg)) {
+                    // consumed by IME
+                } else {
+                    shared::InputMessage out = msg;
+                    // Touch/stylus carry screen-absolute coordinates; rewrite
+                    // them to surface-local (as MouseMove already is) so the
+                    // client hit-tests correctly for off-origin windows.
+                    switch (msg.type_) {
+                        case InputEventType::TouchDown:
+                        case InputEventType::TouchMove:
+                        case InputEventType::TouchUp:
+                        case InputEventType::StylusDown:
+                        case InputEventType::StylusMove:
+                        case InputEventType::StylusUp:
+                        case InputEventType::StylusProximity: {
+                            auto o = window_stack.windowOrigin(focused_surface);
+                            out.value_a_ = msg.value_a_ - static_cast<int32_t>(o.x_);
+                            out.value_b_ = msg.value_b_ - static_cast<int32_t>(o.y_);
+                            break;
+                        }
+                        default: break;
+                    }
+                    (void)focused_client->sendMessage(
+                        {reinterpret_cast<const uint8_t*>(&out), sizeof(out)});
+                }
+            }
+        }
+    };
+
     if (input) {
         (void)loop->addFd(input->getFd(), [&]() {
             auto msgs_res = input->dispatch();
@@ -1429,536 +1982,7 @@ int main(int argc, char** argv) {
                 if (!msgs_res.value().empty())
                     g_scene_dirty = true;  // input may move the cursor / focus ring
                 for (auto& msg : msgs_res.value()) {
-                    // --- Reset idle timers on any user input ---
-                    LockService::resetIdleTimer();
-                    ScreenSaverService::resetIdleTimer();
-
-                    // Always track the hardware cursor on pointer motion, even
-                    // when input is redirected to the greeter or lock screen —
-                    // otherwise the cursor freezes on those screens (it's a DRM
-                    // plane the compositor owns, not the client's to move).
-                    if (msg.type_ == InputEventType::MouseMove &&
-                        (LoginService::isGreeterActive() || LockService::isLocked())) {
-                        cursor_x = std::clamp(cursor_x + static_cast<float>(msg.value_a_),
-                                              0.0f, static_cast<float>(screen_w));
-                        cursor_y = std::clamp(cursor_y + static_cast<float>(msg.value_b_),
-                                              0.0f, static_cast<float>(screen_h));
-                        g_pointer_modifiers = msg.modifiers_;
-                        process_pointer_motion();
-                    }
-
-                    // ── While login greeter is active, redirect all input to it ────────────
-                    if (LoginService::isGreeterActive()) {
-                        auto greeter = LoginService::greeterClient();
-                        if (greeter) {
-                            // The greeter is a fullscreen surface at the origin,
-                            // and its client treats incoming mouse coordinates as
-                            // absolute (surface-local). libinput motion is a
-                            // *relative* delta, though, so forward the tracked
-                            // absolute cursor position instead — otherwise the
-                            // greeter's cursor stays pinned near (0,0) and clicks
-                            // can't land on fields (e.g. the password box).
-                            shared::InputMessage gm = msg;
-                            if (gm.type_ == InputEventType::MouseMove) {
-                                gm.value_a_ = static_cast<int32_t>(cursor_x);
-                                gm.value_b_ = static_cast<int32_t>(cursor_y);
-                            }
-                            (void)greeter->sendMessage(
-                                {reinterpret_cast<const uint8_t*>(&gm), sizeof(gm)});
-                            continue;
-                        }
-                    }
-
-                    // --- While locked, redirect all input to the lock screen ---
-                    if (LockService::isLocked()) {
-                        auto ls_client = LockService::lockscreenClient();
-                        if (ls_client) {
-                            // Allow media keys through even while locked
-                            bool is_media_key =
-                                msg.type_ == InputEventType::AudioVolumeUp   ||
-                                msg.type_ == InputEventType::AudioVolumeDown ||
-                                msg.type_ == InputEventType::AudioMute       ||
-                                msg.type_ == InputEventType::BrightnessUp    ||
-                                msg.type_ == InputEventType::BrightnessDown;
-                            if (!is_media_key) {
-                                (void)ls_client->sendMessage(
-                                    {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
-                                continue;
-                            }
-                        }
-                    }
-
-                    // --- Mouse Move ---
-                    if (msg.type_ == InputEventType::MouseMove) {
-                        cursor_x += static_cast<float>(msg.value_a_);
-                        cursor_y += static_cast<float>(msg.value_b_);
-                        cursor_x = std::clamp(cursor_x, 0.0f, static_cast<float>(screen_w));
-                        cursor_y = std::clamp(cursor_y, 0.0f, static_cast<float>(screen_h));
-                        window_stack.updateDrag({cursor_x, cursor_y});
-
-                        // Active-resize drive + hover-cursor arbitration + hardware
-                        // cursor move (shared with the injected-input path).
-                        g_pointer_modifiers = msg.modifiers_;
-                        process_pointer_motion();
-                    }
-
-                    // --- Mouse Button ---
-                    if (msg.type_ == InputEventType::MouseButton) {
-                        fbx::xkit::Offset mpos{cursor_x, cursor_y};
-                        if (msg.value_b_ == 1) { // press
-                            // Window-management chrome — resize edges, title bar and
-                            // its close/min/max buttons — responds to the LEFT button
-                            // only. Other buttons fall through to focus and are still
-                            // forwarded to the client (context menu, middle-click paste).
-                            const bool is_left = (msg.value_a_ == 272 /* BTN_LEFT */);
-                            // Check for resize zone first (takes priority over drag/focus)
-                            auto resize_hit = window_stack.resizeHitTest(mpos);
-                            if (is_left && resize_hit) {
-                                auto [rsid, redges] = *resize_hit;
-                                focused_surface = rsid;
-                                window_stack.raiseToFocus(rsid);
-                                window_stack.startResize(rsid, mpos, redges);
-                            } else {
-                            auto title_hit = window_stack.hitTest(mpos);
-                            if (is_left && title_hit) {
-                                uint32_t win_id = *title_hit;
-                                focused_surface = win_id;
-                                window_stack.raiseToFocus(win_id);
-
-                                // Identify which zone within the title bar was clicked
-                                const auto& wins = window_stack.getWindows();
-                                auto wit = std::find_if(wins.begin(), wins.end(),
-                                    [win_id](const Window& w){ return w.surface_id_ == win_id; });
-                                if (wit != wins.end()) {
-                                    float wx = wit->position_.x_;
-                                    float wy = wit->position_.y_;
-                                    // Accept a click anywhere in the title-bar band
-                                    // (not just the 12px dot) so the close/min/max
-                                    // buttons are easy to hit with the mouse.
-                                    float btn_top = wy - kTitleBarHeight;
-                                    float btn_bot = wy;
-
-                                    if (cursor_y >= btn_top && cursor_y <= btn_bot) {
-                                        // Within the button row — check which button
-                                        if (cursor_x >= wx + kCloseX && cursor_x <= wx + kCloseX + kButtonSize) {
-                                            // Close button — notify client then remove
-                                            if (g_surface_clients.contains(win_id)) {
-                                                RenderMessage close_msg{
-                                                    .surface_id_ = win_id,
-                                                    .status_ = RenderMessageStatus::SurfaceClosed
-                                                };
-                                                (void)g_surface_clients[win_id]->sendMessage(
-                                                    {reinterpret_cast<const uint8_t*>(&close_msg), sizeof(close_msg)});
-                                            }
-                                            window_stack.removeWindow(win_id);
-                                            focused_surface = 999; // fall back to shell
-                                        } else if (cursor_x >= wx + kMinimizeX && cursor_x <= wx + kMinimizeX + kButtonSize) {
-                                            window_stack.minimizeWindow(win_id);
-                                            focused_surface = 999;
-                                        } else if (cursor_x >= wx + kMaximizeX && cursor_x <= wx + kMaximizeX + kButtonSize) {
-                                            window_stack.maximizeWindow(win_id);
-                                        } else {
-                                            window_stack.startDrag(win_id, mpos);
-                                        }
-                                    } else {
-                                        // Click in title bar but outside button row — drag
-                                        window_stack.startDrag(win_id, mpos);
-                                    }
-                                }
-                            } else {
-                                // Click in window body — focus without drag
-                                auto body_hit = window_stack.bodyHitTest(mpos);
-                                if (body_hit) {
-                                    focused_surface = *body_hit;
-                                    window_stack.raiseToFocus(*body_hit);
-                                }
-                            }
-                            } // end else (not resize_hit)
-                        } else if (msg.value_a_ == 272 /* BTN_LEFT */) { // left release
-                            // End resize/drag and deliver a drop only on the left
-                            // release — the button these interactions start on — so a
-                            // stray right/middle click mid-drag doesn't cancel or drop.
-                            window_stack.endResize();
-                            window_stack.endDrag();
-
-                            // ── DnD: deliver drop ──────────────────────────────────────
-                            auto& dnd = GetDnDState();
-                            if (dnd.active) {
-                                if (dnd.current_target != UINT32_MAX &&
-                                    g_surface_clients.contains(dnd.current_target)) {
-                                    const auto& wins = window_stack.getWindows();
-                                    auto wit = std::find_if(wins.begin(), wins.end(),
-                                        [&dnd](const Window& w){
-                                            return w.surface_id_ == dnd.current_target; });
-                                    float rx = cursor_x - (wit != wins.end() ? wit->position_.x_ : 0);
-                                    float ry = cursor_y - (wit != wins.end() ? wit->position_.y_ : 0);
-                                    DnDSendToClient(g_surface_clients[dnd.current_target],
-                                        shared::DnDOpcode::Drop,
-                                        rx, ry, dnd.mime_type, dnd.data);
-                                    std::cout << "[DnD] Drop on surface " << dnd.current_target
-                                              << " data=" << dnd.data << "\n";
-                                }
-                                // Notify source that drag has ended
-                                DnDSendToClient(dnd.source_client,
-                                    shared::DnDOpcode::DragEnd,
-                                    0.0f, 0.0f, dnd.mime_type);
-                                ClearDnDState();
-                            }
-                        }
-                    }
-
-                    // --- TouchDown: focus the surface under the finger (slot 0 only) ---
-                    if (msg.type_ == InputEventType::TouchDown && msg.modifiers_ == 0) {
-                        fbx::xkit::Offset tpos{
-                            static_cast<float>(msg.value_a_),
-                            static_cast<float>(msg.value_b_)
-                        };
-                        auto title_hit = window_stack.hitTest(tpos);
-                        if (title_hit) {
-                            focused_surface = *title_hit;
-                            window_stack.raiseToFocus(*title_hit);
-                        } else {
-                            auto body_hit = window_stack.bodyHitTest(tpos);
-                            if (body_hit) {
-                                focused_surface = *body_hit;
-                                window_stack.raiseToFocus(*body_hit);
-                            }
-                        }
-                    }
-
-                    // --- Hardware brightness keys ---
-                    if (msg.type_ == InputEventType::BrightnessUp ||
-                        msg.type_ == InputEventType::BrightnessDown) {
-                        int delta = (msg.type_ == InputEventType::BrightnessUp)
-                                    ? msg.value_a_ : -msg.value_a_;
-                        BacklightService::step(delta);
-                        continue;
-                    }
-
-                    // --- Audio media keys ---
-                    if (msg.type_ == InputEventType::AudioVolumeUp  ||
-                        msg.type_ == InputEventType::AudioVolumeDown ||
-                        msg.type_ == InputEventType::AudioMute) {
-                        auto& audio = AudioService::getInstance();
-                        if (msg.type_ == InputEventType::AudioMute)
-                            audio.toggleMute();
-                        else {
-                            int delta = (msg.type_ == InputEventType::AudioVolumeUp)
-                                        ? msg.value_a_ : -msg.value_a_;
-                            audio.adjustVolume(delta);
-                        }
-                        continue;
-                    }
-
-                    // --- Screenshot / screen-recording shortcuts ---
-                    if (msg.type_ == InputEventType::ScreenshotCapture ||
-                        msg.type_ == InputEventType::ScreenshotCaptureRegion) {
-                        auto& ss = ScreenshotService::getInstance();
-                        if (msg.type_ == InputEventType::ScreenshotCapture)
-                            ss.captureFullScreen(static_cast<uint32_t>(msg.value_a_));
-                        else
-                            ss.triggerRegionSelector();
-                        continue;
-                    }
-
-                    // --- Workspace switching ---
-                    if (msg.type_ == InputEventType::WorkspaceSwitch) {
-                        if (msg.value_a_ == -1) {
-                            // Super+Left/Right: snap focused window if one is active,
-                            // otherwise slide the workspace.
-                            if (focused_surface != 999u) {
-                                window_stack.snapWindow(focused_surface, msg.value_b_);
-                            } else {
-                                window_stack.slideWorkspace(msg.value_b_);
-                                BroadcastWorkspaceChanged(
-                                    static_cast<uint32_t>(window_stack.getActiveWorkspace()));
-                            }
-                        } else if (msg.value_a_ == -2) {
-                            window_stack.cycleLayoutMode();
-                        } else if (msg.value_a_ == -3) {
-                            // Super+[ / Super+]: shrink/grow the tiling master column.
-                            window_stack.adjustMasterRatio(msg.value_b_ > 0 ? 0.05f : -0.05f);
-                        } else if (msg.value_a_ == -4) {
-                            // Super+Shift+H/J/K/L: move focus to the nearest window
-                            // in that direction (no reorder — tiles stay put).
-                            using D = fbx::xserver::layout::Dir;
-                            D d = msg.value_b_ == 0 ? D::Left : msg.value_b_ == 1 ? D::Right
-                                : msg.value_b_ == 2 ? D::Up   : D::Down;
-                            uint32_t nf = window_stack.focusDirection(focused_surface, d);
-                            if (nf != focused_surface) focused_surface = nf;
-                        } else if (msg.value_a_ == -5) {
-                            // Super+M: promote the focused window to master.
-                            window_stack.swapWithMaster(focused_surface);
-                        } else {
-                            window_stack.setWorkspace(static_cast<size_t>(msg.value_a_));
-                        }
-                        if (msg.value_a_ >= 0) {
-                            BroadcastWorkspaceChanged(
-                                static_cast<uint32_t>(window_stack.getActiveWorkspace()));
-                        }
-                    }
-
-                    // --- Move focused window to adjacent output: Super+Shift+Left/Right ---
-                    if (msg.type_ == InputEventType::MoveWindowToOutput
-                            && focused_surface != 999u) {
-                        const auto& layout = window_stack.outputLayout();
-                        uint32_t cur_oi = window_stack.getWindowOutput(focused_surface);
-                        uint32_t new_oi = cur_oi;
-                        if (msg.value_b_ == -1 && cur_oi > 0)
-                            new_oi = cur_oi - 1;
-                        else if (msg.value_b_ == 1 && cur_oi + 1 < layout.size())
-                            new_oi = cur_oi + 1;
-
-                        if (new_oi != cur_oi) {
-                            window_stack.moveWindowToOutput(focused_surface, new_oi);
-                            // Notify the moved app about its new display environment
-                            if (g_surface_clients.contains(focused_surface)) {
-                                shared::XBusMessage disp_msg{};
-                                std::strncpy(disp_msg.service_name_, "com.freebsdx.Display",
-                                             sizeof(disp_msg.service_name_) - 1);
-                                disp_msg.opcode_ = static_cast<uint32_t>(
-                                    shared::DisplayOpcode::OutputChanged);
-                                shared::DisplayWindowInfo wi{};
-                                wi.output_idx_    = new_oi;
-                                wi.output_width_  = static_cast<uint32_t>(layout[new_oi].width_);
-                                wi.output_height_ = static_cast<uint32_t>(layout[new_oi].height_);
-                                wi.x_offset_      = layout[new_oi].x_offset_;
-                                std::memcpy(disp_msg.payload_, &wi, sizeof(wi));
-                                (void)g_surface_clients[focused_surface]->sendMessage(
-                                    {reinterpret_cast<const uint8_t*>(&disp_msg),
-                                     sizeof(disp_msg)});
-                            }
-                            std::cout << "[wm] Window " << focused_surface
-                                      << " moved to output " << new_oi
-                                      << " via Super+Shift+"
-                                      << (msg.value_b_ < 0 ? "Left" : "Right") << "\n";
-                        }
-                    }
-
-                    // --- Alt+Tab: cycle window focus ---
-                    if (msg.type_ == InputEventType::CycleFocus) {
-                        const auto& wins = window_stack.getWindows();
-                        std::vector<uint32_t> switchable;
-                        for (const auto& w : wins) {
-                            if (!w.is_shell_ && w.layer_ < 0 && !w.is_subsurface_)
-                                switchable.push_back(w.surface_id_);
-                        }
-                        if (!switchable.empty()) {
-                            int cur = -1;
-                            for (int i = 0; i < (int)switchable.size(); ++i)
-                                if (switchable[i] == focused_surface) { cur = i; break; }
-                            int dir = msg.value_b_;
-                            int next = (cur < 0)
-                                ? (dir > 0 ? 0 : (int)switchable.size() - 1)
-                                : (int)(((cur + dir) % (int)switchable.size()
-                                         + (int)switchable.size()) % (int)switchable.size());
-                            focused_surface = switchable[next];
-                            window_stack.raiseToFocus(focused_surface);
-
-                            // Build and broadcast switcher payload
-                            shared::SwitcherPayload sp{};
-                            sp.focused_id_ = focused_surface;
-                            sp.count_ = static_cast<uint32_t>(
-                                std::min(switchable.size(), size_t{7}));
-                            for (uint32_t i = 0; i < sp.count_; ++i) {
-                                sp.entries_[i].surface_id_ = switchable[i];
-                                // Find title from window list
-                                auto wit = std::find_if(wins.begin(), wins.end(),
-                                    [sid = switchable[i]](const Window& w){
-                                        return w.surface_id_ == sid; });
-                                if (wit != wins.end()) {
-                                    std::strncpy(sp.entries_[i].title_,
-                                        wit->title_.empty()
-                                            ? ("App " + std::to_string(switchable[i])).c_str()
-                                            : wit->title_.c_str(),
-                                        sizeof(sp.entries_[i].title_) - 1);
-                                }
-                            }
-                            BroadcastSwitcherUpdate(sp);
-                        }
-                    }
-
-                    // --- Alt release: dismiss switcher ---
-                    if (msg.type_ == InputEventType::SwitcherDismiss) {
-                        BroadcastSwitcherDismiss();
-                    }
-
-                    // --- Snap: maximize / half / quarter / restore ---
-                    if (msg.type_ == InputEventType::SnapWindow && focused_surface != 999u) {
-                        switch (msg.value_a_) {
-                        case 0: window_stack.maximizeWindow(focused_surface);          break;
-                        case 1: window_stack.snapWindow(focused_surface, -1);          break; // left half
-                        case 2: window_stack.restoreWindow(focused_surface);           break;
-                        case 3: window_stack.snapWindow(focused_surface, +1);          break; // right half
-                        case 4: window_stack.snapWindowQuarter(focused_surface,-1,-1); break; // top-left
-                        case 5: window_stack.snapWindowQuarter(focused_surface,+1,-1); break; // top-right
-                        case 6: window_stack.snapWindowQuarter(focused_surface,-1,+1); break; // bottom-left
-                        case 7: window_stack.snapWindowQuarter(focused_surface,+1,+1); break; // bottom-right
-                        default: break;
-                        }
-                    }
-
-                    // --- Dashboard / Search: forward to shell ---
-                    if (msg.type_ == InputEventType::DashboardToggle ||
-                        msg.type_ == InputEventType::SearchToggle) {
-                        if (g_surface_clients.contains(999u)) {
-                            (void)g_surface_clients[999u]->sendMessage(
-                                {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
-                        }
-                    }
-
-                    // --- Super+F3: toggle compositor GPU debug overlay ---
-                    if (msg.type_ == InputEventType::DebugOverlayToggle) {
-                        comp->toggleDebugOverlay();
-                        std::cout << "[xserver] Debug overlay: "
-                                  << (comp->isDebugOverlayVisible() ? "ON" : "OFF") << "\n";
-                        DevOverlayService::notifyChanged();
-                    }
-
-                    // --- XF86 playback media keys → MediaPlayerService broadcast ---
-                    if (msg.type_ == InputEventType::MediaPlay ||
-                        msg.type_ == InputEventType::MediaStop ||
-                        msg.type_ == InputEventType::MediaNext ||
-                        msg.type_ == InputEventType::MediaPrev) {
-                        uint32_t key = (msg.type_ == InputEventType::MediaPlay) ? 0u :
-                                       (msg.type_ == InputEventType::MediaStop) ? 1u :
-                                       (msg.type_ == InputEventType::MediaNext) ? 2u : 3u;
-                        MediaPlayerService::broadcastMediaKey(key);
-                    }
-
-                    // --- Super+Enter: launch terminal ---
-                    if (shortcuts::enabled(shortcuts::kTerminal)
-                        && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
-                        && msg.value_b_ != 0 && msg.value_a_ == 28
-                        && access("./out/terminal", X_OK) == 0) {
-                        // posix_spawn, not fork+setenv: the compositor is
-                        // multithreaded, and the child may only run
-                        // async-signal-safe code before exec.
-                        std::vector<std::string> env;
-                        for (char** e = environ; e && *e; ++e) {
-                            std::string_view kv(*e);
-                            if (kv.starts_with("LD_LIBRARY_PATH=") || kv.starts_with("XBUS_SOCKET=")) continue;
-                            env.emplace_back(kv);
-                        }
-                        env.push_back("LD_LIBRARY_PATH=./out");
-                        env.push_back(std::string("XBUS_SOCKET=") + kSocketPath);
-                        std::vector<char*> envp;
-                        for (auto& kv : env) envp.push_back(kv.data());
-                        envp.push_back(nullptr);
-                        char arg0[] = "terminal";
-                        char* argv[] = {arg0, nullptr};
-                        pid_t pid = -1;
-                        if (posix_spawn(&pid, "./out/terminal", nullptr, nullptr, argv, envp.data()) != 0)
-                            std::cerr << "[xserver] Super+Enter: can't start the terminal\n";
-                    }
-
-                    // --- Super+Q: close the focused app window (reliable keyboard
-                    // fallback for the small title-bar close button). Never closes
-                    // the shell (999). Mirrors the title-bar close path. ---
-                    if (shortcuts::enabled(shortcuts::kClose)
-                        && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
-                        && msg.value_b_ != 0 && msg.value_a_ == 16 /* KEY_Q */) {
-                        uint32_t fid = focused_surface;
-                        if (fid != 0 && fid != 999 && g_surface_clients.contains(fid)) {
-                            RenderMessage close_msg{};
-                            close_msg.surface_id_ = fid;
-                            close_msg.status_ = RenderMessageStatus::SurfaceClosed;
-                            (void)g_surface_clients[fid]->sendMessage(
-                                {reinterpret_cast<const uint8_t*>(&close_msg), sizeof(close_msg)});
-                            window_stack.removeWindow(fid);
-                            focused_surface = 999;
-                            RebuildAndBroadcastWindowList(&window_stack);
-                            g_scene_dirty = true;
-                        }
-                    }
-
-                    // --- Super+L: lock the screen (spawns the lock screen via
-                    // LockService, same path as the Quick Settings Lock button). ---
-                    if (shortcuts::enabled(shortcuts::kLock) && msg.modifiers_ & 8 && msg.type_ == InputEventType::KeyPress
-                        && msg.value_b_ != 0 && msg.value_a_ == 38 /* KEY_L */) {
-                        LockService::lock();
-                    }
-
-                    // --- Forward keyboard, mouse, touch, stylus, and pinch to apps ---
-                    // Suppress mouse move/button while a DnD drag is active.
-                    const bool dnd_active = GetDnDState().active;
-
-                    // Track the implicit pointer grab: a held button keeps motion
-                    // on the surface that received the press.
-                    if (msg.type_ == InputEventType::MouseButton)
-                        g_pointer_button_down = (msg.value_b_ != 0);
-
-                    if (!dnd_active && msg.type_ == InputEventType::MouseMove) {
-                        // Pointer focus: motion follows the surface under the cursor,
-                        // unless a button is held (implicit grab → keep it on the
-                        // focused surface). Falls back to the shell (999) over the
-                        // desktop. Coordinates are rewritten to surface-local
-                        // absolute so any surface can hit-test correctly regardless
-                        // of when it started receiving motion.
-                        uint32_t target = g_pointer_button_down
-                            ? focused_surface
-                            : window_stack.bodyHitTest({cursor_x, cursor_y}).value_or(999u);
-                        if (g_surface_clients.contains(target)) {
-                            shared::InputMessage local = msg;
-                            auto o = window_stack.windowOrigin(target);
-                            local.value_a_ = static_cast<int32_t>(cursor_x - o.x_);
-                            local.value_b_ = static_cast<int32_t>(cursor_y - o.y_);
-                            (void)g_surface_clients[target]->sendMessage(
-                                {reinterpret_cast<const uint8_t*>(&local), sizeof(local)});
-                        }
-                    } else if (msg.type_ == InputEventType::MouseWheel) {
-                        // Scroll targets the surface under the pointer, not the
-                        // keyboard-focused one (scroll never updates focus, so there
-                        // is nothing to correct it otherwise).
-                        uint32_t target =
-                            window_stack.bodyHitTest({cursor_x, cursor_y}).value_or(999u);
-                        if (g_surface_clients.contains(target)) {
-                            (void)g_surface_clients[target]->sendMessage(
-                                {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
-                        }
-                    } else if (msg.type_ == InputEventType::KeyPress          ||
-                        msg.type_ == InputEventType::TouchDown         ||
-                        msg.type_ == InputEventType::TouchMove         ||
-                        msg.type_ == InputEventType::TouchUp           ||
-                        msg.type_ == InputEventType::StylusDown        ||
-                        msg.type_ == InputEventType::StylusMove        ||
-                        msg.type_ == InputEventType::StylusUp          ||
-                        msg.type_ == InputEventType::StylusProximity   ||
-                        msg.type_ == InputEventType::GesturePinchBegin ||
-                        msg.type_ == InputEventType::GesturePinchUpdate||
-                        msg.type_ == InputEventType::GesturePinchEnd   ||
-                        (!dnd_active && msg.type_ == InputEventType::MouseButton)) {
-                        if (g_surface_clients.contains(focused_surface)) {
-                            auto& focused_client = g_surface_clients[focused_surface];
-                            // IME intercepts KeyPress events — if consumed, do not forward.
-                            if (msg.type_ == InputEventType::KeyPress &&
-                                ImeService::FilterKeyPress(focused_client, msg)) {
-                                // consumed by IME
-                            } else {
-                                shared::InputMessage out = msg;
-                                // Touch/stylus carry screen-absolute coordinates; rewrite
-                                // them to surface-local (as MouseMove already is) so the
-                                // client hit-tests correctly for off-origin windows.
-                                switch (msg.type_) {
-                                    case InputEventType::TouchDown:
-                                    case InputEventType::TouchMove:
-                                    case InputEventType::TouchUp:
-                                    case InputEventType::StylusDown:
-                                    case InputEventType::StylusMove:
-                                    case InputEventType::StylusUp:
-                                    case InputEventType::StylusProximity: {
-                                        auto o = window_stack.windowOrigin(focused_surface);
-                                        out.value_a_ = msg.value_a_ - static_cast<int32_t>(o.x_);
-                                        out.value_b_ = msg.value_b_ - static_cast<int32_t>(o.y_);
-                                        break;
-                                    }
-                                    default: break;
-                                }
-                                (void)focused_client->sendMessage(
-                                    {reinterpret_cast<const uint8_t*>(&out), sizeof(out)});
-                            }
-                        }
-                    }
+                    handle_input(msg);
                 }
             }
         });

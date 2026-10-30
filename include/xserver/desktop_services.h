@@ -110,7 +110,10 @@ public:
 class AppTimeLimitService {
 public:
     using Notify = std::function<void(const std::string& title, const std::string& message)>;
-    static void init(Notify notify) noexcept;
+    using CloseApp = std::function<void(const std::string& app_id)>;
+    // notify: the "Time limit reached" notification; close_app: close every
+    // window of an app (the shell's "Time's up" card, CloseApp).
+    static void init(Notify notify, CloseApp close_app) noexcept;
     static void tick(const std::string& app_id, uint32_t seconds) noexcept;
     static void handleMessage(const shared::XBusMessage& msg,
                               std::shared_ptr<IpcSocket> client) noexcept;

@@ -481,9 +481,11 @@ namespace {
 constexpr const char* kLimitsKey   = "applimit.limits";     // id=minutes
 constexpr const char* kUsageKey    = "applimit.usage";      // day|id=secs
 constexpr const char* kNotifiedKey = "applimit.notified";   // day|id;id
+constexpr const char* kExtraKey    = "applimit.extra";      // day|id=minutes granted today
 
 std::mutex g_limit_mu;
 AppTimeLimitService::Notify g_limit_notify;
+AppTimeLimitService::CloseApp g_limit_close;
 std::string g_usage_day;
 std::map<std::string, uint32_t> g_usage;          // today's seconds by app id
 std::chrono::steady_clock::time_point g_usage_saved{};
@@ -510,9 +512,10 @@ const InstalledApp* findApp(const std::vector<InstalledApp>& apps, std::string_v
 
 }  // namespace
 
-void AppTimeLimitService::init(Notify notify) noexcept {
+void AppTimeLimitService::init(Notify notify, CloseApp close_app) noexcept {
     std::lock_guard lk(g_limit_mu);
     g_limit_notify = std::move(notify);
+    g_limit_close  = std::move(close_app);
 }
 
 void AppTimeLimitService::tick(const std::string& app_id, uint32_t seconds) noexcept {
@@ -525,8 +528,11 @@ void AppTimeLimitService::tick(const std::string& app_id, uint32_t seconds) noex
     g_usage[app_id] = after;
 
     auto limits = applimit::parseMap(ConfigService::get(kLimitsKey));
+    auto extra  = applimit::parseUsage(ConfigService::get(kExtraKey), today);
     bool hit = false;
-    if (auto it = limits.find(app_id); it != limits.end() && applimit::crossed(before, after, it->second)) {
+    auto it = limits.find(app_id);
+    uint32_t allowed = it == limits.end() ? 0 : it->second + (extra.count(app_id) ? extra[app_id] : 0);
+    if (it != limits.end() && applimit::crossed(before, after, allowed)) {
         auto told = applimit::parseNotified(ConfigService::get(kNotifiedKey), today);
         if (told.insert(app_id).second) {
             ConfigService::set(kNotifiedKey, applimit::formatNotified(today, told));
@@ -536,6 +542,13 @@ void AppTimeLimitService::tick(const std::string& app_id, uint32_t seconds) noex
             if (g_limit_notify)
                 g_limit_notify("Time limit reached",
                                name + ": today's " + std::to_string(it->second) + "-minute limit is up.");
+            // The shell's "Time's up" card: close the app or allow more time.
+            shared::AppTimeLimitReached r{};
+            std::strncpy(r.app_id_, app_id.c_str(), sizeof(r.app_id_) - 1);
+            std::strncpy(r.app_name_, name.c_str(), sizeof(r.app_name_) - 1);
+            r.limit_minutes_ = it->second;
+            broadcast("com.freebsdx.AppTimeLimit",
+                      static_cast<uint32_t>(shared::AppTimeLimitOpcode::LimitReached), &r);
         }
         hit = true;
     }
@@ -606,6 +619,32 @@ void AppTimeLimitService::handleMessage(const shared::XBusMessage& msg,
         if (!ok) LOG_WARN("AppTimeLimit: can't {} limit for '{}'", set ? "set" : "remove", name_buf);
         ack(msg, client, kName);
         if (ok) broadcast<char>(kName, static_cast<uint32_t>(O::LimitsChanged), nullptr);
+        break;
+    }
+    case O::Extend:
+    case O::CloseApp: {
+        shared::AppTimeLimitAppRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        req.app_id_[sizeof(req.app_id_) - 1] = '\0';
+        const std::string id = req.app_id_;
+        if (static_cast<O>(msg.opcode_) == O::Extend) {
+            if (!id.empty() && req.minutes_ >= 1 && req.minutes_ <= 240) {
+                std::lock_guard lk(g_limit_mu);
+                const std::string today = applimit::dayKey(std::time(nullptr));
+                auto extra = applimit::parseUsage(ConfigService::get(kExtraKey), today);
+                extra[id] += req.minutes_;
+                ConfigService::set(kExtraKey, applimit::formatUsage(today, extra));
+                // Let the card come back when the extra time runs out.
+                auto told = applimit::parseNotified(ConfigService::get(kNotifiedKey), today);
+                if (told.erase(id)) ConfigService::set(kNotifiedKey, applimit::formatNotified(today, told));
+                LOG_INFO("AppTimeLimit: {} more minutes today for {}", req.minutes_, id);
+            }
+        } else {
+            CloseApp close;
+            { std::lock_guard lk(g_limit_mu); close = g_limit_close; }
+            if (!id.empty() && close) close(id);
+        }
+        ack(msg, client, kName);
         break;
     }
     default: break;
