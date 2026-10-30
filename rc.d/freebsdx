@@ -1,0 +1,53 @@
+#!/bin/sh
+#
+# PROVIDE: freebsdx
+# REQUIRE: devd seatd xsessiond zfs
+# KEYWORD: nojail
+#
+# Add the following line to /etc/rc.conf to enable freebsdx:
+# freebsdx_enable="YES"
+#
+# Optional:
+# freebsdx_user="seat_user" (Ensure user is in the 'video' group)
+
+. /etc/rc.subr
+
+name="freebsdx"
+rcvar="freebsdx_enable"
+
+load_rc_config $name
+
+: ${freebsdx_enable:="NO"}
+: ${freebsdx_user:="wheel"}
+# Default device source: the xsessiond OpenDevice broker (requires xsessiond). The
+# compositor grabs the console keyboard itself (KDSKBMODE K_CODE on its VT) so
+# keystrokes don't leak to the shell. Set XSESSIOND_USE_BROKER=0 to fall back to the
+# libseat→seatd path (same in-compositor keyboard grab); the compositor also falls
+# back automatically if xsessiond is down. Do NOT add XSESSIOND_LIBSEAT here — that's
+# the daemon-side phase-2b flag (xsessiond as a libseat client of seatd), unproven.
+: ${freebsdx_env:="WAYLAND_DISPLAY=wayland-0"}
+
+command="/usr/local/bin/xserver"
+pidfile="/var/run/${name}.pid"
+
+# Run as a daemon, create a PID file
+command_args="-c -f -p ${pidfile} /usr/local/bin/xserver"
+
+# Ensure DRM kernel modules are loaded before starting
+start_precmd="freebsdx_prestart"
+
+freebsdx_prestart()
+{
+    # Check if a DRM module is loaded (e.g., i915, amdgpu, radeon)
+    if ! kldstat -q -m drm; then
+        echo "Loading DRM kernel module (drm-kmod)..."
+        # Ideally, this should be handled by kld_list in rc.conf
+        kldload -n i915kms || kldload -n amdgpu || true
+    fi
+
+    if [ ! -c "/dev/dri/card0" ]; then
+        err 1 "/dev/dri/card0 not found. DRM/KMS is not initialized."
+    fi
+}
+
+run_rc_command "$1"

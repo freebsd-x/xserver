@@ -17,3 +17,6 @@ build/
 
 # macOS
 .DS_Store
+
+# rc(8) scripts live in rc.d/ — not dependency files, despite the *.d pattern above.
+!rc.d/

@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# PROVIDE: xsessiond
+# REQUIRE: DAEMON
+# BEFORE: freebsdx
+# KEYWORD: nojail
+#
+# xsessiond — unified seat + session daemon (phase 1: authentication).
+# Runs as root so the unprivileged freebsdx compositor can verify passwords
+# (login greeter + screen unlock) over a socket instead of a setuid helper.
+# See core/xserver/docs/xsessiond-design.md.
+#
+# Enable in /etc/rc.conf:
+#   xsessiond_enable="YES"
+
+. /etc/rc.subr
+
+name="xsessiond"
+rcvar="xsessiond_enable"
+
+load_rc_config $name
+
+: ${xsessiond_enable:="NO"}
+# The compositor binaries allowed to use the daemon (':'-separated absolute
+# paths). Every other client — any process of any user — is refused.
+: ${xsessiond_compositor:="/usr/local/bin/freebsdx"}
+xsessiond_env="XSESSIOND_COMPOSITOR=${xsessiond_compositor}"
+
+pidfile="/var/run/xsessiond.pid"
+procname="/usr/local/bin/xsessiond"
+
+# xsessiond runs in the foreground; daemonize it via daemon(8).
+command="/usr/sbin/daemon"
+command_args="-f -p ${pidfile} -t ${name} ${procname}"
+
+run_rc_command "$1"
