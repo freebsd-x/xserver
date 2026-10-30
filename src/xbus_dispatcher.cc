@@ -1,5 +1,6 @@
 #include "xserver/shell_input_region.h"
 #include "xserver/xbus_dispatcher.h"
+#include "xserver/peer_identity.h"
 #include "xserver/vulkan_compositor.h"
 #include "xserver/display_service.h"
 #include "xserver/drm_device.h"
@@ -166,6 +167,73 @@ struct ShellOnlyService {
     // input or IME state must stay false.
     bool           slow = false;
 };
+
+// ── Who may call what ────────────────────────────────────────────────────────
+// Services only the shell (or the lock screen / greeter, also trusted shell
+// surfaces) uses. Several change the system through the root broker (firewall,
+// DNS, Wi-Fi, audio device), hold secrets (Keychain, SavedWifi, clipboard
+// history), grant permissions (AppSandbox) or act on other processes (Process,
+// VirtualKeyboard). Any app could call them before; now only the shell may.
+// (Short names: "com.freebsdx." + name.)
+static bool shellOnlyName(std::string_view service) noexcept {
+    static constexpr std::string_view kNames[] = {
+        "A11ySettings", "AirplaneMode", "AppSandbox", "AudioOutput", "AutoBrightness", "BatteryDrain",
+        "BatteryHealth", "ClipboardHistory", "ColorFilter", "ColorProfile", "CrashReporter", "CursorSize",
+        "DNS", "DataSaver", "DiskUsage", "DisplayArrange", "DisplayScale", "DnsConfig",
+        "DoNotDisturb", "Dock", "Energy", "Firewall", "FocusMode", "FramePerf",
+        "GameMode", "Gesture", "GpuMonitor", "GpuStats", "KeyboardBacklight", "Keychain",
+        "Keymap", "License", "Location", "LocationServices", "Login", "MemPressure",
+        "MicMute", "MonoAudio", "MountedVolumes", "NetConns", "Netstat", "NightLight",
+        "NightShift", "OptStorage", "Packages", "PkgUpdates", "Pointer", "Privacy",
+        "Process", "Proxy", "ReduceMotion", "RefreshRate", "RotationLock", "SavedWifi",
+        "ScreenTimeout", "Screenshot", "ScrollDir", "Security", "Sessions", "Smart",
+        "SpatialAudio", "StageManager", "Stylus", "SysInfo", "SysLog", "SystemSounds",
+        "TextSize", "Thermal", "Timezone", "Touchpad", "Tray", "TrueTone",
+        "TrustedDevices", "UpdateChannel", "Usb", "UsbDevice", "UsbDevices", "VirtualKeyboard",
+        "WakeLock", "WakeOnLan",
+    };
+    constexpr std::string_view kPrefix = "com.freebsdx.";
+    if (!service.starts_with(kPrefix)) return false;
+    service.remove_prefix(kPrefix.size());
+    return std::find(std::begin(kNames), std::end(kNames), service) != std::end(kNames);
+}
+
+// Services apps use, where some operations change the system or reach other
+// apps: those are limited to the built-in app that needs them (identified by
+// its executable, peer_identity.h — never by what it says about itself).
+// Returns true if an untrusted client may make this call.
+static bool appMayCall(const shared::XBusMessage& m, int fd) noexcept {
+    using namespace shared;
+    std::string_view svc = m.service_name_;
+    const uint32_t op = m.opcode_;
+    auto is = [op](auto o) { return op == static_cast<uint32_t>(o); };
+    auto from = [fd](std::initializer_list<const char*> bins) { return peer::isOneOf(fd, bins); };
+    if (svc == "com.freebsdx.Power")
+        return is(PowerOpcode::GetPowerState) || is(PowerOpcode::GetLidPolicy) ||
+               is(PowerOpcode::GetSleepTimeout) || from({"settings"});
+    if (svc == "com.freebsdx.Network")
+        return is(NetworkOpcode::GetStatus) || from({"settings"});
+    if (svc == "com.freebsdx.VPN")
+        return is(VpnOpcode::GetStatus) || from({"settings"});
+    if (svc == "com.freebsdx.Bluetooth")
+        return is(BluetoothOpcode::GetState) || is(BluetoothOpcode::ListDevices) || from({"settings"});
+    if (svc == "com.freebsdx.Seat")
+        return !is(SeatOpcode::AssignOutput) || from({"settings"});
+    if (svc == "com.freebsdx.Disk")
+        return is(DiskOpcode::ListDisks) || is(DiskOpcode::ListPartitions) || is(DiskOpcode::ListZpools) ||
+               is(DiskOpcode::GetIoStats) || from({"diskmanager"});
+    if (svc == "com.freebsdx.Terminal")     // a session runs arbitrary commands
+        return from({"terminal"});
+    if (svc == "com.freebsdx.AppManager")
+        return !(is(AppManagerOpcode::Install) || is(AppManagerOpcode::Uninstall)) ||
+               from({"appmanager", "installer"});
+    if (svc == "com.freebsdx.PackageSigning")  // a key decides which packages are trusted
+        return is(PackageSigningOpcode::ListKeys) || is(PackageSigningOpcode::GetPolicy) ||
+               from({"appmanager"});
+    if (svc == "com.freebsdx.Configuration")   // screen lock, firewall, location… settings
+        return op == 0x01 /* GetValue */ || from({"settings"});
+    return true;
+}
 
 static const ShellOnlyService* shellOnlyService(const char* name) noexcept {
     static constexpr ShellOnlyService kTable[] = {
@@ -413,14 +481,27 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     const auto* msg = reinterpret_cast<const shared::XBusMessage*>(data.data());
     if (msg->magic_ != shared::XBUS_MAGIC) return {false, std::nullopt};
 
+    const bool trusted = client->isTrusted(); // true only for the shell (surface 999)
+
+    // Automation injects input and reads pixels: the test harness's, or the
+    // shell's — never an arbitrary app's on a live seat.
     if (std::strcmp(msg->service_name_, "com.freebsdx.Automation") == 0) {
+        if (!trusted && !HeadlessService::isHeadless()) {
+            std::cerr << "[XBusDispatcher] DENIED: com.freebsdx.Automation on a live seat\n";
+            return {true, std::nullopt};
+        }
         auto injected = AutomationService::ProcessMessage(client, *msg, comp, stack);
         return {true, injected};
     }
 
-    shared::XBusMessage response = *msg;
+    if (!trusted && (shellOnlyName(msg->service_name_) || !appMayCall(*msg, client->fd()))) {
+        std::cerr << "[XBusDispatcher] DENIED: " << msg->service_name_ << " op " << msg->opcode_
+                  << " from an app (" << (client->appId().empty() ? "unknown" : client->appId()) << ")\n";
+        SecurityEventsService::record("call-deny", client->appId(), msg->service_name_, false);
+        return {true, std::nullopt};
+    }
 
-    const bool trusted = client->isTrusted(); // true only for the shell (surface 999)
+    shared::XBusMessage response = *msg;
 
     if (std::strcmp(msg->service_name_, "com.freebsdx.Audio") == 0) {
         // Microphone permission: gate capture-device enumeration for sandboxed
@@ -1411,6 +1492,14 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         else std::cerr << "[XBusDispatcher] DENIED: untrusted app attempted com.freebsdx.KeyboardShortcuts\n";
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.Window") == 0) {
+        // An app may retitle / raise only its own windows (the shell: any).
+        uint32_t target = 0;
+        std::memcpy(&target, msg->payload_, sizeof(target));
+        if (!trusted && !clientOwnsSurface(client.get(), target)) {
+            std::cerr << "[XBusDispatcher] DENIED: Window op " << msg->opcode_
+                      << " on surface " << target << " the caller doesn't own\n";
+            return {true, std::nullopt};
+        }
         if (msg->opcode_ == static_cast<uint32_t>(shared::WindowOpcode::SetTitle) && stack) {
             shared::WindowTitleRequest req{};
             std::memcpy(&req, msg->payload_, sizeof(req));

@@ -12,6 +12,10 @@ namespace fbx::xserver {
     class VulkanCompositor;
     class WindowStack;
     class DrmDevice;
+
+    // Did this client register the surface? Defined by the compositor
+    // (main.cc), which owns the surface→client map; the Window gate uses it.
+    bool clientOwnsSurface(const IpcSocket* client, uint32_t surface_id) noexcept;
 }
 
 namespace fbx::xserver {

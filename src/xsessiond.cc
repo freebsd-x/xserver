@@ -22,6 +22,7 @@
 #include "xserver/xsessiond_protocol.h"
 #include "xserver/priv_ops.h"
 #include "xserver/adblock_apply.h"
+#include "xserver/peer_identity.h"
 
 #include <security/pam_appl.h>
 #include <sys/sysctl.h>
@@ -91,6 +92,7 @@ struct Session {
     pam_handle_t* pamh = nullptr;
     std::string   pw;                 // backing store for the conv; cleared post-auth
     std::string   user;
+    bool          peer_ok = false;    // the peer is an allowed compositor (see peer_allowed)
     bool          authed = false;
     bool          open   = false;
     char          ut_id[8] = {};
@@ -492,6 +494,37 @@ libseat_seat_listener g_libseat_listener = {
 // The event loop owns the recv() and the teardown; this is pure per-message
 // dispatch over the connection's Session (a stable reference into the session
 // map — see main()).
+// Only the compositor may use this daemon. The socket is world-reachable
+// (0666), and everything it offers — password checks, seat devices (an evdev
+// fd reads every keystroke), the root broker — was open to any local process
+// of any user. A connection is served only if its peer runs one of the
+// compositor binaries in XSESSIOND_COMPOSITOR (':'-separated absolute paths;
+// default /usr/local/bin/freebsdx), checked by the peer's pid → executable.
+static std::vector<std::string> g_allowed_compositors;   // real paths
+
+// Read before scrub_environment() wipes environ.
+static void load_allowed_compositors() {
+    const char* env = ::getenv("XSESSIOND_COMPOSITOR");
+    std::string list = (env && env[0]) ? env : "/usr/local/bin/freebsdx";
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t colon = list.find(':', start);
+        if (colon == std::string::npos) colon = list.size();
+        std::string path = list.substr(start, colon - start);
+        char real[PATH_MAX];
+        if (!path.empty() && path[0] == '/' && ::realpath(path.c_str(), real))
+            g_allowed_compositors.emplace_back(real);
+        start = colon + 1;
+    }
+}
+
+static bool peer_allowed(int fd) {
+    const std::string exe = fbx::xserver::peer::executable(fd);
+    return !exe.empty() &&
+           std::find(g_allowed_compositors.begin(), g_allowed_compositors.end(), exe) !=
+               g_allowed_compositors.end();
+}
+
 bool dispatch_datagram(int fd, Session& s, const unsigned char* buf, size_t n) {
     if (n < sizeof(RequestHeader)) return false;
 
@@ -500,6 +533,11 @@ bool dispatch_datagram(int fd, Session& s, const unsigned char* buf, size_t n) {
     if (hdr.magic != kMagic || hdr.version != kVersion) {
         send_reply(fd, hdr.serial, Reply::Error, -EINVAL);
         return false;
+    }
+
+    if (!s.peer_ok && static_cast<Opcode>(hdr.opcode) != Opcode::Hello) {
+        send_reply(fd, hdr.serial, Reply::Error, -EPERM);
+        return true;
     }
 
     switch (static_cast<Opcode>(hdr.opcode)) {
@@ -668,6 +706,7 @@ int main() {
     // Phase 2b opt-in (read before scrub wipes environ). Enabling this makes the
     // daemon a libseat client of real seatd; leave it unset for today's behavior.
     const bool want_libseat = ::getenv("XSESSIOND_LIBSEAT") != nullptr;
+    load_allowed_compositors();
     scrub_environment();
 
     // Single process now (no per-connection fork), so no SIGCHLD reaping. Ignore
@@ -764,7 +803,12 @@ int main() {
         if (pfds[0].revents & POLLIN) {
             int cfd = ::accept4(lfd, nullptr, nullptr, SOCK_CLOEXEC);
             if (cfd >= 0) {
-                sessions.emplace(cfd, Session{});   // fresh per-connection state
+                Session fresh{};                    // fresh per-connection state
+                fresh.peer_ok = peer_allowed(cfd);
+                if (!fresh.peer_ok)
+                    std::fprintf(stderr, "xsessiond: refusing a client that isn't the compositor (%s)\n",
+                                 fbx::xserver::peer::executable(cfd).c_str());
+                sessions.emplace(cfd, std::move(fresh));
             } else if (errno != EINTR) {
                 std::perror("xsessiond: accept");
             }

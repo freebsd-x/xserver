@@ -12,6 +12,8 @@
 //
 // Plain exit-code test (0 = pass); no gtest, since it orchestrates a subprocess.
 
+#include <sys/sysctl.h>
+#include <climits>
 #include "xserver/auth_helper.h"
 #include "xserver/xsessiond_device.h"
 #include "xserver/xsessiond_session.h"
@@ -95,6 +97,13 @@ int main(int argc, char** argv) {
     { int f = ::open(devfile.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600); if (f >= 0) ::close(f); }
 
     ::setenv(kSocketPathEnv, sock, 1);
+    // The daemon serves only the compositor: name this test as it.
+    {
+        char self[PATH_MAX] = {};
+        size_t len = sizeof(self) - 1;
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+        if (::sysctl(mib, 4, self, &len, nullptr, 0) == 0) ::setenv("XSESSIOND_COMPOSITOR", self, 1);
+    }
     ::setenv("XSESSIOND_DEV_PREFIX", dir, 1);
     std::atexit(cleanup);
 

@@ -1,4 +1,5 @@
 #include "xserver/headless_service.h"
+#include <iostream>
 #include "xserver/remote_desktop_service.h"
 #include "shared/logger.h"
 #include <cstring>
@@ -44,6 +45,15 @@ bool HeadlessService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         std::memcpy(resp.payload_, &info, sizeof(info));
         (void)client->sendMessage(
             {reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
+        return true;
+    }
+
+    // Everything below drives or reads the screen (inject input, capture the
+    // frame, read the pointer) — the test harness's tools. On a live seat they
+    // would let any app type into other windows or capture the screen, so
+    // they exist only on a --headless compositor.
+    if (!headless_) {
+        std::cerr << "[Headless] DENIED: opcode " << msg.opcode_ << " on a live seat\n";
         return true;
     }
 

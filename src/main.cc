@@ -8,6 +8,7 @@
 #include <spawn.h>
 #include "xserver/shortcuts.h"
 #include "xserver/shell_input_region.h"
+#include "xserver/peer_identity.h"
 #include "xserver/scrolldir_service.h"
 #include "xserver/touchpad_service.h"
 #include "xserver/pointer_service.h"
@@ -159,30 +160,15 @@ static bool g_strict_shell_trust = false;
 // must be running one of the shell binaries (kern.proc.pathname of the peer's
 // pid, LOCAL_PEERCRED) — a sandboxed app can't exec one. Headless allows any
 // client: whoever runs a headless compositor can already reach the broker.
+// For the dispatcher's Window gate: did this client register the surface?
+bool fbx::xserver::clientOwnsSurface(const IpcSocket* client, uint32_t surface_id) noexcept {
+    auto it = g_surface_clients.find(surface_id);
+    return it != g_surface_clients.end() && it->second.get() == client;
+}
+
 static bool mayRegisterShellSurface(int fd) {
     if (g_headless && !g_strict_shell_trust) return true;
-    struct xucred xu{};
-    socklen_t len = sizeof(xu);
-    if (::getsockopt(fd, 0 /* SOL_LOCAL */, LOCAL_PEERCRED, &xu, &len) != 0 ||
-        xu.cr_version != XUCRED_VERSION || xu.cr_pid <= 0)
-        return false;
-    char path[PATH_MAX] = {};
-    size_t plen = sizeof(path) - 1;
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, xu.cr_pid};
-    if (::sysctl(mib, 4, path, &plen, nullptr, 0) != 0) return false;
-    static const std::vector<std::string> trusted = [] {
-        std::vector<std::string> v;
-        for (const char* bin : {"xshell", "lockscreen", "xlogin"})
-            for (const std::string& cand : {std::string("./") + bin, std::string("./out/") + bin,
-                                            std::string("/usr/local/bin/") + bin}) {
-                char real[PATH_MAX];
-                if (::realpath(cand.c_str(), real)) v.emplace_back(real);
-            }
-        return v;
-    }();
-    char real[PATH_MAX];   // e.g. /home → /usr/home on FreeBSD
-    std::string exe = ::realpath(path, real) ? real : path;
-    return std::find(trusted.begin(), trusted.end(), exe) != trusted.end();
+    return peer::isOneOf(fd, {"xshell", "lockscreen", "xlogin"});
 }
 static bool g_flip_pending = false; // single-threaded event loop — no race
 // When the current page flip was issued. A page-flip completion event clears
