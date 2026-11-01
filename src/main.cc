@@ -257,6 +257,23 @@ static float cursor_x = 960.0f;
 static float cursor_y = 540.0f;
 static uint32_t focused_surface = 999;
 
+// The shell's keyboard grab: while one of its popups that takes typing is open
+// (search, launcher, quick note…), keys go to the shell; then back to the
+// window that had them. (Super+Space opened search, but typing still went to
+// the app underneath.)
+static uint32_t g_focus_before_grab = 0;
+void fbx::xserver::shellKeyboardGrab(bool on) noexcept {
+    if (on) {
+        if (focused_surface != 999u) g_focus_before_grab = focused_surface;
+        focused_surface = 999u;
+    } else if (focused_surface == 999u) {
+        if (g_focus_before_grab && g_surface_clients.contains(g_focus_before_grab))
+            focused_surface = g_focus_before_grab;
+        g_focus_before_grab = 0;
+    }
+}
+
+
 // Last cursor shape pushed to the DRM cursor plane (wp_cursor_shape enum; 1 =
 // default arrow). Tracked so hover feedback only re-rasterizes on an actual
 // change instead of on every pointer-motion event.
@@ -1890,9 +1907,15 @@ int main(int argc, char** argv) {
             }
         }
 
-        // --- Dashboard / Search: forward to shell ---
+        // --- Shell actions: forward to the shell ---
+        // (Clipboard history, colour picker, quick note and shortcut help were
+        // forwarded nowhere — Super+V/P/N/'/' did nothing.)
         if (msg.type_ == InputEventType::DashboardToggle ||
-            msg.type_ == InputEventType::SearchToggle) {
+            msg.type_ == InputEventType::SearchToggle ||
+            msg.type_ == InputEventType::ClipboardHistoryToggle ||
+            msg.type_ == InputEventType::ColorPickerToggle ||
+            msg.type_ == InputEventType::QuickNoteToggle ||
+            msg.type_ == InputEventType::ShortcutHelpToggle) {
             if (g_surface_clients.contains(999u)) {
                 (void)g_surface_clients[999u]->sendMessage(
                     {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});

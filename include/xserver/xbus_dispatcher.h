@@ -16,6 +16,10 @@ namespace fbx::xserver {
     // Did this client register the surface? Defined by the compositor
     // (main.cc), which owns the surface→client map; the Window gate uses it.
     bool clientOwnsSurface(const IpcSocket* client, uint32_t surface_id) noexcept;
+
+    // ShellOpcode::KeyboardGrab — defined by the compositor (main.cc), which
+    // owns keyboard focus.
+    void shellKeyboardGrab(bool on) noexcept;
 }
 
 namespace fbx::xserver {

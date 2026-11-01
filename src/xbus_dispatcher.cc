@@ -877,7 +877,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
             msg->opcode_ == static_cast<uint32_t>(shared::PackageSigningOpcode::RemoveKey) ||
             msg->opcode_ == static_cast<uint32_t>(shared::PackageSigningOpcode::SetPolicy);
 
-        if (client->isSandboxed() && is_mutating) {
+        if (client->isSandboxed() && is_mutating && !peer::isOneOf(client->fd(), {"appmanager"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app tried to mutate package trust store\n";
             // Send a failure response so the client doesn't hang
             shared::PkgSigningStatusResponse sr{};
@@ -896,6 +896,12 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // LaunchWithFile: broadcast to all clients so the shell can handle it.
         if (msg->opcode_ == static_cast<uint32_t>(shared::ShellOpcode::LaunchWithFile)) {
             BroadcastXBusMessage(*msg);
+        }
+        // The shell asks for the keyboard while a popup that takes typing is open.
+        else if (msg->opcode_ == static_cast<uint32_t>(shared::ShellOpcode::KeyboardGrab) && client->isTrusted()) {
+            uint32_t on = 0;
+            std::memcpy(&on, msg->payload_, sizeof(on));
+            shellKeyboardGrab(on != 0);
         }
         // Only the shell itself may say where its popups are.
         else if (msg->opcode_ == static_cast<uint32_t>(shared::ShellOpcode::SetInputRegion) &&
@@ -971,7 +977,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.PowerProfile") == 0) {
         const bool is_write = (msg->opcode_ == static_cast<uint32_t>(shared::PowerProfileOpcode::SetProfile));
-        if (client->isSandboxed() && is_write) {
+        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"settings"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted PowerProfile write\n";
         } else {
             PowerProfileService::ProcessMessage(client, *msg);
@@ -1456,7 +1462,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         const bool is_destructive =
             msg->opcode_ == static_cast<uint32_t>(shared::DiskOpcode::Format) ||
             msg->opcode_ == static_cast<uint32_t>(shared::DiskOpcode::Eject);
-        if (client->isSandboxed() && is_destructive) {
+        if (client->isSandboxed() && is_destructive && !peer::isOneOf(client->fd(), {"diskmanager"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted Disk destructive op\n";
         } else {
             DiskService::handleMessage(*msg, client);
@@ -1468,7 +1474,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         const bool is_write =
             msg->opcode_ == static_cast<uint32_t>(shared::FontManagerOpcode::InstallFont) ||
             msg->opcode_ == static_cast<uint32_t>(shared::FontManagerOpcode::RemoveFont);
-        if (client->isSandboxed() && is_write) {
+        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"fontmanager"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted FontManager write\n";
         } else {
             FontManagerService::handleMessage(*msg, client);
