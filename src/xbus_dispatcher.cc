@@ -129,6 +129,7 @@
 #include "xserver/disk_service.h"
 #include "xserver/font_manager_service.h"
 #include "xserver/night_shift_service.h"
+#include "xserver/fetch_broker.h"
 #include "xserver/mono_audio_service.h"
 #include "xserver/true_tone_service.h"
 #include "xserver/opt_storage_service.h"
@@ -542,6 +543,12 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         }
         auto injected = AutomationService::ProcessMessage(client, *msg, comp, stack);
         return {true, injected};
+    }
+
+    // Fetch has its own policy (per-app host allowlist, provider identity).
+    if (std::strcmp(msg->service_name_, "com.freebsdx.Fetch") == 0) {
+        FetchBroker::ProcessMessage(client, *msg, fd_opt);
+        return {true, std::nullopt};
     }
 
     // Accessibility: any app may announce or publish its own tree, but only the

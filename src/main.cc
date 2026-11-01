@@ -945,6 +945,18 @@ int main(int argc, char** argv) {
 
     chmod(kSocketPath, 0666);
     std::cout << "[xserver] IPC Socket LISTENING at " << kSocketPath << "\n" << std::flush;
+
+    // xfetch does network fetches for sandboxed apps (com.freebsdx.Fetch). It
+    // registers itself (checked by executable) and exits when this socket
+    // closes. The copy next to this binary wins, so out-asan/ runs its own.
+    {
+        const std::string& own = peer::ownDirectory();
+        pid_t fetch_pid = spawn::start(
+            spawn::firstExecutable({own + "xfetch", "./out/xfetch", "/usr/local/bin/xfetch"}), "xfetch", {},
+            {.env = {{"XBUS_SOCKET", kSocketPath}}, .stdout_path = "/tmp/xfetch.log"});
+        if (fetch_pid < 0)
+            std::cerr << "[xserver] xfetch not found: sandboxed apps have no network\n";
+    }
     
     (void)loop->addFd(master_fd.get(), [&, m_fd = master_fd.get()]() {
         struct sockaddr_un c_addr; socklen_t c_len = sizeof(c_addr);

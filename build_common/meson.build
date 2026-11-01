@@ -271,6 +271,7 @@ xbus_service_srcs = files(
   '../src/terminal_service.cc',
   '../src/pkg_signing_service.cc',
   '../src/night_shift_service.cc',
+  '../src/fetch_broker.cc',
   '../src/mono_audio_service.cc',
   '../src/true_tone_service.cc',
   '../src/opt_storage_service.cc',
