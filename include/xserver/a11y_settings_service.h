@@ -12,5 +12,11 @@ class A11ySettingsService {
 public:
     static void handleMessage(const shared::XBusMessage& msg,
                               std::shared_ptr<IpcSocket> client) noexcept;
+    // com.freebsdx.A11yPanel — the full accessibility panel (AccessibilityPanelOpcode,
+    // AccessibilitySettings), on the same config keys.
+    static void handlePanelMessage(const shared::XBusMessage& msg,
+                                   std::shared_ptr<IpcSocket> client) noexcept;
+    // Is the screen reader on (announcements spoken — speech.h)?
+    static bool screenReaderOn() noexcept;
 };
 }  // namespace fbx::xserver

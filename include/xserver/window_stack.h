@@ -899,6 +899,13 @@ public:
         return 0;
     }
 
+    [[nodiscard]] std::string windowTitle(uint32_t surface_id) const noexcept {
+        for (const auto& ws : workspaces_)
+            for (const auto& w : ws.windows_)
+                if (w.surface_id_ == surface_id) return w.title_;
+        return {};
+    }
+
     void setWindowTitle(uint32_t surface_id, const std::string& title) noexcept {
         for (auto& ws : workspaces_) {
             for (auto& w : ws.windows_) {

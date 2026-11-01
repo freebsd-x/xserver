@@ -252,6 +252,7 @@ xbus_service_srcs = files(
   '../src/dock_service.cc',
   '../src/gesture_service.cc',
   '../src/a11y_settings_service.cc',
+  '../src/speech.cc',
   '../src/update_channel_service.cc',
   '../src/spatial_audio_service.cc',
   '../src/stylus_service.cc',

@@ -48,6 +48,7 @@
 #include "xserver/adblock_service.h"
 #include "xserver/adblock_apply.h"
 #include "xserver/consent_broker.h"
+#include "xserver/speech.h"
 #include "xserver/location_service.h"
 #include "xserver/kbd_backlight_service.h"
 #include "xserver/energy_service.h"
@@ -798,6 +799,25 @@ TEST_F(ServiceRoundtrip, ConsentHoldsRequestsAndReplaysThemOnTheAnswer) {
     EXPECT_EQ(replayed.size(), 2u);
     fbx::xserver::consent::resolve("com.freebsdx.camera", 2);
     fbx::xserver::consent::setReplay(nullptr);
+}
+
+// ── Screen reader speech: only while on; text cleaned ─────────────────────────
+
+TEST_F(ServiceRoundtrip, SpeechSpeaksOnlyWhileTheReaderIsOn) {
+    using fbx::xserver::speech::clean;
+    EXPECT_EQ(clean("  Save,\tbutton\n\x07 "), "Save, button");
+    EXPECT_EQ(clean(std::string(500, 'a')).size(), 300u);
+
+    const std::string log = home_ + "/spoken.log";
+    ::setenv("FBX_READER_LOG", log.c_str(), 1);
+    ConfigService::set("a11y.screen_reader", "0");
+    fbx::xserver::speech::say("not spoken");
+    fbx::xserver::speech::say("Screen reader off", /*even_if_off=*/true);
+    ConfigService::set("a11y.screen_reader", "1");
+    fbx::xserver::speech::say("Dark Mode, switch, on");
+    EXPECT_EQ(readHomeFile(log), "Screen reader off\nDark Mode, switch, on\n");
+    ::unsetenv("FBX_READER_LOG");
+    ConfigService::set("a11y.screen_reader", "0");
 }
 
 // ── Keymap: SetLayout persists a valid layout, rejects a bogus one ────────────

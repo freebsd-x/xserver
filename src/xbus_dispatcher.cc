@@ -179,7 +179,7 @@ struct ShellOnlyService {
 // (Short names: "com.freebsdx." + name.)
 static bool shellOnlyName(std::string_view service) noexcept {
     static constexpr std::string_view kNames[] = {
-        "A11ySettings", "AirplaneMode", "AppSandbox", "AudioOutput", "AutoBrightness", "BatteryDrain",
+        "A11ySettings", "A11yPanel", "AirplaneMode", "AppSandbox", "AudioOutput", "AutoBrightness", "BatteryDrain",
         "BatteryHealth", "ClipboardHistory", "ColorFilter", "ColorProfile", "CrashReporter", "CursorSize",
         "DNS", "DataSaver", "DiskUsage", "DisplayArrange", "DisplayScale", "DnsConfig",
         "DoNotDisturb", "Dock", "Energy", "Firewall", "FocusMode", "FramePerf",
@@ -544,6 +544,16 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         return {true, injected};
     }
 
+    // Accessibility: any app may announce or publish its own tree, but only the
+    // shell may subscribe to everyone's announcements or read another app's
+    // tree — they carry what other apps' fields contain.
+    if (!trusted && std::strcmp(msg->service_name_, "com.freebsdx.Accessibility") == 0 &&
+        (msg->opcode_ == static_cast<uint32_t>(shared::AccessibilityOpcode::Subscribe) ||
+         msg->opcode_ == static_cast<uint32_t>(shared::AccessibilityOpcode::QueryTree))) {
+        std::cerr << "[XBusDispatcher] DENIED: com.freebsdx.Accessibility op " << msg->opcode_
+                  << " (subscribe/query) from an app\n";
+        return {true, std::nullopt};
+    }
     if (!trusted && (shellOnlyName(msg->service_name_) || !appMayCall(*msg, client->fd()))) {
         std::cerr << "[XBusDispatcher] DENIED: " << msg->service_name_ << " op " << msg->opcode_
                   << " from an app (" << (client->appId().empty() ? "unknown" : client->appId()) << ")\n";
@@ -599,8 +609,12 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.VPN") == 0) {
         // Reads are open to all apps; tunnel and config writes denied to sandboxed clients.
+        // These "no writes from sandboxed apps" gates admit the built-in app
+        // that owns the setting (by executable, peer_identity.h): every app is
+        // sandboxed, so Settings could never change VPN, Bluetooth, brightness,
+        // power, display, screen saver, lock or theme settings.
         const bool is_write = (msg->opcode_ >= static_cast<uint32_t>(shared::VpnOpcode::Connect));
-        if (client->isSandboxed() && is_write) {
+        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"settings"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted VPN write\n";
         } else {
             VpnService::ProcessMessage(client, *msg);
@@ -642,7 +656,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         const bool is_write =
             msg->opcode_ == static_cast<uint32_t>(shared::LockOpcode::Lock) ||
             msg->opcode_ == static_cast<uint32_t>(shared::LockOpcode::SetTimeout);
-        if (client->isSandboxed() && is_write) {
+        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"settings"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted Lock write\n";
         } else {
             LockService::ProcessMessage(client, *msg);
@@ -653,7 +667,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // SetConfig: denied to sandboxed apps (prevents rogue apps disabling saver).
         const bool is_write =
             msg->opcode_ == static_cast<uint32_t>(shared::ScreenSaverOpcode::SetConfig);
-        if (client->isSandboxed() && is_write) {
+        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"settings"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted ScreenSaver SetConfig\n";
         } else {
             ScreenSaverService::ProcessMessage(client, *msg);
@@ -664,7 +678,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // they own. DestroySession is denied to sandboxed clients entirely.
         const bool is_destroy =
             msg->opcode_ == static_cast<uint32_t>(shared::TerminalOpcode::DestroySession);
-        if (client->isSandboxed() && is_destroy) {
+        if (client->isSandboxed() && is_destroy && !peer::isOneOf(client->fd(), {"terminal"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted Terminal DestroySession\n";
         } else {
             TerminalService::ProcessMessage(client, *msg);
@@ -708,7 +722,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.Bluetooth") == 0) {
         const bool is_write = (msg->opcode_ >= static_cast<uint32_t>(shared::BluetoothOpcode::SetEnabled));
-        if (client->isSandboxed() && is_write) {
+        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"settings"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted Bluetooth write\n";
         } else {
             BluetoothService::ProcessMessage(client, *msg);
@@ -716,7 +730,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.Backlight") == 0) {
         const bool is_write = (msg->opcode_ >= static_cast<uint32_t>(shared::BacklightOpcode::SetBrightness));
-        if (client->isSandboxed() && is_write) {
+        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"settings"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted Backlight write\n";
         } else {
             BacklightService::ProcessMessage(client, *msg);
@@ -727,7 +741,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // are denied to sandboxed (Capsicum) clients.
         const bool is_write = (msg->opcode_ >= static_cast<uint32_t>(shared::PowerOpcode::Suspend) &&
                                msg->opcode_ <= static_cast<uint32_t>(shared::PowerOpcode::SetSleepTimeout));
-        if (client->isSandboxed() && is_write) {
+        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"settings"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted Power write\n";
         } else {
             PowerService::ProcessMessage(client, *msg);
@@ -791,7 +805,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         const bool is_write_op =
             op == static_cast<uint32_t>(shared::DisplayOpcode::SetOutputScale) ||
             op == static_cast<uint32_t>(shared::DisplayOpcode::SetVrrEnabled);
-        if (client->isSandboxed() && is_write_op) {
+        if (client->isSandboxed() && is_write_op && !peer::isOneOf(client->fd(), {"settings"})) {
             std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted Display write (opcode 0x"
                       << std::hex << op << std::dec << ")\n";
         } else {
@@ -937,7 +951,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         }
         else if (msg->opcode_ == static_cast<uint32_t>(shared::ThemeOpcode::SetTheme)) {
             // System-wide theme changes are denied for sandboxed apps.
-            if (client->isSandboxed()) {
+            if (client->isSandboxed() && !peer::isOneOf(client->fd(), {"settings"})) {
                 std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted Theme write\n";
             } else {
                 shared::ThemeSetRequest req{};
@@ -1379,6 +1393,10 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.A11ySettings") == 0) {
         A11ySettingsService::handleMessage(*msg, client);
+        return {true, std::nullopt};
+    }
+    else if (std::strcmp(msg->service_name_, "com.freebsdx.A11yPanel") == 0) {
+        A11ySettingsService::handlePanelMessage(*msg, client);
         return {true, std::nullopt};
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.UpdateChannel") == 0) {

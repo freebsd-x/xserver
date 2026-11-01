@@ -10,6 +10,7 @@
 #include "xserver/shell_input_region.h"
 #include "xserver/peer_identity.h"
 #include "xserver/spawn_util.h"
+#include "xserver/accessibility_service.h"
 #include "xserver/scrolldir_service.h"
 #include "xserver/touchpad_service.h"
 #include "xserver/pointer_service.h"
@@ -1356,6 +1357,21 @@ int main(int argc, char** argv) {
     // Defined with the input loop below; the frame timer feeds it injected input.
     std::function<void(shared::InputMessage&)> handle_input;
     (void)loop->addTimer(1, 16, [comp, screen_w, screen_h, drm_ptr, &process_pointer_motion, &handle_input]() {
+        // Screen reader: say which window has focus ("Settings, window") when it
+        // changes — also once its title arrives, since a new window is focused
+        // before its app sets the title.
+        {
+            static uint32_t    spoken_surface = 0;
+            static std::string spoken_title;
+            if (focused_surface != 999u && focused_surface != 998u) {
+                std::string title = window_stack.windowTitle(focused_surface);
+                if (!title.empty() && (focused_surface != spoken_surface || title != spoken_title)) {
+                    spoken_surface = focused_surface;
+                    spoken_title = title;
+                    AccessibilityService::BroadcastAnnounce(focused_surface, title + ", window");
+                }
+            }
+        }
         if (!g_seat_active) return;   // seat handed to another VT — don't touch the GPU
         if (g_flip_pending) {
             // Watchdog: a healthy flip completes in ~1 frame (16ms @60Hz). If one

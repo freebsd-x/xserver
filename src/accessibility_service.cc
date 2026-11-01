@@ -1,4 +1,5 @@
 #include "xserver/accessibility_service.h"
+#include "xserver/speech.h"
 #include "xserver/ipc_socket.h"
 #include <algorithm>
 #include <cstring>
@@ -97,8 +98,8 @@ void AccessibilityService::ProcessMessage(std::shared_ptr<IpcSocket> client,
                      sizeof(bcast.service_name_) - 1);
         bcast.opcode_ = static_cast<uint32_t>(shared::AccessibilityOpcode::Announce);
         std::memcpy(bcast.payload_, &ann, sizeof(ann));
-        std::cout << "[a11y] Announce: " << ann.text_ << "\n";
         broadcast(bcast);
+        speech::say(ann.text_);   // spoken while the screen reader is on
         return;
     }
 
@@ -177,6 +178,7 @@ void AccessibilityService::BroadcastAnnounce(uint32_t surface_id,
     msg.opcode_ = static_cast<uint32_t>(shared::AccessibilityOpcode::Announce);
     std::memcpy(msg.payload_, &ann, sizeof(ann));
     broadcast(msg);
+    speech::say(ann.text_);
 }
 
 } // namespace fbx::xserver
