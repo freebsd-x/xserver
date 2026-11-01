@@ -1,4 +1,5 @@
 #include "xserver/login_service.h"
+#include "xserver/spawn_util.h"
 #include "xserver/auth_helper.h"
 #include "xserver/auth_throttle.h"
 #include "xserver/security_events_service.h"
@@ -231,18 +232,17 @@ void LoginService::startSession(const char* username) noexcept {
 void LoginService::spawnGreeter() noexcept {
     std::cout << "[LoginService] Spawning xlogin greeter...\n";
     greeter_active_ = true;
-    greeter_pid_ = fork();
-    if (greeter_pid_ == 0) {
-        setenv("LD_LIBRARY_PATH", "./out", 1);
-        setenv("XBUS_SOCKET", "/tmp/freebsdx.sock", 1);
-        if (access("./xlogin", X_OK) == 0)            // dev build (builddir/)
-            execl("./xlogin", "xlogin", nullptr);
-        if (access("./out/xlogin", X_OK) == 0)
-            execl("./out/xlogin", "xlogin", nullptr);
-        if (access("/usr/local/bin/xlogin", X_OK) == 0)
-            execl("/usr/local/bin/xlogin", "xlogin", nullptr);
-        std::cerr << "[LoginService] FATAL: failed to exec xlogin\n";
-        exit(1);
+    // posix_spawn, not fork + setenv (unsafe after fork here; a hang left the
+    // login screen missing — spawn_util.h). ./xlogin is the dev build (builddir/).
+    greeter_pid_ = spawn::start(
+        spawn::firstExecutable({"./xlogin", "./out/xlogin", "/usr/local/bin/xlogin"}), "xlogin", {},
+        {.env = {{"LD_LIBRARY_PATH", "./out"}, {"XBUS_SOCKET", "/tmp/freebsdx.sock"}}});
+    if (greeter_pid_ < 0) {
+        // No greeter binary: straight to the shell (dev workflow without xlogin).
+        std::cerr << "[LoginService] no xlogin greeter found — starting the shell directly\n";
+        greeter_active_ = false;
+        if (shell_spawner_) shell_spawner_();
+        return;
     }
     // If xlogin exits immediately (binary not found or crashes at startup),
     // skip straight to the shell — allows dev workflow without xlogin installed.

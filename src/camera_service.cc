@@ -1,4 +1,7 @@
 #include "xserver/camera_service.h"
+#include "xserver/spawn_util.h"
+#include <iostream>
+#include <climits>
 #include "xserver/async_shell.h"
 #include "xserver/privacy_service.h"
 #include "xserver/shell_util.h"
@@ -177,14 +180,29 @@ shared::CameraState CameraService::getState() noexcept {
     return st;
 }
 
+// Where a capture goes: the app's requested folder only if it resolves inside
+// the user's home (the compositor writes it, outside the app's sandbox — any
+// other folder would let an app plant files wherever the user can write),
+// otherwise ~/<fallback>.
+static std::string outputDir(const char* requested, size_t max, const char* fallback) {
+    const std::string home = getenv("HOME") ? getenv("HOME") : "/tmp";
+    const std::string def = home + "/" + fallback;
+    if (!requested[0]) return def;
+    std::string req(requested, strnlen(requested, max));
+    char real_home[PATH_MAX], real_req[PATH_MAX];
+    if (!::realpath(home.c_str(), real_home) || !::realpath(req.c_str(), real_req)) return def;
+    const std::string h = real_home, r = real_req;
+    if (r == h || r.compare(0, h.size() + 1, h + "/") == 0) return r;
+    std::cerr << "[CameraService] ignoring output folder outside the home folder: " << req << "\n";
+    return def;
+}
+
 shared::CameraStillResult CameraService::captureStill(const shared::CameraStillRequest& req) noexcept {
     shared::CameraStillResult res{};
     if (PrivacyService::cameraBlocked()) return res;   // denied (success_ = 0)
     const std::string& dev = current_device_.empty() ? "/dev/video0" : current_device_;
 
-    std::string dir = req.output_dir_[0]
-        ? std::string(req.output_dir_, strnlen(req.output_dir_, sizeof(req.output_dir_)))
-        : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/Pictures";
+    std::string dir = outputDir(req.output_dir_, sizeof(req.output_dir_), "Pictures");
 
     std::string out = timestampedPath(dir, "camera", "jpg");
 
@@ -208,22 +226,17 @@ shared::CameraState CameraService::startRecording(const shared::CameraRecordRequ
     if (recording_) stopRecording();
 
     const std::string& dev = current_device_.empty() ? "/dev/video0" : current_device_;
-    std::string dir = req.output_dir_[0]
-        ? std::string(req.output_dir_, strnlen(req.output_dir_, sizeof(req.output_dir_)))
-        : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/Videos";
+    std::string dir = outputDir(req.output_dir_, sizeof(req.output_dir_), "Videos");
 
     record_path_ = timestampedPath(dir, "camera", "mp4");
 
-    // Fork ffmpeg for recording
-    pid_t pid = fork();
-    if (pid == 0) {
-        // child
-        std::string cmd = std::format(
-            "ffmpeg -f v4l2 -video_size {}x{} -i {} -c:v libx264 -preset ultrafast {}",
-            current_width_, current_height_, shellQuote(dev), shellQuote(record_path_));
-        execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
-        _exit(1);
-    }
+    // Built here and started with posix_spawn: the old fork() child built this
+    // string (allocating) — unsafe after fork in the multi-threaded compositor.
+    const std::string cmd = std::format(
+        "ffmpeg -f v4l2 -video_size {}x{} -i {} -c:v libx264 -preset ultrafast {}",
+        current_width_, current_height_, shellQuote(dev), shellQuote(record_path_));
+    const pid_t pid = spawn::start("/bin/sh", "sh", {"-c", cmd});
+    if (pid < 0) return getState();
     record_pid_ = pid;
     recording_  = true;
 

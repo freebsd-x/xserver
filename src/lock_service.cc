@@ -1,4 +1,5 @@
 #include "xserver/lock_service.h"
+#include "xserver/spawn_util.h"
 #include "xserver/auth_helper.h"
 #include "xserver/auth_throttle.h"
 #include "xserver/security_events_service.h"
@@ -40,16 +41,12 @@ bool LockService::pamAuthenticate(const char* user, const char* password) noexce
 // ── Spawn / kill lockscreen ───────────────────────────────────────────────────
 
 void LockService::spawn_lockscreen() noexcept {
-    pid_t pid = ::fork();
-    if (pid == 0) {
-        ::setenv("LD_LIBRARY_PATH", "./out", 1);
-        ::setenv("XBUS_SOCKET", "/tmp/freebsdx.sock", 1);
-        if (::access("./out/lockscreen", X_OK) == 0)
-            ::execl("./out/lockscreen", "lockscreen", nullptr);
-        else if (::access("/usr/local/bin/lockscreen", X_OK) == 0)
-            ::execl("/usr/local/bin/lockscreen", "lockscreen", nullptr);
-        ::exit(1);
-    }
+    // posix_spawn, not fork + setenv (unsafe after fork in this multi-threaded
+    // process; it could deadlock and leave the screen unlocked — spawn_util.h).
+    const pid_t pid = spawn::start(
+        spawn::firstExecutable({"./out/lockscreen", "/usr/local/bin/lockscreen"}), "lockscreen", {},
+        {.env = {{"LD_LIBRARY_PATH", "./out"}, {"XBUS_SOCKET", "/tmp/freebsdx.sock"}}});
+    if (pid < 0) std::cerr << "[LockService] couldn't start the lock screen\n";
     lockscreen_pid_ = pid;
 }
 

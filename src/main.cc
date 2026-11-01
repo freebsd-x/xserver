@@ -9,6 +9,7 @@
 #include "xserver/shortcuts.h"
 #include "xserver/shell_input_region.h"
 #include "xserver/peer_identity.h"
+#include "xserver/spawn_util.h"
 #include "xserver/scrolldir_service.h"
 #include "xserver/touchpad_service.h"
 #include "xserver/pointer_service.h"
@@ -219,32 +220,18 @@ static void releaseFbCache(DrmDevice* drm) noexcept {
 
 void spawn_shell() {
     std::cout << "[xserver] SPAWNING xshell...\n" << std::flush;
-    g_shell_pid = fork();
-    if (g_shell_pid == 0) {
-        // Lead our own process group so xshell + every app it launches can be
-        // signalled as a unit on shutdown (kill(-g_shell_pid, ...)).
-        setpgid(0, 0);
-
-        int fd = open("/tmp/xshell-boot.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd >= 0) {
-            dup2(fd, STDOUT_FILENO);
-            dup2(fd, STDERR_FILENO);
-            close(fd);
-        }
-        
-        setenv("LD_LIBRARY_PATH", "./out", 1);
-        setenv("XBUS_SOCKET", kSocketPath, 1);
-        
-        if (access("./xshell", X_OK) == 0) {         // dev build (builddir/)
-            execl("./xshell", "xshell", nullptr);
-        } else if (access("./out/xshell", X_OK) == 0) {
-            execl("./out/xshell", "xshell", nullptr);
-        } else if (access("/usr/local/bin/xshell", X_OK) == 0) {
-            execl("/usr/local/bin/xshell", "xshell", nullptr);
-        }
-        std::cerr << "[xserver] FATAL: Failed to exec xshell: " << strerror(errno) << std::endl;
-        exit(1);
-    }
+    // posix_spawn, not fork + setenv/open in the child (unsafe after fork in
+    // this multi-threaded process — spawn_util.h). xshell leads its own process
+    // group so it and every app it launches can be signalled as a unit on
+    // shutdown (kill(-g_shell_pid, ...)); its output goes to /tmp/xshell-boot.log.
+    // ./xshell is the dev build (builddir/).
+    g_shell_pid = spawn::start(
+        spawn::firstExecutable({"./xshell", "./out/xshell", "/usr/local/bin/xshell"}), "xshell", {},
+        {.env = {{"LD_LIBRARY_PATH", "./out"}, {"XBUS_SOCKET", kSocketPath}},
+         .stdout_path = "/tmp/xshell-boot.log",
+         .new_group = true});
+    if (g_shell_pid < 0)
+        std::cerr << "[xserver] FATAL: couldn't start xshell (no binary found)\n";
 }
 
 // Signal the desktop session (xshell + the apps it spawned) to exit. xshell

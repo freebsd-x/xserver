@@ -1,4 +1,5 @@
 #include "xserver/screensaver_service.h"
+#include "xserver/spawn_util.h"
 #include "xserver/lock_service.h"
 #include <iostream>
 #include <cstring>
@@ -58,17 +59,10 @@ void ScreenSaverService::activate() noexcept {
     std::cout << "[ScreenSaverService] Activating (mode=" << mode_.load() << ")\n";
     broadcastState();
 
-    pid_t pid = ::fork();
-    if (pid == 0) {
-        ::setenv("XBUS_SOCKET", "/tmp/freebsdx.sock", 1);
-        const char* mode_str = modeArg(mode_.load());
-        if (::access("./out/screensaver", X_OK) == 0)
-            ::execl("./out/screensaver", "screensaver", mode_str, nullptr);
-        else if (::access("/usr/local/bin/freebsdx-screensaver", X_OK) == 0)
-            ::execl("/usr/local/bin/freebsdx-screensaver",
-                    "freebsdx-screensaver", mode_str, nullptr);
-        ::_exit(1);
-    }
+    // posix_spawn, not fork + setenv (unsafe after fork here — spawn_util.h).
+    const std::string path = spawn::firstExecutable({"./out/screensaver", "/usr/local/bin/freebsdx-screensaver"});
+    const pid_t pid = spawn::start(path, path.substr(path.rfind('/') + 1), {modeArg(mode_.load())},
+                                   {.env = {{"XBUS_SOCKET", "/tmp/freebsdx.sock"}}});
     if (pid > 0)
         saver_pid_ = pid;
 }
