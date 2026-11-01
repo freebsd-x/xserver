@@ -81,6 +81,14 @@ extern "C" void crashHandler(int sig, siginfo_t* info, void*) noexcept {
 }  // namespace
 
 void installCrashHandler(const char* proc_name) noexcept {
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+    // ASan's own SEGV/BUS handler reports the faulting access with a
+    // symbolized stack; ours would replace it with a bare backtrace.
+    (void)proc_name;
+    return;
+#  endif
+#endif
     // Build the spool path once, here (not in the handler).
     const char* home = getenv("HOME");
     if (home && *home) {

@@ -34,12 +34,33 @@ inline std::string executable(int fd) {
     return ::realpath(path, real) ? std::string(real) : std::string(path);
 }
 
-// Is `exe` one of the desktop's own binaries named `name` — built (./, ./out/)
-// or installed (/usr/local/bin/)?
+// The directory of this process's own executable (with a trailing '/'), or "".
+inline const std::string& ownDirectory() {
+    static const std::string dir = [] {
+        char path[PATH_MAX] = {};
+        size_t plen = sizeof(path) - 1;
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+        if (::sysctl(mib, 4, path, &plen, nullptr, 0) != 0) return std::string();
+        char real[PATH_MAX];
+        std::string p = ::realpath(path, real) ? std::string(real) : std::string(path);
+        auto slash = p.rfind('/');
+        return slash == std::string::npos ? std::string() : p.substr(0, slash + 1);
+    }();
+    return dir;
+}
+
+// Is `exe` one of the desktop's own binaries named `name` — built (./, ./out/,
+// or next to the compositor itself, e.g. a sanitizer build in out-asan/) or
+// installed (/usr/local/bin/)? Trusting the compositor's own directory adds
+// nothing: whoever can write there can already replace the compositor.
 inline bool isBuiltin(const std::string& exe, const std::string& name) {
     if (exe.empty()) return false;
+    const std::string& own = ownDirectory();
     for (const std::string& cand : {"./" + name, "./out/" + name, "./out/" + name + "_app",
+                                    own.empty() ? std::string() : own + name,
+                                    own.empty() ? std::string() : own + name + "_app",
                                     "/usr/local/bin/" + name}) {
+        if (cand.empty()) continue;
         char real[PATH_MAX];
         if (::realpath(cand.c_str(), real) && exe == real) return true;
     }

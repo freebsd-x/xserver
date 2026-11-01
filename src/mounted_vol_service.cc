@@ -20,7 +20,12 @@ std::vector<shared::VolumeEntry> enumerate() {
         shared::VolumeEntry e{};
         uint64_t bsize = s.f_bsize ? s.f_bsize : 512;
         e.total_kb_ = static_cast<uint64_t>(s.f_blocks) * bsize / 1024;
-        e.used_kb_  = static_cast<uint64_t>(s.f_blocks - s.f_bfree) * bsize / 1024;
+        // f_bfree is signed and some filesystems (tmpfs, nullfs, fdescfs)
+        // report more free than total or a negative count; unclamped, the
+        // subtraction wrapped to ~2^64 KB "used".
+        uint64_t bfree = s.f_bfree > 0 ? static_cast<uint64_t>(s.f_bfree) : 0;
+        uint64_t blocks = static_cast<uint64_t>(s.f_blocks);
+        e.used_kb_  = (blocks > bfree ? blocks - bfree : 0) * bsize / 1024;
         std::strncpy(e.mount_,  s.f_mntonname,   sizeof(e.mount_) - 1);
         std::strncpy(e.fstype_, s.f_fstypename,  sizeof(e.fstype_) - 1);
         e.readonly_ = (s.f_flags & MNT_RDONLY) ? 1u : 0u;
