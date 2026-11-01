@@ -7,7 +7,6 @@
 #include "xserver/ipc_socket.h"
 #include <security/pam_appl.h>
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <signal.h>
@@ -54,75 +53,19 @@ static int pam_conv_fn(int num_msg, const struct pam_message** msgs,
     return PAM_SUCCESS;
 }
 
-// Try the setuid-root xauthcheck helper. Returns 1 on auth success, 0 on
-// auth failure, -1 if the helper is unavailable (so the caller can fall back to
-// in-process PAM, which works when the compositor itself runs as root).
-// Declared in xserver/auth_helper.h; also used by LockService.
-int authViaHelper(const char* user, const char* password) noexcept {
-    const char* candidates[] = {
-        "./out/xauthcheck", "./xauthcheck",
-        "/usr/local/libexec/xauthcheck", "/usr/local/bin/xauthcheck",
-    };
-    // Only use a candidate that is actually setuid root — otherwise it would run
-    // with our own (unprivileged) uid and couldn't read the shadow DB anyway. A
-    // plain build-dir copy (not yet `meson install`ed) is skipped, and if none
-    // qualify we return -1 so the caller falls back to in-process PAM (which
-    // works when the compositor itself is run as root).
-    const char* path = nullptr;
-    for (const char* c : candidates) {
-        struct stat st;
-        if (::stat(c, &st) == 0 && st.st_uid == 0 && (st.st_mode & S_ISUID) &&
-            ::access(c, X_OK) == 0) {
-            path = c;
-            break;
-        }
-    }
-    if (!path) return -1;
-
-    int in_pipe[2];
-    if (::pipe(in_pipe) != 0) return -1;
-    pid_t pid = ::fork();
-    if (pid < 0) { ::close(in_pipe[0]); ::close(in_pipe[1]); return -1; }
-    if (pid == 0) {
-        ::dup2(in_pipe[0], STDIN_FILENO);
-        ::close(in_pipe[0]);
-        ::close(in_pipe[1]);
-        ::execl(path, path, static_cast<char*>(nullptr));
-        _exit(127);  // exec failed
-    }
-    ::close(in_pipe[0]);
-    std::string payload = std::string(user) + "\n" + password + "\n";
-    size_t off = 0;
-    while (off < payload.size()) {
-        ssize_t w = ::write(in_pipe[1], payload.data() + off, payload.size() - off);
-        if (w <= 0) break;
-        off += static_cast<size_t>(w);
-    }
-    // Scrub the plaintext password from our heap before the buffer is freed —
-    // explicit_bzero isn't elided by the optimizer like memset can be.
-    ::explicit_bzero(payload.data(), payload.size());
-    ::close(in_pipe[1]);
-    int status = 0;
-    if (::waitpid(pid, &status, 0) < 0) return -1;
-    if (WIFEXITED(status)) {
-        int code = WEXITSTATUS(status);
-        if (code == 127) return -1;   // helper couldn't exec → fall back
-        return code == 0 ? 1 : 0;
-    }
-    return 0;
-}
-
 // Shared full-chain password check (declared in auth_helper.h). Both the login
 // greeter and the screen locker route through this so they enforce identical
 // policy — notably pam_acct_mgmt on the in-process fallback, which login's old
 // inline path skipped (a disabled/expired account could have logged in).
 bool pamAuthenticateFull(const char* service, const char* user,
                          const char* password) noexcept {
-    // Preferred: the xsessiond daemon (does PAM as root). Then the setuid-root
-    // helper. Both keep the compositor unprivileged; only fall back to
-    // in-process PAM (below) if neither is available (i.e. we run as root).
+    // The xsessiond daemon does PAM as root, keeping the compositor
+    // unprivileged. Without it, fall back to in-process PAM (below), which
+    // only works when the compositor itself runs as root.
     if (int s = authViaXsessiond(user, password); s >= 0) return s == 1;
-    if (int h = authViaHelper(user, password); h >= 0) return h == 1;
+    if (::geteuid() != 0)
+        std::cerr << "[auth] xsessiond unreachable and not root: PAM can't read the "
+                     "password database (start xsessiond)\n";
 
     PamData pd{password};
     struct pam_conv conv{pam_conv_fn, &pd};

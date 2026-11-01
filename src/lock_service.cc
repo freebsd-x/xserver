@@ -33,8 +33,7 @@ bool LockService::pamAuthenticate(const char* user, const char* password) noexce
         user = ::getenv("USER");
         if (!user) user = "root";
     }
-    // Shared full chain (xsessiond → setuid helper → in-process PAM w/
-    // pam_acct_mgmt) — identical policy to the login greeter. See auth_helper.h.
+    // Shared full chain (xsessiond → in-process PAM w/ pam_acct_mgmt) — identical policy to the login greeter. See auth_helper.h.
     return pamAuthenticateFull("freebsdx", user, password);
 }
 

@@ -13,7 +13,7 @@ Landed so far:
 
 **Phase 1a — hosting the PAM check in the daemon:**
 - `include/xserver/sessiond_protocol.h` — versioned SEQPACKET wire protocol.
-- `src/xsessiond.cc` — the root daemon: single-process `poll()` event loop
+- `daemons/xsessiond/xsessiond.cc` — the root daemon: single-process `poll()` event loop
   (one `Session` per connection fd), PAM (`pam_authenticate` + `pam_acct_mgmt`),
   env-scrubbed. Target `xsessiond`. (Originally accept-fork; converted to a
   single-process event loop as phase-2b groundwork — see the 2b note below.)
@@ -52,7 +52,7 @@ only owns the accounting. This is the last piece of phase 1.
   SCM_RIGHTS buffer** (result ≥ 0 is the device id, result < 0 a negative
   errno), and `CloseDevice{id}` → `DeviceClosed`. New `kCapDevice` bit in the
   `Welcome` caps.
-- Daemon (`src/xsessiond.cc`): `device_open()` `realpath()`s the request and
+- Daemon (`daemons/xsessiond/xsessiond.cc`): `device_open()` `realpath()`s the request and
   requires it to resolve under an allowlist (`/dev/drm/`, `/dev/dri/`,
   `/dev/input/`; char-device only) so the root daemon can't be coaxed into
   handing out arbitrary files; `send_device_fd()` passes the fd via
@@ -123,7 +123,7 @@ which fbx already owns:
 | Open DRM/input nodes, pass fds, VT switching | external `seatd` via `libseat` | seatd |
 | Who is logged in / which session is active | *nobody* (implicit, single session) | — |
 | Greeter spawn, session (xshell) spawn | `LoginService` | fbx |
-| PAM password check | `xauthcheck` (setuid helper) | fbx |
+| PAM password check | `xauthcheck` (setuid helper; retired 2026-11-01 — now xsessiond) | fbx |
 
 seatd owns only the **device/VT half**. fbx already owns the **login/session
 half**. A unified `xsessiond` would merge both behind the API seam we already
@@ -211,12 +211,13 @@ milestone never comes, keeping `seatd` is correct (see §11).
 - `LockSession` / `UnlockSession(secret)` — the locker calls `Authenticate`
   against the *owning* uid rather than spawning anything.
 
-### 4e. Auth (was: xauthcheck)
-- The PAM check moves *into* xsessiond (already root, no separate setuid binary
-  needed). `xauthcheck` can be retired, OR kept as the fallback for
-  configurations that run without xsessiond. `authViaHelper` becomes
-  `authViaSessiond` — same 1/0/-1 contract, so `LoginService`/`LockService`
-  callers barely change.
+### 4e. Auth (was: xauthcheck) — DONE
+- The PAM check lives *in* xsessiond (already root, no separate setuid binary).
+  **`xauthcheck` was retired (2026-11-01):** login/unlock were live-confirmed
+  through xsessiond, the helper wasn't installed, and an installed setuid
+  helper was an unthrottled password oracle for any local user (the
+  AuthThrottle gate lives in the compositor, not the helper). The chain is now
+  xsessiond → in-process PAM (root-run dev compositors only).
 
 ## 5. Protocol (native, versioned)
 
@@ -301,10 +302,10 @@ riskiest privileged code paths from the compositor process.
   the connected socket's `SO_PEERCRED`/`getpeereid` (uid), not by anything in the
   message.
 - **Secret handling:** password bytes arrive over the SEQPACKET socket (not
-  argv/env), are fed straight to PAM, and are zeroed after. Same discipline as
-  `xauthcheck` today.
+  argv/env), are fed straight to PAM, and are zeroed after (the discipline the
+  retired `xauthcheck` helper used).
 - **No env trust in the exec path** (the setuid-hygiene lesson from
-  `authcheck.cc`): build the child env explicitly.
+  the retired `xauthcheck.cc`): build the child env explicitly.
 - **Denial of service:** cap in-flight requests per client; `DisableAck` timeout
   bounds a misbehaving client's ability to stall a VT switch.
 
@@ -369,7 +370,7 @@ live seat.
 3. **Native VT switching.** Replace the internal seatd dependency with the §6
    state machine. Gated behind a config flag; A/B against seatd. **Test only on a
    disposable machine.**
-4. **Retire seatd + xauthcheck** once phase 3 is proven on hardware.
+4. **Retire seatd** once phase 3 is proven on hardware (xauthcheck: retired).
 
 Stopping after phase 1 is a perfectly good outcome; so is stopping after 2a with
 device brokering proven but not yet cut over.

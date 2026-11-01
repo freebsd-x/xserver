@@ -80,23 +80,12 @@ executable('xserver',
   install : true,
 )
 
-# Tiny setuid-root PAM helper: lets the unprivileged compositor verify a
-# password without running the whole display server as root. install_mode makes
-# `sudo meson install` set it setuid root (owner root, mode 4755) automatically —
-# exactly how the base system ships su/login — so no manual chmod is needed.
-executable('xauthcheck',
-  ['src/xauthcheck.cc'],
-  dependencies : [libpam_dep],
-  install      : true,
-  install_mode : ['rwsr-xr-x', 'root', 'root'],
-)
-
 # xsessiond: unified seat + session daemon (phase 1 = authentication). Runs as
 # root so the unprivileged compositor can verify a password over a socket
 # instead of a per-check setuid exec. Standalone: libpam only. See
 # docs/xsessiond-design.md.
 xsessiond_exe = executable('xsessiond',
-  ['src/xsessiond.cc'],
+  ['daemons/xsessiond/xsessiond.cc'],
   include_directories : inc_dir,   # needs xserver/xsessiond_protocol.h
   dependencies : [libpam_dep, libseat_dep],   # libseat: opt-in phase-2b client mode
   install      : true,

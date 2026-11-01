@@ -2,8 +2,8 @@
 //
 // See core/xserver/docs/xsessiond-design.md. Phase 1 hosts the PAM check in a
 // persistent root daemon so the unprivileged compositor can verify a password
-// without a per-check setuid exec (it supersedes xauthcheck; that helper
-// stays as a fallback). Phase 2a adds device brokering (fd passing over
+// without a per-check setuid exec (it superseded the setuid xauthcheck helper,
+// since removed). Phase 2a adds device brokering (fd passing over
 // SCM_RIGHTS); later phases add VT switching and session activation behind the
 // same socket.
 //
