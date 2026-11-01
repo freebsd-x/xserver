@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +30,7 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
-#include <semaphore>
+#include <deque>
 #include <string>
 #include <thread>
 
@@ -45,8 +46,18 @@ constexpr const char* kUserAgent = "FreeBSD-X/1.0 (xfetch; +https://github.com/f
 
 std::shared_ptr<xserver::IpcSocket> g_sock;
 std::mutex                          g_send_mu;
-std::counting_semaphore<6>          g_slots{6};   // concurrent transfers
 fs::path                            g_cache_dir;
+
+// Requests queue here for the network thread, which runs every transfer in
+// ONE curl multi handle: requests to a host share its connection (HTTP/2
+// streams, multiplexed), so a screenful of map tiles costs one TLS handshake
+// and arrives about as fast as the server sends them. (One easy handle per
+// request paid a handshake per tile; six pooled ones still took ~2x longer.)
+struct Job { uint32_t txn; std::string url; std::chrono::steady_clock::time_point queued; };
+const bool g_trace = std::getenv("FBX_FETCH_TRACE") != nullptr;   // per-request timing to the log
+std::mutex              g_jobs_mu;
+std::deque<Job>         g_jobs;
+std::atomic<CURLM*>     g_multi{nullptr};   // set once the network thread is up
 
 // Cache file name: FNV-1a 64 of the URL, in hex.
 std::string cacheName(const std::string& url) {
@@ -90,13 +101,12 @@ size_t onData(char* p, size_t sz, size_t n, void* ud) {
     return sz * n;
 }
 
-shared::FetchStatus httpGet(const std::string& url, std::string& body, long& code) {
-    CURL* c = curl_easy_init();
-    if (!c) return shared::FetchStatus::NetworkError;
+// Options for one transfer (its body accumulates in *body).
+void setOptions(CURL* c, const std::string& url, std::string* body) {
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_USERAGENT, kUserAgent);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, onData);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, body);
     // No redirects: a redirect could lead off the allowlisted host.
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
@@ -105,13 +115,7 @@ shared::FetchStatus httpGet(const std::string& url, std::string& body, long& cod
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(c, CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(kMaxBody));
-    CURLcode rc = curl_easy_perform(c);
-    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-    curl_easy_cleanup(c);
-    if (rc == CURLE_WRITE_ERROR || rc == CURLE_FILESIZE_EXCEEDED) return shared::FetchStatus::TooLarge;
-    if (rc != CURLE_OK) return shared::FetchStatus::NetworkError;
-    if (code < 200 || code >= 300) return shared::FetchStatus::HttpError;
-    return shared::FetchStatus::Ok;
+    curl_easy_setopt(c, CURLOPT_PIPEWAIT, 1L);   // wait to multiplex rather than open another connection
 }
 
 // The body in a sealed-for-reading anonymous shm object.
@@ -142,24 +146,9 @@ void reply(uint32_t txn, const shared::FetchReply& r, int fd) {
     (void)g_sock->sendMessage({reinterpret_cast<const uint8_t*>(&m), sizeof(m)}, fd);
 }
 
-void serve(uint32_t txn, std::string url) {
-    g_slots.acquire();
-    shared::FetchReply r{};
-    bool cacheable = false;
-    std::string body;
-    if (!xserver::fetch_policy::knownHost(url, &cacheable)) {
-        r.status_ = static_cast<int32_t>(shared::FetchStatus::Denied);
-    } else if (cacheable && readCache(url, body)) {
-        r.status_ = static_cast<int32_t>(shared::FetchStatus::Ok);
-        r.http_status_ = 200;
-        r.from_cache_ = 1;
-    } else {
-        long code = 0;
-        auto st = httpGet(url, body, code);
-        r.status_ = static_cast<int32_t>(st);
-        r.http_status_ = static_cast<uint32_t>(code);
-        if (st == shared::FetchStatus::Ok && cacheable) writeCache(url, body);
-    }
+// Answer one request: the body (if ok) goes in a read-only shm fd.
+void finish(const Job& job, shared::FetchReply r, const std::string& body,
+            std::chrono::steady_clock::time_point started) {
     int fd = -1;
     if (r.status_ == static_cast<int32_t>(shared::FetchStatus::Ok)) {
         fd = bodyFd(body);
@@ -167,10 +156,95 @@ void serve(uint32_t txn, std::string url) {
         else r.size_ = body.size();
     }
     if (r.status_ != static_cast<int32_t>(shared::FetchStatus::Ok))
-        LOG_INFO("{} → status {} (HTTP {})", url, r.status_, r.http_status_);
-    reply(txn, r, fd);
+        LOG_INFO("{} → status {} (HTTP {})", job.url, r.status_, r.http_status_);
+    reply(job.txn, r, fd);
     if (fd >= 0) ::close(fd);
-    g_slots.release();
+    if (g_trace) {
+        using ms = std::chrono::milliseconds;
+        const auto end = std::chrono::steady_clock::now();
+        LOG_INFO("trace {} waited {} ms, took {} ms{}", job.url,
+                 std::chrono::duration_cast<ms>(started - job.queued).count(),
+                 std::chrono::duration_cast<ms>(end - started).count(), r.from_cache_ ? " (cache)" : "");
+    }
+}
+
+struct Transfer {
+    Job         job;
+    std::string body;
+    bool        cacheable = false;
+    std::chrono::steady_clock::time_point started;
+};
+
+// The network thread: takes queued requests, answers policy refusals and cache
+// hits at once, and runs everything else concurrently in one multi handle.
+void networkLoop() {
+    CURLM* multi = curl_multi_init();
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, 2L);   // be a polite tile client
+    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 6L);
+    g_multi = multi;
+    while (true) {
+        std::deque<Job> jobs;
+        {
+            std::lock_guard<std::mutex> lk(g_jobs_mu);
+            jobs.swap(g_jobs);
+        }
+        for (Job& job : jobs) {
+            const auto now = std::chrono::steady_clock::now();
+            shared::FetchReply r{};
+            bool cacheable = false;
+            std::string body;
+            if (!xserver::fetch_policy::knownHost(job.url, &cacheable)) {
+                r.status_ = static_cast<int32_t>(shared::FetchStatus::Denied);
+                finish(job, r, body, now);
+            } else if (cacheable && readCache(job.url, body)) {
+                r.status_ = static_cast<int32_t>(shared::FetchStatus::Ok);
+                r.http_status_ = 200;
+                r.from_cache_ = 1;
+                finish(job, r, body, now);
+            } else if (CURL* c = curl_easy_init()) {
+                auto* t = new Transfer{std::move(job), {}, cacheable, now};
+                setOptions(c, t->job.url, &t->body);
+                curl_easy_setopt(c, CURLOPT_PRIVATE, t);
+                curl_multi_add_handle(multi, c);
+            } else {
+                r.status_ = static_cast<int32_t>(shared::FetchStatus::NetworkError);
+                finish(job, r, body, now);
+            }
+        }
+
+        int running = 0;
+        curl_multi_perform(multi, &running);
+        int left = 0;
+        while (CURLMsg* msg = curl_multi_info_read(multi, &left)) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            CURL* c = msg->easy_handle;
+            Transfer* t = nullptr;
+            curl_easy_getinfo(c, CURLINFO_PRIVATE, &t);
+            long code = 0;
+            curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+            const CURLcode rc = msg->data.result;
+            shared::FetchReply r{};
+            r.http_status_ = static_cast<uint32_t>(code);
+            if (rc == CURLE_WRITE_ERROR || rc == CURLE_FILESIZE_EXCEEDED)
+                r.status_ = static_cast<int32_t>(shared::FetchStatus::TooLarge);
+            else if (rc != CURLE_OK)
+                r.status_ = static_cast<int32_t>(shared::FetchStatus::NetworkError);
+            else if (code < 200 || code >= 300)
+                r.status_ = static_cast<int32_t>(shared::FetchStatus::HttpError);
+            else
+                r.status_ = static_cast<int32_t>(shared::FetchStatus::Ok);
+            if (r.status_ == static_cast<int32_t>(shared::FetchStatus::Ok) && t->cacheable)
+                writeCache(t->job.url, t->body);
+            finish(t->job, r, t->body, t->started);
+            curl_multi_remove_handle(multi, c);
+            curl_easy_cleanup(c);
+            delete t;
+        }
+        // Sleep until a socket is ready, a timer is due, or main() queues a
+        // request (curl_multi_wakeup).
+        curl_multi_poll(multi, nullptr, 0, 1000, nullptr);
+    }
 }
 
 }  // namespace
@@ -203,9 +277,11 @@ int main() {
         std::lock_guard<std::mutex> lk(g_send_mu);
         (void)g_sock->sendMessage({reinterpret_cast<const uint8_t*>(&reg), sizeof(reg)});
     }
+    std::thread(networkLoop).detach();
     LOG_INFO("serving com.freebsdx.Fetch (cache: {})", g_cache_dir.empty() ? "none" : g_cache_dir.string());
 
     // Every connection also gets the compositor's broadcasts; only relayed Gets matter.
+    // The compositor caps relayed requests (kMaxPending), which bounds this queue.
     while (true) {
         auto res = g_sock->receiveMessage();
         if (!res) break;   // the compositor went away: so do we
@@ -219,7 +295,11 @@ int main() {
         shared::FetchRequest req{};
         std::memcpy(&req, m.payload_, sizeof(req));
         req.url_[sizeof(req.url_) - 1] = '\0';
-        std::thread(serve, m.transaction_id_, std::string(req.url_)).detach();
+        {
+            std::lock_guard<std::mutex> lk(g_jobs_mu);
+            g_jobs.push_back({m.transaction_id_, std::string(req.url_), std::chrono::steady_clock::now()});
+        }
+        if (CURLM* multi = g_multi.load()) curl_multi_wakeup(multi);
     }
     LOG_INFO("compositor closed the connection; exiting");
     std::_Exit(0);   // detached transfers may be mid-request: skip atexit teardown
