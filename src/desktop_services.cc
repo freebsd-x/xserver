@@ -1,4 +1,5 @@
 #include "xserver/desktop_services.h"
+#include "xserver/peer_identity.h"
 #include "xserver/desktop_parse.h"
 #include "xserver/applimit_parse.h"
 #include "xserver/app_sandbox_service.h"
@@ -127,13 +128,26 @@ std::vector<InstalledApp> installedApps() noexcept {
         if (de.path().extension() != ".xapp") continue;
         auto json = readFile((de.path() / "manifest.json").string());
         if (!json) continue;
-        InstalledApp a{desktop::jsonString(*json, "identifier"), desktop::jsonString(*json, "name"), {}};
+        InstalledApp a{desktop::jsonString(*json, "identifier"), desktop::jsonString(*json, "name"), {}, {}};
         std::string exe = desktop::jsonString(*json, "executable");
         if (!exe.empty()) a.exec = std::filesystem::absolute(de.path() / exe, ec).string();
+        a.base = exe.empty() ? de.path().stem().string() : std::filesystem::path(exe).filename().string();
+        for (char& c : a.base) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         if (!a.id.empty() && a.id.size() < 32 && !a.name.empty()) out.push_back(std::move(a));
     }
     std::sort(out.begin(), out.end(), [](const InstalledApp& a, const InstalledApp& b) { return a.name < b.name; });
     return out;
+}
+
+std::string verifiedAppId(int fd) noexcept {
+    const std::string exe = peer::executable(fd);
+    if (exe.empty()) return {};
+    for (const auto& a : installedApps()) {
+        if (peer::isBuiltin(exe, a.base)) return a.id;            // out/<base>[_app], installed
+        char real[PATH_MAX];
+        if (!a.exec.empty() && ::realpath(a.exec.c_str(), real) && exe == real) return a.id;   // the bundle's binary
+    }
+    return {};
 }
 
 // ── AppPermsService ──────────────────────────────────────────────────────────

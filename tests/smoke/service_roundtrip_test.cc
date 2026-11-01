@@ -47,6 +47,7 @@
 #include "xserver/keymap_service.h"
 #include "xserver/adblock_service.h"
 #include "xserver/adblock_apply.h"
+#include "xserver/consent_broker.h"
 #include "xserver/location_service.h"
 #include "xserver/kbd_backlight_service.h"
 #include "xserver/energy_service.h"
@@ -771,6 +772,32 @@ TEST_F(ServiceRoundtrip, AdBlockDownloadsAppliesAndRemoves) {
     EXPECT_EQ(readHomeFile(hosts), "127.0.0.1 localhost\n");
 
     AdBlockService::setBackend({});
+}
+
+// ── First-use consent: held requests are replayed once, in order ────────────
+
+TEST_F(ServiceRoundtrip, ConsentHoldsRequestsAndReplaysThemOnTheAnswer) {
+    std::vector<uint32_t> replayed;
+    fbx::xserver::consent::setReplay([&](std::shared_ptr<IpcSocket>, const XBusMessage& m) {
+        replayed.push_back(m.transaction_id_);
+    });
+    auto p = makePipe();
+    XBusMessage a = makeReq("com.freebsdx.Camera", 0x01, 0x7c000001);
+    XBusMessage b = makeReq("com.freebsdx.Camera", 0x01, 0x7c000002);
+    fbx::xserver::consent::hold("com.freebsdx.camera", "Camera", 1, p.svc, a);
+    fbx::xserver::consent::hold("com.freebsdx.camera", "Camera", 1, p.svc, b);
+    fbx::xserver::consent::hold("com.freebsdx.camera", "Camera", 2, p.svc, a);   // another question
+    EXPECT_EQ(fbx::xserver::consent::pending("com.freebsdx.camera", 1), 2u);
+
+    fbx::xserver::consent::resolve("com.freebsdx.camera", 1);
+    EXPECT_EQ(replayed, (std::vector<uint32_t>{0x7c000001, 0x7c000002}));
+    EXPECT_EQ(fbx::xserver::consent::pending("com.freebsdx.camera", 1), 0u);
+    EXPECT_EQ(fbx::xserver::consent::pending("com.freebsdx.camera", 2), 1u);   // still waiting
+
+    fbx::xserver::consent::resolve("com.freebsdx.camera", 1);                   // nothing left: no replay
+    EXPECT_EQ(replayed.size(), 2u);
+    fbx::xserver::consent::resolve("com.freebsdx.camera", 2);
+    fbx::xserver::consent::setReplay(nullptr);
 }
 
 // ── Keymap: SetLayout persists a valid layout, rejects a bogus one ────────────

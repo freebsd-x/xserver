@@ -16,8 +16,14 @@ struct InstalledApp {
     std::string id;     // manifest identifier
     std::string name;
     std::string exec;   // bundle dir + manifest "executable"
+    std::string base;   // binary name the build produces (out/<base>[_app]), lowercased
 };
 [[nodiscard]] std::vector<InstalledApp> installedApps() noexcept;   // sorted by name
+
+// The installed app whose binary the peer on `fd` is running (built out/<name>
+// or the bundle's own), by executable — never by the client's self-declared
+// XAPP_ID. "" if it isn't one of the installed apps.
+[[nodiscard]] std::string verifiedAppId(int fd) noexcept;
 
 // com.freebsdx.AppPerms — camera / microphone / location per installed app
 // (the .xapp bundles in the apps dir from init(), by manifest identifier,

@@ -15,6 +15,13 @@ std::string PermissionStore::resolvePath(const std::string& path) const {
     return std::string(home ? home : "/tmp") + "/.freebsdx/app-permissions";
 }
 
+bool PermissionStore::decided(const std::string& app, Capability cap) const noexcept {
+    if (cap >= kNumCaps) return false;
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = apps_.find(app);
+    return it != apps_.end() && it->second.set[cap];
+}
+
 bool PermissionStore::isAllowed(const std::string& app, Capability cap) const noexcept {
     if (cap >= kNumCaps) return false;
     std::lock_guard<std::mutex> lk(mutex_);

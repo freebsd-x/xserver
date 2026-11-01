@@ -1,6 +1,8 @@
 #include "xserver/shell_input_region.h"
 #include "xserver/xbus_dispatcher.h"
 #include "xserver/peer_identity.h"
+#include "xserver/consent_broker.h"
+#include "xserver/desktop_services.h"
 #include "xserver/vulkan_compositor.h"
 #include "xserver/display_service.h"
 #include "xserver/drm_device.h"
@@ -233,6 +235,35 @@ static bool appMayCall(const shared::XBusMessage& m, int fd) noexcept {
     if (svc == "com.freebsdx.Configuration")   // screen lock, firewall, location… settings
         return op == 0x01 /* GetValue */ || from({"settings"});
     return true;
+}
+
+// Runtime permissions (camera, microphone, screen capture). The app is
+// identified by its executable, never by its self-declared XAPP_ID (an app
+// could otherwise claim another app's grants), and an installed app is gated
+// whether or not it has entered its sandbox yet — apps make their first calls
+// from on_init, before cap_enter(), which used to skip the gate entirely.
+// Undecided → the request is held and the user is asked (consent_broker.h);
+// the answer replays it. The shell, and unrecognised unsandboxed clients (the
+// Wayland bridge relaying a screencast), aren't gated.
+enum class Gate { Allow, Deny, Held };
+static Gate gatePermission(const std::shared_ptr<IpcSocket>& client, const shared::XBusMessage& msg,
+                           PermissionStore::Capability cap, const char* what) noexcept {
+    if (client->isTrusted()) return Gate::Allow;
+    const std::string app = verifiedAppId(client->fd());
+    if (app.empty()) {
+        if (!client->isSandboxed()) return Gate::Allow;
+        SecurityEventsService::record("perm-deny", client->appId(), std::string(what) + " (unknown app)", false);
+        return Gate::Deny;
+    }
+    if (AppSandboxService::isAllowed(app, cap)) return Gate::Allow;
+    if (!AppSandboxService::decided(app, cap)) {
+        std::string name = app;
+        for (const auto& a : installedApps()) if (a.id == app) name = a.name;
+        consent::hold(app, name, cap, client, msg);
+        return Gate::Held;
+    }
+    SecurityEventsService::record("perm-deny", app, what, false);
+    return Gate::Deny;
 }
 
 static const ShellOnlyService* shellOnlyService(const char* name) noexcept {
@@ -486,6 +517,22 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
 
     const bool trusted = client->isTrusted(); // true only for the shell (surface 999)
 
+    // A request held for a first-use permission answer is replayed through
+    // here, with the compositor and window stack of the latest call.
+    static VulkanCompositor* s_comp = nullptr;
+    static WindowStack*      s_stack = nullptr;
+    if (comp) s_comp = comp;
+    if (stack) s_stack = stack;
+    static const bool replay_set = [] {
+        consent::setReplay([](std::shared_ptr<IpcSocket> c, const shared::XBusMessage& m) {
+            UniqueFd none;
+            (void)XBusDispatcher::ProcessMessage(c, {reinterpret_cast<const uint8_t*>(&m), sizeof(m)},
+                                                 none, s_comp, s_stack);
+        });
+        return true;
+    }();
+    (void)replay_set;
+
     // Automation injects input and reads pixels: the test harness's, or the
     // shell's — never an arbitrary app's on a live seat.
     if (std::strcmp(msg->service_name_, "com.freebsdx.Automation") == 0) {
@@ -511,10 +558,11 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // apps. (OpenStream can't yet be gated for capture specifically — it's
         // also the playback path — until AudioStreamRequest carries a direction
         // flag; tracked as a protocol follow-up.)
-        if (client->isSandboxed() &&
-            msg->opcode_ == static_cast<uint32_t>(shared::AudioOpcode::ListSources) &&
-            !AppSandboxService::isAllowed(client->appId(), PermissionStore::Microphone)) {
-            SecurityEventsService::record("perm-deny", client->appId(), "microphone", false);
+        const Gate mic = msg->opcode_ == static_cast<uint32_t>(shared::AudioOpcode::ListSources)
+                       ? gatePermission(client, *msg, PermissionStore::Microphone, "microphone") : Gate::Allow;
+        if (mic == Gate::Held) {
+            // waiting for the user's answer — replayed then
+        } else if (mic == Gate::Deny) {
             shared::XBusMessage resp = *msg;          // empty page reply
             shared::AudioDevicePage pg{};
             std::memcpy(resp.payload_, &pg, sizeof(pg));
@@ -689,9 +737,13 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // Screen-capture permission: a sandboxed app may grab the framebuffer
         // only if the user granted it (was previously ungated — any app could
         // read the whole screen). Deny-by-default; audit refusals.
-        if (msg->opcode_ == 0x01 && client->isSandboxed() &&
-            !AppSandboxService::isAllowed(client->appId(), PermissionStore::ScreenCapture)) {
-            SecurityEventsService::record("perm-deny", client->appId(), "screencapture", false);
+        const Gate cap_gate = msg->opcode_ == 0x01
+                            ? gatePermission(client, *msg, PermissionStore::ScreenCapture, "screencapture")
+                            : Gate::Allow;
+        if (cap_gate == Gate::Held) {
+            // waiting for the user's answer — replayed then
+        }
+        else if (cap_gate == Gate::Deny) {
             shared::XBusMessage resp = *msg;
             shared::ScreencopyFrameInfo fail{};   // zero dims = failure
             std::memcpy(resp.payload_, &fail, sizeof(fail));
@@ -936,11 +988,10 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         // Runtime permission: a sandboxed app may use the camera only if the user
         // granted it (deny-by-default). Was previously a blanket deny for all
         // sandboxed apps; now it's a per-app grant via the AppSandbox panel.
-        if (is_sandboxed &&
-            !AppSandboxService::isAllowed(client->appId(), PermissionStore::Camera)) {
-            SecurityEventsService::record("perm-deny", client->appId(), "camera", false);
-            respond_ok();
-            return {true};
+        switch (gatePermission(client, *msg, PermissionStore::Camera, "camera")) {
+            case Gate::Held: return {true};                  // replayed after the user's answer
+            case Gate::Deny: respond_ok(); return {true};
+            case Gate::Allow: break;
         }
         switch (static_cast<shared::CameraOpcode>(msg->opcode_)) {
             case shared::CameraOpcode::ListDevices: {

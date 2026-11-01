@@ -30,6 +30,10 @@ public:
     // Pure decision: is `cap` allowed for `app`, given stored grants + defaults?
     bool isAllowed(const std::string& app, Capability cap) const noexcept;
 
+    // Has the user ever decided on `cap` for `app` (grant or deny)? An app
+    // that hasn't been decided on is asked once (first-use consent).
+    bool decided(const std::string& app, Capability cap) const noexcept;
+
     // Record a user decision (grant/revoke) and persist. Returns false on a bad
     // capability index.
     bool set(const std::string& app, Capability cap, bool allowed) noexcept;

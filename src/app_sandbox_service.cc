@@ -1,4 +1,5 @@
 #include "xserver/app_sandbox_service.h"
+#include "xserver/consent_broker.h"
 #include "shared/logger.h"
 
 #include <cstring>
@@ -15,6 +16,10 @@ PermissionStore& AppSandboxService::store() noexcept {
 void AppSandboxService::init() noexcept {
     store().load();
     LOG_INFO("AppSandboxService: ready ({} apps with overrides)", store().list().size());
+}
+
+bool AppSandboxService::decided(const std::string& app, PermissionStore::Capability cap) noexcept {
+    return store().decided(app, cap);
 }
 
 bool AppSandboxService::isAllowed(const std::string& app,
@@ -76,9 +81,13 @@ void AppSandboxService::handleMessage(const shared::XBusMessage& msg,
         shared::AppSandboxPermRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         req.identifier_[sizeof(req.identifier_) - 1] = '\0';
-        if (req.permission_ < PermissionStore::kNumCaps)
+        if (req.permission_ < PermissionStore::kNumCaps) {
             setPermission(req.identifier_, static_cast<PermissionStore::Capability>(req.permission_),
                           req.allowed_ != 0);
+            // The answer to a first-use prompt (or a change in Settings):
+            // replay any request that was waiting on it.
+            consent::resolve(req.identifier_, req.permission_);
+        }
         break;
     }
     default:

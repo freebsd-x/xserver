@@ -22,6 +22,7 @@ public:
     // sandboxed clients before a sensitive operation.
     static bool isAllowed(const std::string& app,
                           PermissionStore::Capability cap) noexcept;
+    static bool decided(const std::string& app, PermissionStore::Capability cap) noexcept;
 
     // Record a grant/revoke, persist it and broadcast PermsChanged (also used
     // by com.freebsdx.AppPerms).

@@ -99,3 +99,18 @@ TEST(PermissionStoreTest, RejectsBadCapability) {
     EXPECT_FALSE(s.set("com.x.App", static_cast<Cap>(99), true));
     EXPECT_FALSE(s.isAllowed("com.x.App", static_cast<Cap>(99)));
 }
+
+// First-use consent asks only while a capability is undecided: a revoke counts
+// as a decision too (the user isn't asked again).
+TEST(PermissionStore, DecidedTracksExplicitChoices) {
+    fbx::xserver::PermissionStore ps;
+    using C = fbx::xserver::PermissionStore;
+    EXPECT_FALSE(ps.decided("com.example.app", C::Camera));
+    EXPECT_FALSE(ps.isAllowed("com.example.app", C::Camera));   // deny-by-default
+    ps.set("com.example.app", C::Camera, false);
+    EXPECT_TRUE(ps.decided("com.example.app", C::Camera));
+    EXPECT_FALSE(ps.decided("com.example.app", C::Microphone));
+    ps.set("com.example.app", C::Microphone, true);
+    EXPECT_TRUE(ps.decided("com.example.app", C::Microphone));
+    EXPECT_TRUE(ps.isAllowed("com.example.app", C::Microphone));
+}
