@@ -1,3 +1,5 @@
+#include "xserver/mini_json.h"
+#include "xserver/fetch_broker.h"
 #include "xserver/app_manager_service.h"
 #include "xserver/async_shell.h"
 #include "xserver/ipc_socket.h"
@@ -38,93 +40,7 @@ static std::vector<CatalogEntry> g_catalog;
 static std::time_t               g_catalog_ts{0};
 [[maybe_unused]] static bool                      g_catalog_updating{false};
 
-// ─── Internal JSON helpers (same minimal parser used by MimeService) ──────────
-
-static std::string jsonValue(const std::string& json, const std::string& key) {
-    std::string k = "\"" + key + "\":";
-    size_t pos = json.find(k);
-    if (pos == std::string::npos) return "";
-    size_t s = json.find('"', pos + k.size());
-    if (s == std::string::npos) return "";
-    size_t e = json.find('"', s + 1);
-    if (e == std::string::npos) return "";
-    return json.substr(s + 1, e - s - 1);
-}
-
-static std::vector<std::string> jsonArray(const std::string& json, const std::string& key) {
-    std::vector<std::string> result;
-    std::string k = "\"" + key + "\"";
-    size_t pos = json.find(k);
-    if (pos == std::string::npos) return result;
-    size_t bracket = json.find('[', pos + k.size());
-    if (bracket == std::string::npos) return result;
-    size_t end = json.find(']', bracket);
-    if (end == std::string::npos) return result;
-    std::string arr = json.substr(bracket + 1, end - bracket - 1);
-    size_t i = 0;
-    while (i < arr.size()) {
-        size_t q1 = arr.find('"', i); if (q1 == std::string::npos) break;
-        size_t q2 = arr.find('"', q1 + 1); if (q2 == std::string::npos) break;
-        result.push_back(arr.substr(q1 + 1, q2 - q1 - 1));
-        i = q2 + 1;
-    }
-    return result;
-}
-
-// Iterates through JSON array of objects, extracting a flat list of {key->value} maps.
-// Very minimal: assumes no nested objects inside each package entry.
-static std::vector<std::unordered_map<std::string,std::string>>
-jsonObjectArray(const std::string& json, const std::string& array_key) {
-    std::vector<std::unordered_map<std::string,std::string>> result;
-    std::string k = "\"" + array_key + "\"";
-    size_t pos = json.find(k);
-    if (pos == std::string::npos) return result;
-    size_t bracket = json.find('[', pos + k.size());
-    if (bracket == std::string::npos) return result;
-
-    size_t i = bracket + 1;
-    while (i < json.size()) {
-        // Find next object start
-        size_t obj_start = json.find('{', i);
-        if (obj_start == std::string::npos) break;
-        size_t obj_end = json.find('}', obj_start);
-        if (obj_end == std::string::npos) break;
-        // Check we haven't passed the array end
-        size_t arr_end = json.find(']', bracket + 1);
-        if (obj_start > arr_end) break;
-
-        std::string obj = json.substr(obj_start + 1, obj_end - obj_start - 1);
-        std::unordered_map<std::string,std::string> entry;
-
-        // Extract all "key":"value" pairs from the object string
-        size_t j = 0;
-        while (j < obj.size()) {
-            size_t kq1 = obj.find('"', j); if (kq1 == std::string::npos) break;
-            size_t kq2 = obj.find('"', kq1+1); if (kq2 == std::string::npos) break;
-            std::string key = obj.substr(kq1+1, kq2-kq1-1);
-            size_t colon = obj.find(':', kq2+1); if (colon == std::string::npos) break;
-            size_t vstart = colon + 1;
-            while (vstart < obj.size() && obj[vstart] == ' ') ++vstart;
-            std::string val;
-            if (vstart < obj.size() && obj[vstart] == '"') {
-                size_t vq2 = obj.find('"', vstart+1); if (vq2 == std::string::npos) break;
-                val = obj.substr(vstart+1, vq2-vstart-1);
-                j = vq2 + 1;
-            } else {
-                // Numeric value
-                size_t vend = obj.find_first_of(",}", vstart);
-                val = obj.substr(vstart, vend == std::string::npos ? std::string::npos : vend - vstart);
-                // trim whitespace
-                while (!val.empty() && std::isspace(static_cast<unsigned char>(val.back()))) val.pop_back();
-                j = vend == std::string::npos ? obj.size() : vend + 1;
-            }
-            entry[key] = val;
-        }
-        if (!entry.empty()) result.push_back(std::move(entry));
-        i = obj_end + 1;
-    }
-    return result;
-}
+// JSON scanning of manifests / the catalog: xserver/mini_json.h.
 
 static void loadCatalogFromDisk() noexcept {
     const char* home = std::getenv("HOME");
@@ -137,7 +53,7 @@ static void loadCatalogFromDisk() noexcept {
     std::string json{std::istreambuf_iterator<char>(f), {}};
 
     g_catalog.clear();
-    auto entries = jsonObjectArray(json, "packages");
+    auto entries = mini_json::objectArray(json, "packages");
     for (const auto& e : entries) {
         CatalogEntry ce;
         auto get = [&](const char* k) -> std::string {
@@ -159,7 +75,7 @@ static void loadCatalogFromDisk() noexcept {
     }
 
     // Extract last_updated timestamp if present
-    std::string ts = jsonValue(json, "updated");
+    std::string ts = mini_json::value(json, "updated");
     if (!ts.empty()) g_catalog_ts = std::time(nullptr); // approximate
 }
 
@@ -218,12 +134,12 @@ static BundleMeta readManifest(const fs::path& bundle_dir) noexcept {
     std::ifstream f(path);
     if (!f) return m;
     std::string content((std::istreambuf_iterator<char>(f)), {});
-    m.name       = jsonValue(content, "name");
-    m.version    = jsonValue(content, "version");
-    m.identifier = jsonValue(content, "identifier");
-    m.executable = jsonValue(content, "executable");
-    m.icon       = jsonValue(content, "icon");
-    m.mime_types = jsonArray(content, "mime_types");
+    m.name       = mini_json::value(content, "name");
+    m.version    = mini_json::value(content, "version");
+    m.identifier = mini_json::value(content, "identifier");
+    m.executable = mini_json::value(content, "executable");
+    m.icon       = mini_json::value(content, "icon");
+    m.mime_types = mini_json::array(content, "mime_types");
     m.valid      = !m.name.empty() && !m.identifier.empty();
     return m;
 }
@@ -584,12 +500,10 @@ shared::AppManagerCatalogState AppManagerService::updateCatalog() noexcept {
 
     fs::path cache = fs::path(home) / ".freebsdx-catalog.json";
 
-    // Cap the network fetch: no repo/DNS must never hang the compositor.
-    std::string cmd = "timeout -k 2 20 fetch -q -o \"" + cache.string() + "\" " + kCatalogUrl + " 2>/dev/null"
-                    + " || timeout -k 2 20 curl -s -o \"" + cache.string() + "\" " + kCatalogUrl + " 2>/dev/null";
-    int ret = fbx::xserver::spawnStatus(cmd.c_str());
+    // Through xfetch, capped so a missing repo/DNS never stalls the caller.
+    const bool fetched = FetchBroker::fetchToFile(kCatalogUrl, cache.string(), std::chrono::seconds(20));
 
-    if (ret == 0 && fs::exists(cache)) {
+    if (fetched && fs::exists(cache)) {
         loadCatalogFromDisk();
         st.total_packages_ = static_cast<uint32_t>(g_catalog.size());
         st.last_updated_   = static_cast<uint32_t>(std::time(nullptr));
@@ -651,17 +565,15 @@ void AppManagerService::installRemote(
         }
     }
 
-    // shellQuote the URL and temp path: both derive from client input and go
-    // into a shell command. (Double-quoting alone doesn't stop $(), ``, or ".)
+    // Through xfetch: the URL (from the catalog or the client) must be on a
+    // host the compositor's fetch policy allows — no longer any host at all —
+    // and nothing here goes through a shell.
     std::string tmp = "/tmp/freebsdx-remote-" + id + ".xpkg";
-    std::string cmd = "fetch -q -o " + shellQuote(tmp) + " " + shellQuote(url) + " 2>/dev/null"
-                    + " || curl -s -o " + shellQuote(tmp) + " " + shellQuote(url) + " 2>/dev/null";
 
-    std::thread([cmd, tmp, id, requester]() {
+    std::thread([url, tmp, id, requester]() {
         try {
             BroadcastInstallProgress(id, 10, 0, "Downloading...");
-            int ret = fbx::xserver::spawnStatus(cmd.c_str());
-            if (ret != 0 || !fs::exists(tmp)) {
+            if (!FetchBroker::fetchToFile(url, tmp, std::chrono::seconds(600)) || !fs::exists(tmp)) {
                 BroadcastInstallProgress(id, 0, 2, "Download failed");
                 return;
             }

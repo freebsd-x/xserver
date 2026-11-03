@@ -1,3 +1,4 @@
+#include "xserver/mini_json.h"
 #include "xserver/mime_service.h"
 #include "xserver/ipc_socket.h"
 #include "xserver/config_service.h"
@@ -63,40 +64,7 @@ static constexpr std::pair<std::string_view, std::string_view> kExtMime[] = {
     {".webm",  "video/webm"},
 };
 
-// ─── Internal JSON helpers ────────────────────────────────────────────────────
-
-static std::string jsonValue(const std::string& json, const std::string& key) {
-    std::string k = "\"" + key + "\":";
-    size_t pos = json.find(k);
-    if (pos == std::string::npos) return "";
-    size_t s = json.find('"', pos + k.size());
-    if (s == std::string::npos) return "";
-    size_t e = json.find('"', s + 1);
-    if (e == std::string::npos) return "";
-    return json.substr(s + 1, e - s - 1);
-}
-
-static std::vector<std::string> jsonArray(const std::string& json, const std::string& key) {
-    std::vector<std::string> result;
-    std::string k = "\"" + key + "\"";
-    size_t pos = json.find(k);
-    if (pos == std::string::npos) return result;
-    size_t bracket = json.find('[', pos + k.size());
-    if (bracket == std::string::npos) return result;
-    size_t end = json.find(']', bracket);
-    if (end == std::string::npos) return result;
-    std::string arr = json.substr(bracket + 1, end - bracket - 1);
-    size_t i = 0;
-    while (i < arr.size()) {
-        size_t q1 = arr.find('"', i);
-        if (q1 == std::string::npos) break;
-        size_t q2 = arr.find('"', q1 + 1);
-        if (q2 == std::string::npos) break;
-        result.push_back(arr.substr(q1 + 1, q2 - q1 - 1));
-        i = q2 + 1;
-    }
-    return result;
-}
+// JSON scanning of manifests / the catalog: xserver/mini_json.h.
 
 // ─── MimeService::loadFromAppsDir ────────────────────────────────────────────
 
@@ -111,9 +79,9 @@ void MimeService::loadFromAppsDir(const std::string& apps_dir) noexcept {
             std::ifstream f(manifest);
             std::string content((std::istreambuf_iterator<char>(f)), {});
 
-            std::string id   = jsonValue(content, "identifier");
-            std::string name = jsonValue(content, "name");
-            auto types       = jsonArray(content, "mime_types");
+            std::string id   = mini_json::value(content, "identifier");
+            std::string name = mini_json::value(content, "name");
+            auto types       = mini_json::array(content, "mime_types");
 
             if (id.empty() || types.empty()) continue;
 

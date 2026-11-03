@@ -39,7 +39,7 @@ using namespace fbx;
 
 namespace {
 
-constexpr size_t kMaxBody      = 8u << 20;       // 8 MiB
+constexpr size_t kMaxCached    = 8u << 20;       // cache entries are tiles; anything larger isn't cached
 constexpr long   kTimeoutSec   = 15;
 constexpr time_t kCacheMaxAge  = 7 * 24 * 3600;  // tiles: a week (OSM tile usage policy)
 constexpr const char* kUserAgent = "FreeBSD-X/1.0 (xfetch; +https://github.com/freebsd-x)";
@@ -72,7 +72,7 @@ bool readCache(const std::string& url, std::string& body) {
     if (g_cache_dir.empty()) return false;
     fs::path p = g_cache_dir / cacheName(url);
     struct stat st{};
-    if (::stat(p.c_str(), &st) != 0 || st.st_size <= 0 || static_cast<size_t>(st.st_size) > kMaxBody) return false;
+    if (::stat(p.c_str(), &st) != 0 || st.st_size <= 0 || static_cast<size_t>(st.st_size) > kMaxCached) return false;
     if (std::time(nullptr) - st.st_mtime > kCacheMaxAge) return false;
     std::ifstream f(p, std::ios::binary);
     body.assign(std::istreambuf_iterator<char>(f), {});
@@ -94,19 +94,22 @@ void writeCache(const std::string& url, const std::string& body) {
     if (ec) fs::remove(tmp, ec);
 }
 
+// A body being received, and the most its rule allows (fetch_policy max_bytes).
+struct Sink { std::string data; size_t limit = 0; };
+
 size_t onData(char* p, size_t sz, size_t n, void* ud) {
-    auto* body = static_cast<std::string*>(ud);
-    if (body->size() + sz * n > kMaxBody) return 0;   // aborts the transfer
-    body->append(p, sz * n);
+    auto* sink = static_cast<Sink*>(ud);
+    if (sink->data.size() + sz * n > sink->limit) return 0;   // aborts the transfer
+    sink->data.append(p, sz * n);
     return sz * n;
 }
 
-// Options for one transfer (its body accumulates in *body).
-void setOptions(CURL* c, const std::string& url, std::string* body) {
+// Options for one transfer (its body accumulates in *sink).
+void setOptions(CURL* c, const std::string& url, Sink* sink) {
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_USERAGENT, kUserAgent);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, onData);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, body);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, sink);
     // No redirects: a redirect could lead off the allowlisted host.
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
@@ -114,7 +117,7 @@ void setOptions(CURL* c, const std::string& url, std::string* body) {
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(c, CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(kMaxBody));
+    curl_easy_setopt(c, CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(sink->limit));
     curl_easy_setopt(c, CURLOPT_PIPEWAIT, 1L);   // wait to multiplex rather than open another connection
 }
 
@@ -170,7 +173,7 @@ void finish(const Job& job, shared::FetchReply r, const std::string& body,
 
 struct Transfer {
     Job         job;
-    std::string body;
+    Sink        body;
     bool        cacheable = false;
     std::chrono::steady_clock::time_point started;
 };
@@ -193,8 +196,9 @@ void networkLoop() {
             const auto now = std::chrono::steady_clock::now();
             shared::FetchReply r{};
             bool cacheable = false;
+            size_t limit = 0;
             std::string body;
-            if (!xserver::fetch_policy::knownHost(job.url, &cacheable)) {
+            if (!xserver::fetch_policy::knownHost(job.url, &cacheable, &limit)) {
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::Denied);
                 finish(job, r, body, now);
             } else if (cacheable && readCache(job.url, body)) {
@@ -203,7 +207,7 @@ void networkLoop() {
                 r.from_cache_ = 1;
                 finish(job, r, body, now);
             } else if (CURL* c = curl_easy_init()) {
-                auto* t = new Transfer{std::move(job), {}, cacheable, now};
+                auto* t = new Transfer{std::move(job), {{}, limit}, cacheable, now};
                 setOptions(c, t->job.url, &t->body);
                 curl_easy_setopt(c, CURLOPT_PRIVATE, t);
                 curl_multi_add_handle(multi, c);
@@ -234,9 +238,10 @@ void networkLoop() {
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::HttpError);
             else
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::Ok);
-            if (r.status_ == static_cast<int32_t>(shared::FetchStatus::Ok) && t->cacheable)
-                writeCache(t->job.url, t->body);
-            finish(t->job, r, t->body, t->started);
+            if (r.status_ == static_cast<int32_t>(shared::FetchStatus::Ok) && t->cacheable &&
+                t->body.data.size() <= kMaxCached)
+                writeCache(t->job.url, t->body.data);
+            finish(t->job, r, t->body.data, t->started);
             curl_multi_remove_handle(multi, c);
             curl_easy_cleanup(c);
             delete t;

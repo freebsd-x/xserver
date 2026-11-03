@@ -56,3 +56,27 @@ TEST(FetchPolicy, KnownHostAndCacheability) {
     EXPECT_FALSE(cacheable);   // search results are never cached
     EXPECT_FALSE(fp::knownHost("https://example.com/"));
 }
+
+TEST(FetchPolicy, CompositorServicesHaveTheirOwnHosts) {
+    const auto comp = fp::kCompositor;
+    EXPECT_TRUE(fp::allowed(comp, "https://wttr.in/Paris?format=j1"));
+    EXPECT_TRUE(fp::allowed(comp, "https://pkg.freebsd-x.org/catalog.json"));
+    EXPECT_TRUE(fp::allowed(comp, "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"));
+    // Packages may not come from just anywhere any more.
+    EXPECT_FALSE(fp::allowed(comp, "https://evil.example/app.xpkg"));
+    EXPECT_FALSE(fp::allowed(comp, "http://pkg.freebsd-x.org/catalog.json"));   // https only
+    // ...and an app can't reach the compositor's hosts.
+    EXPECT_FALSE(fp::allowed("com.freebsdx.maps", "https://wttr.in/Paris"));
+    EXPECT_FALSE(fp::allowed("com.freebsdx.maps", "https://pkg.freebsd-x.org/x.xpkg"));
+}
+
+TEST(FetchPolicy, SizeLimitsFollowTheRule) {
+    size_t limit = 0;
+    bool cacheable = true;
+    ASSERT_TRUE(fp::knownHost("https://pkg.freebsd-x.org/big.xpkg", &cacheable, &limit));
+    EXPECT_EQ(limit, 256 * fp::kMiB);   // packages are large
+    EXPECT_FALSE(cacheable);
+    ASSERT_TRUE(fp::knownHost("https://tile.openstreetmap.org/1/0/0.png", &cacheable, &limit));
+    EXPECT_EQ(limit, 8 * fp::kMiB);
+    EXPECT_TRUE(cacheable);
+}

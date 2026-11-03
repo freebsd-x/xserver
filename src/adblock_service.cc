@@ -1,3 +1,4 @@
+#include "xserver/fetch_broker.h"
 #include "xserver/adblock_service.h"
 #include "xserver/adblock.h"
 #include "xserver/async_shell.h"
@@ -33,8 +34,9 @@ AdBlockService::Backend backend() {
     AdBlockService::Backend b = g_backend;
     if (!b.download)
         b.download = [](const std::string& url, const std::string& dest) {
-            // fetch(1), argv only (no shell); -T bounds a stalled transfer.
-            return spawnArgvStatus({"/usr/bin/fetch", "-q", "-T", "60", "-o", dest, url}) == 0;
+            // Through xfetch, under the compositor's fetch policy (the default
+            // list's host is allowed; a custom list on another host is refused).
+            return FetchBroker::fetchToFile(url, dest, std::chrono::seconds(90));
         };
     if (!b.apply)
         b.apply = [](bool on) { return runPrivilegedOp(privops::kAdBlockApply, on ? "1" : "0"); };

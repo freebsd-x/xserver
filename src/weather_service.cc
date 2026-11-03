@@ -4,6 +4,7 @@
 // `fetch` utility every 30 minutes.  Parses temp/condition/wind/humidity
 // and the 3-day forecast from the JSON response.
 
+#include "xserver/fetch_broker.h"
 #include "xserver/weather_service.h"
 #include "xserver/async_shell.h"
 #include "xserver/url_encode.h"
@@ -119,13 +120,11 @@ bool WeatherService::fetchAndStore() noexcept {
     // used to be passed through verbatim (only spaces became '+').
     std::string encoded = xserver::urlEncodeQuery(city);
 
-    // Use fetch (FreeBSD base); fall back to curl. posix_spawn, not popen: popen
-    // forks and deadlocks the child on a libc stdio lock in this multithreaded
-    // compositor (see async_shell.h).
+    // Through xfetch (fetch_policy.h allows the compositor wttr.in): no
+    // network or shell command in the compositor itself.
     std::string url  = "https://wttr.in/" + encoded + "?format=j1";
-    std::string json = xserver::spawnCapture("fetch -qo - '" + url + "' 2>/dev/null");
-    if (json.empty())
-        json = xserver::spawnCapture("curl -sf '" + url + "' 2>/dev/null");
+    auto fetched = xserver::FetchBroker::fetchBlocking(url, std::chrono::seconds(30));
+    std::string json = fetched.ok() ? std::move(fetched.body) : std::string();
 
     if (json.empty() || json.find("current_condition") == std::string::npos) {
         std::cerr << "[WeatherService] empty or invalid response\n";

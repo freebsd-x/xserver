@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -12,18 +13,28 @@
 namespace fbx::xserver::fetch_policy {
 
 struct Rule {
-    const char* app;      // verified app id
+    const char* app;      // verified app id (or kCompositor)
     const char* host;
     bool        https_only;
     bool        cacheable;  // xfetch may answer from (and fill) its disk cache
+    size_t      max_bytes;  // largest body xfetch will accept
 };
 
+// The compositor's own services (weather, the package catalog and downloads,
+// the ad-block list) fetch through xfetch too, under this identity. No app can
+// hold it: the broker refuses an app whose manifest claims it.
+inline constexpr const char* kCompositor = "freebsdx.compositor";
+
+inline constexpr size_t kMiB = 1u << 20;
 inline constexpr Rule kRules[] = {
-    {"com.freebsdx.maps", "tile.openstreetmap.org",      true,  true},
-    {"com.freebsdx.maps", "nominatim.openstreetmap.org", true,  false},
+    {"com.freebsdx.maps", "tile.openstreetmap.org",      true,  true,  8 * kMiB},
+    {"com.freebsdx.maps", "nominatim.openstreetmap.org", true,  false, 1 * kMiB},
     // ip-api's free tier is HTTP-only; Maps uses it only on an explicit,
     // opted-in "My Location" tap (see ipGeoEnabled() in Maps).
-    {"com.freebsdx.maps", "ip-api.com",                  false, false},
+    {"com.freebsdx.maps", "ip-api.com",                  false, false, 1 * kMiB},
+    {kCompositor,         "wttr.in",                     true,  false, 1 * kMiB},
+    {kCompositor,         "pkg.freebsd-x.org",           true,  false, 256 * kMiB},   // catalog + packages
+    {kCompositor,         "raw.githubusercontent.com",   true,  false, 16 * kMiB},    // the default ad-block list
 };
 
 struct Url {
@@ -75,13 +86,22 @@ inline bool allowed(std::string_view app, std::string_view url) {
     return !app.empty() && parse(url, u) && ruleFor(app, u);
 }
 
-// Is `url` allowed for some app (xfetch's own check), and may it be cached?
-inline bool knownHost(std::string_view url, bool* cacheable = nullptr) {
+// Is `url` allowed for some app (xfetch's own check)? Its rule's cacheability
+// and size limit (the most generous of the rules for that host).
+inline bool knownHost(std::string_view url, bool* cacheable = nullptr, size_t* max_bytes = nullptr) {
     Url u;
     if (!parse(url, u)) return false;
-    const Rule* r = ruleFor({}, u);
-    if (r && cacheable) *cacheable = r->cacheable;
-    return r != nullptr;
+    bool found = false, cache = false;
+    size_t limit = 0;
+    for (const Rule& r : kRules)
+        if (u.host == r.host && (u.https || !r.https_only)) {
+            found = true;
+            cache = cache || r.cacheable;
+            limit = std::max(limit, r.max_bytes);
+        }
+    if (cacheable) *cacheable = cache;
+    if (max_bytes) *max_bytes = limit;
+    return found;
 }
 
 }  // namespace fbx::xserver::fetch_policy
