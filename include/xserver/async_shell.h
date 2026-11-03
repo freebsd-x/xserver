@@ -92,6 +92,66 @@ inline int spawnArgvStatus(const std::vector<std::string>& args) noexcept {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+// Run a program with an argv — no shell, so no argument (an SSID, a device, a
+// path) can ever be interpreted as shell syntax — and capture its stdout.
+// args[0] is looked up on PATH like the shell did. Options: `stdin_data` is
+// written to its stdin (secrets such as an API key go here, never in argv,
+// which any local user can read with ps); `timeout_sec` > 0 caps it with
+// timeout(1); stderr goes to /dev/null. `exit_code` gets WEXITSTATUS or -1.
+struct ArgvRun {
+    std::string stdin_data;
+    int         timeout_sec = 0;
+    int*        exit_code = nullptr;
+};
+inline std::string spawnArgvCapture(std::vector<std::string> args, const ArgvRun& opt = {}) noexcept {
+    if (opt.exit_code) *opt.exit_code = -1;
+    if (args.empty()) return {};
+    if (opt.timeout_sec > 0)
+        args.insert(args.begin(), {"timeout", "-k", "2", std::to_string(opt.timeout_sec)});
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+
+    int out_pf[2], in_pf[2] = {-1, -1};
+    if (::pipe2(out_pf, O_CLOEXEC) != 0) return {};
+    if (::pipe2(in_pf, O_CLOEXEC) != 0) { ::close(out_pf[0]); ::close(out_pf[1]); return {}; }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, in_pf[0], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, out_pf[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    pid_t pid = -1;
+    int rc = ::posix_spawnp(&pid, argv[0], &fa, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    ::close(in_pf[0]);
+    ::close(out_pf[1]);
+    if (rc != 0) { ::close(in_pf[1]); ::close(out_pf[0]); return {}; }
+    // Small inputs (headers, a config line) fit the pipe buffer, so writing
+    // them all before reading can't deadlock against the child's stdout.
+    size_t off = 0;
+    while (off < opt.stdin_data.size()) {
+        ssize_t w = ::write(in_pf[1], opt.stdin_data.data() + off, opt.stdin_data.size() - off);
+        if (w <= 0) break;
+        off += static_cast<size_t>(w);
+    }
+    ::close(in_pf[1]);
+    std::string out;
+    char buf[512]; ssize_t n;
+    while ((n = ::read(out_pf[0], buf, sizeof(buf))) > 0) out.append(buf, static_cast<size_t>(n));
+    ::close(out_pf[0]);
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    if (opt.exit_code) *opt.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return out;
+}
+
+// The exit status of an argv run (output discarded). See spawnArgvCapture.
+inline int spawnArgvRun(std::vector<std::string> args, int timeout_sec = 0) noexcept {
+    int code = -1;
+    (void)spawnArgvCapture(std::move(args), {.timeout_sec = timeout_sec, .exit_code = &code});
+    return code;
+}
+
 class AsyncShellCache {
 public:
     // Returns the cached stdout of `cmd`, refreshing it on a detached thread.

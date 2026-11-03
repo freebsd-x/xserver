@@ -1,3 +1,5 @@
+#include "xserver/wifi_commands.h"
+#include "xserver/wpa_ctrl.h"
 #include "xserver/network_service.h"
 #include "xserver/config_service.h"
 #include "xserver/async_shell.h"
@@ -224,35 +226,33 @@ void NetworkService::connect(const shared::WifiConnectRequest& req) noexcept {
 
     std::cout << "[NetworkService] Connecting to \"" << ssid << "\"\n";
 
-    // Quote SSID and passphrase so any character is safe to pass through the shell.
-    std::string q_ssid = shellQuote(ssid);
-    std::string q_pass = shellQuote(pass);
-
-    if (pass.empty()) {
-        // Open network
-        (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan
-            + " add_network >/dev/null 2>&1").c_str());
-        (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan
-            + " set_network 0 ssid " + q_ssid + " >/dev/null 2>&1").c_str());
-        (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan
-            + " set_network 0 key_mgmt NONE >/dev/null 2>&1").c_str());
-    } else {
-        // WPA2/3
-        (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan
-            + " add_network >/dev/null 2>&1").c_str());
-        (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan
-            + " set_network 0 ssid " + q_ssid + " >/dev/null 2>&1").c_str());
-        (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan
-            + " set_network 0 psk " + q_pass + " >/dev/null 2>&1").c_str());
+    // Over wpa_supplicant's control socket (wpa_ctrl.h): no wpa_cli, no
+    // shell, no secret on a command line. ADD_NETWORK creates the network and
+    // returns its id; joinCommands sets the SSID (hex) and the PSK derived from
+    // the passphrase, then enables and selects it.
+    std::string id = wpa::request(wlan, "ADD_NETWORK");
+    while (!id.empty() && (id.back() == '\n' || id.back() == '\r')) id.pop_back();
+    if (!wifi::validNetworkId(id)) {
+        std::cerr << "[NetworkService] wpa_supplicant didn't add a network (" << id << ")\n";
+        return;
     }
-    (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan
-        + " enable_network 0 >/dev/null 2>&1").c_str());
-    (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan
-        + " select_network 0 >/dev/null 2>&1").c_str());
+    const auto cmds = wifi::joinCommands(id, ssid, pass);
+    if (cmds.empty()) {
+        std::cerr << "[NetworkService] Not a valid WPA passphrase (8-63 printable characters)\n";
+        (void)wpa::request(wlan, "REMOVE_NETWORK " + id);
+        return;
+    }
+    for (const auto& c : cmds) {
+        if (wpa::request(wlan, c).rfind("OK", 0) != 0) {
+            std::cerr << "[NetworkService] wpa_supplicant refused " << c.substr(0, c.find(' ', 12)) << "\n";
+            (void)wpa::request(wlan, "REMOVE_NETWORK " + id);
+            return;
+        }
+    }
 
     // Give wpa_supplicant a moment then acquire IP
     ::sleep(3);
-    (void)fbx::xserver::spawnStatus(("dhclient " + wlan + " >/dev/null 2>&1").c_str());
+    (void)spawnArgvRun({"dhclient", wlan}, 30);
 
     ConfigService::set("net.last_ssid", ssid);
 
@@ -271,7 +271,7 @@ void NetworkService::connect(const shared::WifiConnectRequest& req) noexcept {
 void NetworkService::disconnect() noexcept {
     std::string wlan = findWlanInterface();
     if (wlan.empty()) return;
-    (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan + " disconnect >/dev/null 2>&1").c_str());
+    (void)wpa::request(wlan, "DISCONNECT");
     std::cout << "[NetworkService] Disconnected\n";
 
     shared::XBusMessage bcast{};

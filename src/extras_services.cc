@@ -27,7 +27,7 @@ std::string hotspotUnavailableReason() {
     auto wlans = sysadmin::parseWlanIfaces(spawnCapture("ifconfig -l 2>/dev/null"));
     if (wlans.empty()) return "there's no Wi-Fi interface";
     for (const auto& w : wlans)
-        if (extras::driverSupportsHostap(spawnCapture("ifconfig " + w + " list caps 2>/dev/null")))
+        if (extras::driverSupportsHostap(spawnArgvCapture({"ifconfig", w, "list", "caps"})))
             return "access-point setup (hostapd on a hostap-mode wlan) isn't implemented yet";
     return "the Wi-Fi driver doesn't support access-point (HOSTAP) mode";
 }
@@ -101,10 +101,12 @@ Syncthing loadSyncthing() {
     return st;
 }
 
+// Syncthing's local REST API. The API key goes to curl on stdin (-H @-):
+// on the command line (as before) any local user could read it with ps.
 std::string restGet(const Syncthing& st, const std::string& path) {
     if (st.apikey.empty()) return {};
-    return spawnCapture("curl -sf -m 3 -H " + shellQuote("X-API-Key: " + st.apikey) + " " +
-                        shellQuote("http://" + st.address + path) + " 2>/dev/null");
+    return spawnArgvCapture({"curl", "-sf", "-m", "3", "-H", "@-", "http://" + st.address + path},
+                            {.stdin_data = "X-API-Key: " + st.apikey + "\n"});
 }
 
 }  // namespace
@@ -201,11 +203,12 @@ void FileSyncService::handleMessage(const shared::XBusMessage& msg,
         bool ok = false;
         for (const auto& f : st.folders) {
             if (f.label != req.name_ || !extras::safeFolderId(f.id) || st.apikey.empty()) continue;
-            int rc = spawnStatus("curl -sf -m 5 -X PATCH -H " + shellQuote("X-API-Key: " + st.apikey) +
-                                 " -H 'Content-Type: application/json' -d " +
-                                 shellQuote(pause ? "{\"paused\":true}" : "{\"paused\":false}") + " " +
-                                 shellQuote("http://" + st.address + "/rest/config/folders/" + f.id) +
-                                 " >/dev/null 2>&1");
+            int rc = -1;   // API key on stdin, as in restGet
+            (void)spawnArgvCapture({"curl", "-sf", "-m", "5", "-X", "PATCH", "-H", "@-",
+                                    "-H", "Content-Type: application/json",
+                                    "-d", pause ? "{\"paused\":true}" : "{\"paused\":false}",
+                                    "http://" + st.address + "/rest/config/folders/" + f.id},
+                                   {.stdin_data = "X-API-Key: " + st.apikey + "\n", .exit_code = &rc});
             ok = rc == 0;
             break;
         }

@@ -160,14 +160,6 @@ static shared::AppInfo makeAppInfo(const fs::path& bundle_dir,
     return info;
 }
 
-// Run a shell command, return true on success.
-static bool runCmd(const std::string& cmd) noexcept {
-    std::cout << "[AppManager] " << cmd << "\n";
-    // Cap so a wedged extract/install command can't hang the compositor forever.
-    int ret = fbx::xserver::spawnStatus(("timeout -k 5 300 " + cmd).c_str());
-    return ret == 0;
-}
-
 // ─── AppManagerService ────────────────────────────────────────────────────────
 
 void AppManagerService::setAppsDir(const std::string& dir) noexcept {
@@ -320,10 +312,9 @@ void AppManagerService::ProcessMessage(std::shared_ptr<IpcSocket> client,
             }
 
             broadcastProgress(identifier, 20, 0, "Extracting archive…");
-            // src_path comes from the client: quote it properly (a bare '…'
-            // let a file named "x';cmd;'.xpkg" run cmd).
-            std::string extract_cmd = "tar -xzf " + shellQuote(src_path) + " -C " + shellQuote(tmp_dir);
-            if (!runCmd(extract_cmd)) {
+            // src_path comes from the client: argv, no shell (tar's -f / -C
+            // take the next argument as their value, so not as an option).
+            if (spawnArgvRun({"tar", "-xzf", src_path, "-C", tmp_dir}, 300) != 0) {
                 broadcastProgress(identifier, 0, 2, "Extraction failed");
                 fs::remove_all(tmp_dir);
                 break;

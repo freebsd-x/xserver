@@ -70,7 +70,7 @@ void FirewallService::handleMessage(const shared::XBusMessage& msg,
         } else {
             if (r != kBrokerUnreachable)
                 LOG_WARN("FirewallService: broker refused pf enable/disable ({})", r);
-            int rc = spawnStatus(std::string("pfctl ") + (req.enabled_ ? "-e" : "-d") + " >/dev/null 2>&1");
+            int rc = spawnArgvRun({"pfctl", req.enabled_ ? "-e" : "-d"});
             if (rc != 0) LOG_INFO("FirewallService: pfctl needs root (not applied)");
         }
         sendStatus(client, msg, static_cast<uint32_t>(O::SetEnabled));   // ack = fresh status

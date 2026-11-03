@@ -142,7 +142,7 @@ void VpnService::connectBackground(const char* iface) noexcept {
     // Ensure kernel module is loaded
     (void)fbx::xserver::spawnStatus("kldload if_wg 2>/dev/null");
 
-    int rc = fbx::xserver::spawnStatus(("wg-quick up " + name + " 2>/dev/null").c_str());
+    int rc = fbx::xserver::spawnArgvRun({"wg-quick", "up", name});
     if (rc != 0)
         LOG_INFO("VPN: wg-quick up {} returned {}", name, rc);
 
@@ -162,7 +162,7 @@ void VpnService::disconnectBackground(const char* iface) noexcept {
         while (ss >> tok) {
             if (!isValidInterfaceName(tok)) continue; // skip unexpected tokens
             LOG_INFO("VPN: bringing down {}", tok);
-            (void)fbx::xserver::spawnStatus(("wg-quick down " + tok + " 2>/dev/null").c_str());
+            (void)fbx::xserver::spawnArgvRun({"wg-quick", "down", tok});
         }
     } else {
         if (!isValidInterfaceName(name)) {
@@ -171,7 +171,7 @@ void VpnService::disconnectBackground(const char* iface) noexcept {
             return;
         }
         LOG_INFO("VPN: bringing down {}", name);
-        (void)fbx::xserver::spawnStatus(("wg-quick down " + name + " 2>/dev/null").c_str());
+        (void)fbx::xserver::spawnArgvRun({"wg-quick", "down", name});
     }
 
     broadcastVpnChanged(VpnService::getStatus());

@@ -36,9 +36,9 @@ uint32_t BacklightService::getLevel() noexcept {
 void BacklightService::writeLevel(uint32_t level) noexcept {
     level = std::min(level, 100u);
     current_level_ = level;
-    // backlight(8) device first (video group, no root); the level is a clamped
-    // integer so the command is injection-free. ACPI sysctl fallback.
-    if (spawnStatus("backlight " + std::to_string(level) + " >/dev/null 2>&1") == 0) {
+    // backlight(8) device first (video group, no root); argv, no shell. ACPI
+    // sysctl fallback.
+    if (spawnArgvRun({"backlight", std::to_string(level)}) == 0) {
         std::cout << "[BacklightService] Brightness set to " << level << "% (backlight device)\n";
         return;
     }

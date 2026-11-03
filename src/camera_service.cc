@@ -206,14 +206,12 @@ shared::CameraStillResult CameraService::captureStill(const shared::CameraStillR
 
     std::string out = timestampedPath(dir, "camera", "jpg");
 
-    // Use ffmpeg to grab one frame
-    // dev and out derive from client input (device path, output dir) — quote them.
-    std::string cmd = std::format(
-        "ffmpeg -f v4l2 -video_size {}x{} -i {} -vframes 1 -q:v 2 {} 2>/dev/null",
-        current_width_, current_height_, shellQuote(dev), shellQuote(out));
-
-    // Cap the capture: a busy/wedged camera device must not hang the compositor.
-    int ret = fbx::xserver::spawnStatus(("timeout -k 2 20 " + cmd).c_str());
+    // ffmpeg grabs one frame. dev and out derive from client input (device
+    // path, output dir): argv, no shell. Capped so a wedged camera device
+    // can't hang the caller.
+    int ret = fbx::xserver::spawnArgvRun(
+        {"ffmpeg", "-f", "v4l2", "-video_size", std::format("{}x{}", current_width_, current_height_),
+         "-i", dev, "-vframes", "1", "-q:v", "2", out}, 20);
     if (ret == 0 && std::filesystem::exists(out)) {
         res.success_ = 1;
         std::strncpy(res.path_, out.c_str(), sizeof(res.path_) - 1);

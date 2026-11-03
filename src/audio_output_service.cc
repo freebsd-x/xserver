@@ -68,7 +68,7 @@ void AudioOutputService::handleMessage(const shared::XBusMessage& msg,
             } else {
                 if (r != kBrokerUnreachable)
                     LOG_WARN("AudioOutputService: broker refused default-sink set ({})", r);
-                int rc = spawnStatus("sysctl hw.snd.default_unit=" + std::to_string(unit) + " >/dev/null 2>&1");
+                int rc = spawnArgvRun({"sysctl", "hw.snd.default_unit=" + std::to_string(unit)});
                 if (rc != 0)
                     LOG_INFO("AudioOutputService: could not set default sink to {} (needs root)", req.id_);
             }
