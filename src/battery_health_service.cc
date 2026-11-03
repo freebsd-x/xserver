@@ -19,7 +19,7 @@ constexpr const char* kKey     = "batteryhealth.optimized_charging";
 shared::BatteryHealthState build() {
     shared::BatteryHealthState st{};
     // Real wear data (posix_spawn, not popen — async_shell).
-    auto b = battery::parseAcpiconf(spawnCapture("acpiconf -i 0 2>/dev/null"));
+    auto b = battery::parseAcpiconf(spawnArgvCapture({"acpiconf", "-i", "0"}));
     st.health_pct_  = battery::healthPct(b);
     st.cycle_count_ = b.cycle_count;
     // Persisted preference (no hardware effect on FreeBSD).

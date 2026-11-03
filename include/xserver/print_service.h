@@ -38,7 +38,7 @@ private:
                              const std::string& message) noexcept;
 
     // Run a command and return its stdout output.
-    static std::string runCmd(const std::string& cmd) noexcept;
+    static std::string runCmd(std::vector<std::string> args) noexcept;
 
     // Parse printer list from `lpstat -p -l` output.
     struct ParsedPrinter {

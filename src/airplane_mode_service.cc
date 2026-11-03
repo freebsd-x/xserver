@@ -47,7 +47,7 @@ void AirplaneModeService::handleMessage(const shared::XBusMessage& msg,
         shared::AirplaneModeState st = load();
         if (req.enabled_ && !st.enabled_) {
             // Take down the Wi-Fi interfaces that are up, and remember them.
-            auto up = sysadmin::parseWlanIfaces(spawnCapture("ifconfig -l -u 2>/dev/null"));
+            auto up = sysadmin::parseWlanIfaces(spawnArgvCapture({"ifconfig", "-l", "-u"}));
             std::string downed;
             bool ok = true;
             for (const auto& ifc : up) {

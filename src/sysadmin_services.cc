@@ -33,17 +33,18 @@ std::mutex g_cache_mu;
 std::map<std::string, std::pair<Clock::time_point, std::string>> g_cache;
 constexpr auto kCacheTtl = std::chrono::seconds(3);
 
-std::string cachedCapture(const std::string& cmd) {
+std::string cachedCapture(std::vector<std::string> args, int timeout_sec = 0) {
+    std::string key;
+    for (const auto& a : args) { key += a; key += '\x1f'; }
     {
         std::lock_guard lk(g_cache_mu);
-        auto it = g_cache.find(cmd);
+        auto it = g_cache.find(key);
         if (it != g_cache.end() && Clock::now() - it->second.first < kCacheTtl)
             return it->second.second;
     }
-    // posix_spawn, not popen (popen deadlocks the threaded compositor).
-    std::string out = spawnCapture(cmd);
+    std::string out = spawnArgvCapture(std::move(args), {.timeout_sec = timeout_sec});   // argv, no shell
     std::lock_guard lk(g_cache_mu);
-    g_cache[cmd] = {Clock::now(), out};
+    g_cache[key] = {Clock::now(), out};
     return out;
 }
 
@@ -73,7 +74,7 @@ constexpr const char* kServicesName = "com.freebsdx.Services";
 
 std::vector<sysadmin::RcDaemon> enabledDaemons() {
     std::vector<sysadmin::RcDaemon> out;
-    std::istringstream paths(cachedCapture("service -e 2>/dev/null"));
+    std::istringstream paths(cachedCapture({"service", "-e"}));
     std::string path;
     while (std::getline(paths, path)) {
         if (path.empty()) continue;
@@ -148,7 +149,7 @@ void JailsService::handleMessage(const shared::XBusMessage& msg,
     switch (static_cast<O>(msg.opcode_)) {
     case O::ListJails: {
         auto jails = sysadmin::parseJls(
-            cachedCapture("jls -n jid host.hostname ip4.addr dying 2>/dev/null"));
+            cachedCapture({"jls", "-n", "jid", "host.hostname", "ip4.addr", "dying"}));
         auto pg = makePage<shared::JailPage>(readPage(msg), jails,
             [](shared::JailEntry& e, const sysadmin::Jail& j) {
                 e.jid_ = j.jid;
@@ -181,7 +182,7 @@ void ZfsPoolsService::handleMessage(const shared::XBusMessage& msg,
     switch (static_cast<O>(msg.opcode_)) {
     case O::ListPools: {
         auto pools = sysadmin::parseZpoolList(
-            cachedCapture("zpool list -Hp -o name,size,alloc,health 2>/dev/null"));
+            cachedCapture({"zpool", "list", "-Hp", "-o", "name,size,alloc,health"}));
         auto pg = makePage<shared::ZfsPoolPage>(readPage(msg), pools,
             [](shared::ZfsPoolEntry& e, const sysadmin::Pool& p) {
                 e.used_bytes_  = p.alloc_bytes;
@@ -193,7 +194,7 @@ void ZfsPoolsService::handleMessage(const shared::XBusMessage& msg,
                 if (privops::safeName(p.name, 64, ".:")) {
                     uint32_t pct = 0;
                     e.scrubbing_ = sysadmin::parseScrubProgress(
-                        cachedCapture("zpool status " + p.name + " 2>/dev/null"), pct) ? 1u : 0u;
+                        cachedCapture({"zpool", "status", p.name}), pct) ? 1u : 0u;
                     e.scrub_pct_ = pct;
                 }
             });
@@ -221,7 +222,7 @@ void BootEnvService::handleMessage(const shared::XBusMessage& msg,
     constexpr const char* kName = "com.freebsdx.BootEnv";
     switch (static_cast<O>(msg.opcode_)) {
     case O::ListBE: {
-        auto bes = sysadmin::parseBectlList(cachedCapture("bectl list -H 2>/dev/null"));
+        auto bes = sysadmin::parseBectlList(cachedCapture({"bectl", "list", "-H"}));
         auto pg = makePage<shared::BePage>(readPage(msg), bes,
             [](shared::BeEntry& e, const sysadmin::BootEnv& b) {
                 std::strncpy(e.name_, b.name.c_str(), sizeof(e.name_) - 1);
@@ -242,7 +243,7 @@ void BootEnvService::handleMessage(const shared::XBusMessage& msg,
         if (destroy) {
             // Never destroy the booted BE (bectl refuses too; check up front).
             bool booted = false;
-            for (const auto& b : sysadmin::parseBectlList(cachedCapture("bectl list -H 2>/dev/null")))
+            for (const auto& b : sysadmin::parseBectlList(cachedCapture({"bectl", "list", "-H"})))
                 if (b.name == req.name_ && b.active) booted = true;
             if (booted) LOG_WARN("BootEnvService: refusing to destroy the booted BE '{}'", req.name_);
             else ok = brokerOp("BootEnvService", privops::kBeDestroy, req.name_);
@@ -267,7 +268,7 @@ shared::NtpState ntpState() {
         if (std::strcmp(p.name_, "ntpd") == 0) { st.enabled_ = 1; break; }
     if (!st.enabled_) return st;
 
-    auto info = sysadmin::parseNtpqPeers(cachedCapture("timeout 3 ntpq -pn 2>/dev/null"));
+    auto info = sysadmin::parseNtpqPeers(cachedCapture({"ntpq", "-pn"}, 3));
     st.synced_ = info.synced ? 1u : 0u;
     std::strncpy(st.server_, info.server.c_str(), sizeof(st.server_) - 1);
     if (info.synced) {
@@ -322,7 +323,7 @@ shared::RemoteLoginState remoteLoginState() {
     for (const auto& p : proc::enumerateProcesses())
         if (std::strcmp(p.name_, "sshd") == 0) { st.enabled_ = 1; break; }
     if (st.enabled_)
-        st.sessions_ = sysadmin::countEstablished(cachedCapture("netstat -an -p tcp 2>/dev/null"), cfg.port);
+        st.sessions_ = sysadmin::countEstablished(cachedCapture({"netstat", "-an", "-p", "tcp"}), cfg.port);
     return st;
 }
 

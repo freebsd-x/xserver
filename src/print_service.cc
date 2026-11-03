@@ -14,12 +14,13 @@ namespace fbx::xserver {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-std::string PrintService::runCmd(const std::string& cmd) noexcept {
+std::string PrintService::runCmd(std::vector<std::string> args) noexcept {
     // Async + cached: lpstat/lpc hang when the print system (CUPS/lpd) is
     // unresponsive, and this runs on the compositor's single event-loop thread —
     // a hang there freezes the whole desktop. Return cached output, refresh in
-    // the background.
-    return g_asyncShell.get(cmd);
+    // the background. Read-only queries only (job status) — anything with a
+    // side effect runs on a worker thread instead (submit, cancel).
+    return g_asyncShell.get(std::move(args));
 }
 
 bool PrintService::pathAllowed(const std::string& path) noexcept {
@@ -40,7 +41,7 @@ bool PrintService::pathAllowed(const std::string& path) noexcept {
 }
 
 std::string PrintService::defaultPrinter() noexcept {
-    std::string out = runCmd("lpstat -d 2>/dev/null");
+    std::string out = runCmd({"lpstat", "-d"});
     // Expected: "system default destination: <name>"
     const char* prefix = "system default destination: ";
     auto pos = out.find(prefix);
@@ -55,7 +56,7 @@ std::string PrintService::defaultPrinter() noexcept {
 std::vector<PrintService::ParsedPrinter> PrintService::parsePrinters() noexcept {
     std::vector<ParsedPrinter> printers;
 
-    std::string out = runCmd("lpstat -p -l 2>/dev/null");
+    std::string out = runCmd({"lpstat", "-p", "-l"});
     if (out.empty()) return printers;
 
     std::string def = defaultPrinter();
@@ -157,16 +158,6 @@ uint32_t PrintService::submitJob(const shared::PrintRequest& req,
         }
     }
 
-    // Sanitize title (escape single quotes for shell safety)
-    std::string safe_title;
-    safe_title.reserve(title.size() + 4);
-    for (char c : title) {
-        if (c == '\'') safe_title += "'\\''";
-        else           safe_title += c;
-    }
-    if (safe_title.empty()) safe_title = "Print Job";
-
-    // Sanitize printer name (only allow alphanumeric, hyphen, underscore)
     for (char c : printer) {
         if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != '.') {
             message = "Invalid printer name";
@@ -174,43 +165,33 @@ uint32_t PrintService::submitJob(const shared::PrintRequest& req,
         }
     }
 
-    // Build lp command
-    std::ostringstream cmd;
-    cmd << "lp -d '" << printer << "'";
-    cmd << " -n " << std::max(1u, req.copies_);
-    cmd << " -t '" << safe_title << "'";
+    if (title.empty()) title = "Print Job";
 
-    // Duplex
-    if (req.duplex_ == 1)
-        cmd << " -o sides=two-sided-long-edge";
-    else if (req.duplex_ == 2)
-        cmd << " -o sides=two-sided-short-edge";
-
-    // Color mode
-    if (req.color_mode_ == 2)
-        cmd << " -o ColorModel=Gray";
-
-    // Paper size
+    // lp, as an argv — no shell, so the title and path (both from the client)
+    // are only ever arguments.
+    std::vector<std::string> args = {"lp", "-d", printer,
+                                     "-n", std::to_string(std::max(1u, req.copies_)),
+                                     "-t", title};
+    if (req.duplex_ == 1)      { args.push_back("-o"); args.push_back("sides=two-sided-long-edge"); }
+    else if (req.duplex_ == 2) { args.push_back("-o"); args.push_back("sides=two-sided-short-edge"); }
+    if (req.color_mode_ == 2)  { args.push_back("-o"); args.push_back("ColorModel=Gray"); }
+    args.push_back("-o");
     switch (req.paper_size_) {
-        case 1: cmd << " -o media=A4";     break;
-        case 2: cmd << " -o media=Legal";  break;
-        case 3: cmd << " -o media=A3";     break;
-        default: cmd << " -o media=Letter"; break;
+        case 1: args.push_back("media=A4");     break;
+        case 2: args.push_back("media=Legal");  break;
+        case 3: args.push_back("media=A3");     break;
+        default: args.push_back("media=Letter"); break;
     }
+    args.push_back("--");   // the path is a file even if it starts with '-'
+    args.push_back(file_path);
 
-    // File path (single-quoted for shell safety, escaping embedded single quotes)
-    std::string safe_path;
-    safe_path.reserve(file_path.size() + 4);
-    for (char c : file_path) {
-        if (c == '\'') safe_path += "'\\''";
-        else           safe_path += c;
+    std::cout << "[PrintService] submitJob: lp -d " << printer << " … " << file_path << "\n";
+    int rc = -1;
+    std::string output = spawnArgvCapture(std::move(args), {.timeout_sec = 30, .exit_code = &rc});
+    if (rc != 0) {
+        message = "lp failed (exit " + std::to_string(rc) + ")";
+        return 0;
     }
-    cmd << " '" << safe_path << "' 2>&1";
-
-    std::string cmd_str = cmd.str();
-    std::cout << "[PrintService] submitJob: " << cmd_str << "\n";
-
-    std::string output = runCmd(cmd_str);
 
     // Parse job id from output like: "request id is HP_LaserJet-42 (1 file(s))"
     // or: "request id is printer-name-42 (1 file(s))"
@@ -307,9 +288,13 @@ void PrintService::handlePrintFile(std::shared_ptr<IpcSocket> client,
     shared::PrintRequest req{};
     std::memcpy(&req, msg.payload_, sizeof(req));
 
-    std::string message;
-    uint32_t job_id = submitJob(req, message);
-    sendResponse(client, msg, job_id != 0, job_id, message);
+    // lp can hang on a stuck print system: submit and answer from a worker
+    // thread, never the compositor's event loop.
+    std::thread([client, msg, req]() {
+        std::string message;
+        uint32_t job_id = submitJob(req, message);
+        sendResponse(client, msg, job_id != 0, job_id, message);
+    }).detach();
 }
 
 void PrintService::handleGetJobStatus(std::shared_ptr<IpcSocket> client,
@@ -344,8 +329,7 @@ void PrintService::handleGetJobStatus(std::shared_ptr<IpcSocket> client,
         cups_job = job_id_str;
     }
 
-    std::string cmd = "lpstat -l " + cups_job + " 2>/dev/null";
-    std::string out = runCmd(cmd);
+    std::string out = runCmd({"lpstat", "-l", cups_job});
 
     shared::PrintJobStatus status{};
     status.job_id_ = job_id;
@@ -437,17 +421,16 @@ void PrintService::handleCancelJob(std::shared_ptr<IpcSocket> client,
         cups_job = std::to_string(job_id);
     }
 
-    std::string cmd = "cancel " + cups_job + " 2>&1";
-    std::cout << "[PrintService] CancelJob: " << cmd << "\n";
-    std::string out = runCmd(cmd);
-
-    // Strip trailing newline
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
-        out.pop_back();
-
-    bool ok = out.empty(); // cancel exits 0 with no output on success
-    std::string message = ok ? ("Cancelled job " + std::to_string(job_id)) : out;
-    sendResponse(client, msg, ok, job_id, message);
+    std::cout << "[PrintService] CancelJob: " << cups_job << "\n";
+    // On a worker thread, judged by the exit status: through the (read-only)
+    // status cache the first cancel came back empty — "success" — unrun.
+    std::thread([client, msg, cups_job, job_id]() {
+        int rc = -1;
+        (void)spawnArgvCapture({"cancel", cups_job}, {.timeout_sec = 15, .exit_code = &rc});
+        const bool ok = rc == 0;
+        sendResponse(client, msg, ok, job_id,
+                     ok ? "Cancelled job " + std::to_string(job_id) : "cancel failed (exit " + std::to_string(rc) + ")");
+    }).detach();
 }
 
 void PrintService::handleShowDialog(std::shared_ptr<IpcSocket> client,
@@ -482,9 +465,11 @@ void PrintService::handleShowDialog(std::shared_ptr<IpcSocket> client,
     req.duplex_     = 0; // one-sided
     req.paper_size_ = 0; // letter
 
-    std::string message;
-    uint32_t job_id = submitJob(req, message);
-    sendResponse(client, msg, job_id != 0, job_id, message);
+    std::thread([client, msg, req]() {   // as handlePrintFile
+        std::string message;
+        uint32_t job_id = submitJob(req, message);
+        sendResponse(client, msg, job_id != 0, job_id, message);
+    }).detach();
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────

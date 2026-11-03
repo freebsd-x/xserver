@@ -164,7 +164,7 @@ void InputDeviceService::handleMessage(const shared::XBusMessage& msg,
 namespace {
 std::vector<usb::UsbInfo> securityKeys() {
     std::vector<usb::UsbInfo> keys;
-    for (auto& u : usb::parseDevinfo(spawnCapture("devinfo -v 2>/dev/null"))) {
+    for (auto& u : usb::parseDevinfo(spawnArgvCapture({"devinfo", "-v"}))) {
         if (!usb::isSecurityKey(u)) continue;
         size_t i = u.driver.find_first_of("0123456789");
         if (i != std::string::npos) {

@@ -16,7 +16,7 @@ namespace {
 std::string runSockstat() {
     // posix_spawn, not popen: popen() forks in this multithreaded compositor and the
     // child deadlocks on a libc stdio lock held by another thread (see async_shell.h).
-    return spawnCapture("sockstat -46sn 2>/dev/null");
+    return spawnArgvCapture({"sockstat", "-46sn"});
 }
 
 void sendAck(IpcSocket* client, uint32_t tid, shared::NetstatOpcode op) {

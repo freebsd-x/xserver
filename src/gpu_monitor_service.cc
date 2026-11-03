@@ -15,7 +15,7 @@ namespace {
 const std::string& gpuName() {
     // posix_spawn, not popen (popen deadlocks the threaded compositor).
     static const std::string name = [] {
-        std::string n = gpu::parseGpuName(spawnCapture("pciconf -lv 2>/dev/null"));
+        std::string n = gpu::parseGpuName(spawnArgvCapture({"pciconf", "-lv"}));
         return n.empty() ? std::string("Unknown GPU") : n;
     }();
     return name;

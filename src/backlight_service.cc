@@ -19,7 +19,7 @@ uint32_t BacklightService::getLevel() noexcept {
     // Prefer the backlight(8) device (/dev/backlight0 is group `video`, which the
     // compositor is already in for DRM — no root needed). Fall back to the ACPI
     // video sysctl on machines that only expose that.
-    int b = backlight::parseBrightness(spawnCapture("backlight 2>/dev/null"));
+    int b = backlight::parseBrightness(spawnArgvCapture({"backlight"}));
     if (b >= 0) { current_level_ = static_cast<uint32_t>(b); return current_level_; }
 
     int brightness = 80; // safe fallback

@@ -19,8 +19,8 @@ constexpr const char* kSvc = "com.freebsdx.Firewall";
 shared::FirewallStatus build() {
     shared::FirewallStatus st{};
     // Reads need root; unprivileged → empty output → disabled/0 (honest).
-    std::string info  = spawnCapture("pfctl -s info 2>/dev/null");
-    std::string rules = spawnCapture("pfctl -s rules 2>/dev/null");
+    std::string info  = spawnArgvCapture({"pfctl", "-s", "info"});
+    std::string rules = spawnArgvCapture({"pfctl", "-s", "rules"});
     st.enabled_    = firewall::parseEnabled(info) ? 1u : 0u;
     st.rule_count_ = firewall::countRules(rules);
     uint32_t ba = 0;

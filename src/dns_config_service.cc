@@ -119,7 +119,7 @@ void DnsConfigService::handleMessage(const shared::XBusMessage& msg,
     }
     case O::Flush: {
         // Reload the local resolver cache (needs root → best-effort, logged).
-        int rc = spawnStatus("service local_unbound reload >/dev/null 2>&1");
+        int rc = spawnArgvRun({"service", "local_unbound", "reload"});
         if (rc != 0) LOG_INFO("DnsConfigService: DNS cache flush needs root (service local_unbound reload)");
         ack(client, msg, static_cast<uint32_t>(O::Flush));
         break;

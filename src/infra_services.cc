@@ -52,7 +52,7 @@ std::vector<infra::Share> currentShares() {
     std::ifstream f("/etc/fstab");
     std::stringstream fstab;
     fstab << f.rdbuf();
-    return infra::collectShares(spawnCapture("mount -p -t nfs,smbfs 2>/dev/null"), fstab.str());
+    return infra::collectShares(spawnArgvCapture({"mount", "-p", "-t", "nfs,smbfs"}), fstab.str());
 }
 
 std::string sharePathFor(const infra::Share& s) {
@@ -132,9 +132,9 @@ bool podmanInstalled() { return ::access("/usr/local/bin/podman", X_OK) == 0; }
 
 std::vector<infra::Container> containers() {
     if (!podmanInstalled()) return {};
-    return infra::parsePodmanPs(spawnCapture(
-        "/usr/bin/timeout 5 /usr/local/bin/podman ps -a --format "
-        "'{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}' 2>/dev/null"));
+    return infra::parsePodmanPs(spawnArgvCapture(
+        {"/usr/local/bin/podman", "ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}"},
+        {.timeout_sec = 5}));
 }
 
 }  // namespace

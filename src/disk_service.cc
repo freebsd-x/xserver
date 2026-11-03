@@ -72,7 +72,7 @@ std::vector<DiskInfo> DiskService::enumerateDisks() noexcept {
     std::vector<DiskInfo> disks;
 
     // Bounded so a wedged GEOM tasting can't hang the event loop forever.
-    std::string output = xserver::runCapped("geom disk list 2>/dev/null");
+    std::string output = xserver::runCapped({"geom", "disk", "list"});
 
     DiskInfo cur{};
     bool in_disk = false;
@@ -123,7 +123,7 @@ std::vector<PartitionInfo> DiskService::listPartitions(const std::string& disk) 
     // Get mount info: device → mountpoint
     std::map<std::string, std::string> mounts;
     {
-        std::istringstream mss(xserver::runCapped("mount 2>/dev/null"));
+        std::istringstream mss(xserver::runCapped({"mount"}));
         std::string mline;
         while (std::getline(mss, mline)) {
             // "/dev/ada0p3 on / (ufs, local, ...)"
@@ -139,8 +139,7 @@ std::vector<PartitionInfo> DiskService::listPartitions(const std::string& disk) 
     }
 
     // gpart show -p: full provider names (bounded so it can't hang the loop)
-    std::string cmd = "gpart show -p " + disk + " 2>/dev/null";
-    std::istringstream gss(xserver::runCapped(cmd));
+    std::istringstream gss(xserver::runCapped({"gpart", "show", "-p", disk}));
     std::string line;
     while (std::getline(gss, line)) {
         // Header: "=>     40  976773088  ada0  GPT  (465G)"
@@ -184,7 +183,7 @@ std::vector<ZpoolInfo> DiskService::listZpools() noexcept {
     std::vector<ZpoolInfo> pools;
 
     // Bounded so a wedged/suspended pool can't hang the event loop.
-    std::istringstream zss(xserver::runCapped("zpool list -H -o name,size,alloc,free,health 2>/dev/null"));
+    std::istringstream zss(xserver::runCapped({"zpool", "list", "-H", "-o", "name,size,alloc,free,health"}));
     std::string line;
     while (std::getline(zss, line)) {
         std::istringstream iss(line);
@@ -343,9 +342,9 @@ void DiskService::handleMessage(const XBusMessage& msg,
         }
         std::thread([dev, mnt, client]() {
             try {
-                std::string cmd = "mount /dev/" + dev + " " + mnt + " 2>&1";
                 int rc = -1;
-                std::string out = fbx::xserver::spawnCaptureStatus(cmd, &rc);  // posix_spawn, fork-safe
+                std::string out = fbx::xserver::spawnArgvCapture({"mount", "/dev/" + dev, mnt},
+                                                                 {.timeout_sec = 60, .exit_code = &rc, .merge_stderr = true});
                 broadcastDiskChanged();
                 DiskService::sendStatus(client, rc == 0, rc == 0 ? "Mounted" : out);
             } catch (...) {
@@ -362,9 +361,9 @@ void DiskService::handleMessage(const XBusMessage& msg,
         if (!isValidDevice(dev)) { sendStatus(client, false, "Invalid device"); return; }
         std::thread([dev, client]() {
             try {
-                std::string cmd = "umount /dev/" + dev + " 2>&1";
                 int rc = -1;
-                std::string out = fbx::xserver::spawnCaptureStatus(cmd, &rc);  // posix_spawn, fork-safe
+                std::string out = fbx::xserver::spawnArgvCapture({"umount", "/dev/" + dev},
+                                                                 {.timeout_sec = 60, .exit_code = &rc, .merge_stderr = true});
                 broadcastDiskChanged();
                 DiskService::sendStatus(client, rc == 0, rc == 0 ? "Unmounted" : out);
             } catch (...) {
@@ -384,24 +383,24 @@ void DiskService::handleMessage(const XBusMessage& msg,
         if (!isValidDevice(dev)) { sendStatus(client, false, "Invalid device"); return; }
 
         // Build format command based on fs type
-        std::string cmd;
+        // argv: the label is client text, only ever an argument.
+        std::vector<std::string> cmd;
         if (fs == "ufs") {
-            cmd = "newfs";
-            if (!lbl.empty()) cmd += " -L " + xserver::shellQuote(lbl);
-            cmd += " /dev/" + dev + " 2>&1";
+            cmd = {"newfs"};
         } else if (fs == "msdos" || fs == "fat32") {
-            cmd = "newfs_msdos -F 32";
-            if (!lbl.empty()) cmd += " -L " + xserver::shellQuote(lbl);
-            cmd += " /dev/" + dev + " 2>&1";
+            cmd = {"newfs_msdos", "-F", "32"};
         } else {
             sendStatus(client, false, "Unsupported filesystem: " + fs);
             return;
         }
+        if (!lbl.empty()) { cmd.push_back("-L"); cmd.push_back(lbl); }
+        cmd.push_back("/dev/" + dev);
 
-        std::thread([cmd, client]() {
+        std::thread([cmd = std::move(cmd), client]() mutable {
             try {
                 int rc = -1;
-                std::string out = fbx::xserver::spawnCaptureStatus(cmd, &rc);  // posix_spawn, fork-safe
+                // No timeout: killing newfs partway would leave a half-formatted disk.
+                std::string out = fbx::xserver::spawnArgvCapture(std::move(cmd), {.exit_code = &rc, .merge_stderr = true});
                 broadcastDiskChanged();
                 DiskService::sendStatus(client, rc == 0, rc == 0 ? "Format complete" : out);
             } catch (...) {
@@ -418,9 +417,9 @@ void DiskService::handleMessage(const XBusMessage& msg,
         if (!isValidDevice(dev)) { sendStatus(client, false, "Invalid device"); return; }
         std::thread([dev, client]() {
             try {
-                std::string cmd = "camcontrol eject /dev/" + dev + " 2>&1";
                 int rc = -1;
-                std::string out = fbx::xserver::spawnCaptureStatus(cmd, &rc);  // posix_spawn, fork-safe
+                std::string out = fbx::xserver::spawnArgvCapture({"camcontrol", "eject", "/dev/" + dev},
+                                                                 {.timeout_sec = 60, .exit_code = &rc, .merge_stderr = true});
                 broadcastDiskChanged();
                 DiskService::sendStatus(client, rc == 0, rc == 0 ? "Ejected" : out);
             } catch (...) {

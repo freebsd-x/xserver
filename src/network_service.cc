@@ -66,11 +66,11 @@ static std::string findWlanInterface() noexcept {
     return {};
 }
 
-static std::string runCmd(const std::string& cmd) noexcept {
+static std::string runCmd(std::vector<std::string> args) noexcept {
     // Never block the compositor's event loop: wpa_cli/ifconfig can hang when
     // wpa_supplicant isn't responding. Return the cached output and refresh it
     // on a background thread (see AsyncShellCache).
-    return g_asyncShell.get(cmd);
+    return g_asyncShell.get(std::move(args));
 }
 
 // ── GetStatus ─────────────────────────────────────────────────────────────────
@@ -82,7 +82,7 @@ shared::NetworkStatus NetworkService::getStatus() noexcept {
     // Try wpa_cli first for SSID + signal
     std::string wlan = findWlanInterface();
     if (!wlan.empty()) {
-        std::string wpa_out = runCmd("wpa_cli -i " + wlan + " status 2>/dev/null");
+        std::string wpa_out = runCmd({"wpa_cli", "-i", wlan, "status"});
         std::istringstream ss(wpa_out);
         std::string line;
         while (std::getline(ss, line)) {
@@ -93,7 +93,7 @@ shared::NetworkStatus NetworkService::getStatus() noexcept {
                 status.is_connected_ = 1;
         }
         // Signal strength via ifconfig
-        std::string if_out = runCmd("ifconfig " + wlan + " 2>/dev/null");
+        std::string if_out = runCmd({"ifconfig", wlan});
         std::smatch m;
         std::regex rssi_re(R"((-\d+)dBm)");
         if (std::regex_search(if_out, m, rssi_re))
@@ -124,7 +124,7 @@ shared::NetworkStatus NetworkService::getStatus() noexcept {
     // FreeBSD netstat -ibn format (link line):
     //   Name Mtu Network Address Ipkts Ierrs Idrop Ibytes Opkts Oerrs Obytes Coll
     if (!iface.empty()) {
-        std::string nb = runCmd("netstat -ibn -I " + iface + " 2>/dev/null");
+        std::string nb = runCmd({"netstat", "-ibn", "-I", iface});
         auto pos = nb.find("<Link#");
         if (pos != std::string::npos) {
             size_t ls = nb.rfind('\n', pos);
@@ -150,18 +150,19 @@ void NetworkService::scanBackground() noexcept {
 
     LOG_INFO("Wi-Fi scan on {}", wlan);
 
-    // Trigger a fresh scan; wpa_cli scan returns immediately
-    (void)fbx::xserver::spawnStatus(("wpa_cli -i " + wlan + " scan >/dev/null 2>&1").c_str());
+    // Trigger a fresh scan (returns immediately) over the control socket —
+    // this runs on a background thread, so a blocking request is fine.
+    (void)wpa::request(wlan, "SCAN");
 
     // Give the driver ~2s to collect results
     ::sleep(2);
 
-    // Read results: "wpa_cli scan_results" format:
+    // Read results (SCAN_RESULTS, the format wpa_cli prints):
     //   bssid / frequency / signal level / flags / ssid
-    std::string out = runCmd("wpa_cli -i " + wlan + " scan_results 2>/dev/null");
+    std::string out = wpa::request(wlan, "SCAN_RESULTS");
     if (out.find("bssid") == std::string::npos) {
         // Fallback: ifconfig wlan scan
-        out = runCmd("ifconfig " + wlan + " scan 2>/dev/null");
+        out = spawnArgvCapture({"ifconfig", wlan, "scan"}, {.timeout_sec = 10});
         std::istringstream ss(out);
         std::string line;
         bool header = true;

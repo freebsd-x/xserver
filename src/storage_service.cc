@@ -18,7 +18,7 @@ bool StorageService::ProcessMessage(std::shared_ptr<IpcSocket> client, const sha
 
     if (msg.opcode_ == 0x01) { // GetDisks
         // The real disks, from GEOM (readable without root).
-        std::string disks = geom::diskSummary(spawnCapture("geom disk list 2>/dev/null"));
+        std::string disks = geom::diskSummary(spawnArgvCapture({"geom", "disk", "list"}));
         std::memset(response.payload_, 0, sizeof(response.payload_));
         std::strncpy(reinterpret_cast<char*>(response.payload_), disks.c_str(), sizeof(response.payload_) - 1);
     } else if (msg.opcode_ == 0x02) { // InstallToDisk

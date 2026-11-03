@@ -19,31 +19,26 @@ std::mutex BluetoothService::devices_mutex_;
 
 // ── CLI helpers ───────────────────────────────────────────────────────────────
 
-std::string BluetoothService::runCmd(const std::string& cmd) noexcept {
+std::string BluetoothService::runCmd(std::vector<std::string> args) noexcept {
     // Async + cached: hccontrol can hang on a wedged adapter, and this runs on
     // the compositor's single event-loop thread — never block it.
-    return g_asyncShell.get(cmd);
+    return g_asyncShell.get(std::move(args));
 }
 
 bool BluetoothService::adapterPresent() noexcept {
-    // Cached exit-code check (emit a token on success so we can read it back).
-    return g_asyncShell.get(
-        "hccontrol -n hci0 read_bd_addr >/dev/null 2>&1 && echo ok").find("ok")
-        != std::string::npos;
+    return g_asyncShell.succeeded({"hccontrol", "-n", "hci0", "read_bd_addr"});   // cached exit status
 }
 
 bool BluetoothService::adapterEnabled() noexcept {
-    return g_asyncShell.get(
-        "hccontrol -n hci0 read_local_features >/dev/null 2>&1 && echo ok").find("ok")
-        != std::string::npos;
+    return g_asyncShell.succeeded({"hccontrol", "-n", "hci0", "read_local_features"});
 }
 
 void BluetoothService::setEnabled(bool on) noexcept {
     if (on) {
-        runDetached("service bluetooth start hci0 2>/dev/null");
+        runDetached({"service", "bluetooth", "start", "hci0"});
         std::cout << "[BluetoothService] Adapter enabled\n";
     } else {
-        runDetached("service bluetooth stop hci0 2>/dev/null");
+        runDetached({"service", "bluetooth", "stop", "hci0"});
         std::cout << "[BluetoothService] Adapter disabled\n";
     }
 }
@@ -65,7 +60,7 @@ std::vector<shared::BluetoothDevice> BluetoothService::listDevices() noexcept {
     { std::lock_guard<std::mutex> lk(devices_mutex_); devs = known_devices_; }
 
     // Augment with paired keys from the host controller store
-    std::string keys_out = runCmd("hccontrol -n hci0 read_stored_link_key 2>/dev/null");
+    std::string keys_out = runCmd({"hccontrol", "-n", "hci0", "read_stored_link_key"});
     std::istringstream ss(keys_out);
     std::string line;
     std::regex addr_re(R"(BD_ADDR:\s*([0-9a-fA-F:]{17}))");
@@ -105,7 +100,7 @@ void BluetoothService::runScan() noexcept {
     //   Page Scan Rep. Mode: 0x01
     //   Class: ...
     //   Clock offset: 0x...
-    std::string out = runCmd("hccontrol -n hci0 inquiry 2>/dev/null");
+    std::string out = runCmd({"hccontrol", "-n", "hci0", "inquiry"});
 
     std::istringstream ss(out);
     std::string line;
@@ -119,8 +114,7 @@ void BluetoothService::runScan() noexcept {
         if (!have_dev) return;
         // Resolve name via hccontrol remote_name_request (best-effort, quick timeout)
         if (std::strncmp(cur.name_, cur.addr_.str_, 17) == 0) {
-            std::string nc = runCmd(std::string("hccontrol -n hci0 remote_name_request ")
-                                    + cur.addr_.str_ + " 2>/dev/null");
+            std::string nc = runCmd({"hccontrol", "-n", "hci0", "remote_name_request", cur.addr_.str_});
             std::smatch nm;
             if (std::regex_search(nc, nm, name_re))
                 std::strncpy(cur.name_, nm[1].str().c_str(), sizeof(cur.name_) - 1);
@@ -240,9 +234,7 @@ void BluetoothService::ProcessMessage(std::shared_ptr<IpcSocket> client,
             break;
         }
         // Connect HID device via bthidcontrol
-        std::string cmd = std::string("bthidcontrol -a ") + req.addr_.str_
-                          + " -c /etc/bluetooth/bthidd.conf connect 2>/dev/null";
-        (void)fbx::xserver::spawnStatus(cmd.c_str());
+        (void)spawnArgvRun({"bthidcontrol", "-a", req.addr_.str_, "-c", "/etc/bluetooth/bthidd.conf", "connect"}, 10);
         std::cout << "[BluetoothService] Connect: " << req.addr_.str_ << "\n";
         for (auto& d : known_devices_)
             if (std::strncmp(d.addr_.str_, req.addr_.str_, 17) == 0)
@@ -262,9 +254,7 @@ void BluetoothService::ProcessMessage(std::shared_ptr<IpcSocket> client,
             (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
             break;
         }
-        std::string cmd = std::string("bthidcontrol -a ") + req.addr_.str_
-                          + " -c /etc/bluetooth/bthidd.conf disconnect 2>/dev/null";
-        (void)fbx::xserver::spawnStatus(cmd.c_str());
+        (void)spawnArgvRun({"bthidcontrol", "-a", req.addr_.str_, "-c", "/etc/bluetooth/bthidd.conf", "disconnect"}, 10);
         std::cout << "[BluetoothService] Disconnect: " << req.addr_.str_ << "\n";
         for (auto& d : known_devices_)
             if (std::strncmp(d.addr_.str_, req.addr_.str_, 17) == 0)
@@ -284,9 +274,7 @@ void BluetoothService::ProcessMessage(std::shared_ptr<IpcSocket> client,
             break;
         }
         // Initiate pairing: hccontrol create_connection + hcsecd handles key exchange
-        std::string cmd = std::string("hccontrol -n hci0 create_connection ")
-                          + req.addr_.str_ + " 2>/dev/null";
-        (void)fbx::xserver::spawnStatus(cmd.c_str());
+        (void)spawnArgvRun({"hccontrol", "-n", "hci0", "create_connection", req.addr_.str_}, 10);
         std::cout << "[BluetoothService] Pair: " << req.addr_.str_ << "\n";
         for (auto& d : known_devices_)
             if (std::strncmp(d.addr_.str_, req.addr_.str_, 17) == 0)
@@ -306,9 +294,7 @@ void BluetoothService::ProcessMessage(std::shared_ptr<IpcSocket> client,
             break;
         }
         // Remove stored link key
-        std::string cmd = std::string("hccontrol -n hci0 delete_stored_link_key ")
-                          + req.addr_.str_ + " 2>/dev/null";
-        (void)fbx::xserver::spawnStatus(cmd.c_str());
+        (void)spawnArgvRun({"hccontrol", "-n", "hci0", "delete_stored_link_key", req.addr_.str_}, 10);
         std::cout << "[BluetoothService] Forget: " << req.addr_.str_ << "\n";
         known_devices_.erase(
             std::remove_if(known_devices_.begin(), known_devices_.end(),

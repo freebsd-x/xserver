@@ -18,7 +18,7 @@ constexpr const char* kService = "com.freebsdx.AudioOutput";
 
 std::vector<audio::AudioSink> listSinks() {
     // posix_spawn, not popen (popen deadlocks the threaded compositor).
-    return audio::parseSndstat(spawnCapture("cat /dev/sndstat 2>/dev/null"));
+    return audio::parseSndstat(spawnArgvCapture({"cat", "/dev/sndstat"}));
 }
 
 shared::AudioSinkPage buildPage(const std::vector<audio::AudioSink>& sinks, uint32_t page) {

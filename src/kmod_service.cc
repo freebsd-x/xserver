@@ -20,7 +20,7 @@ void KmodService::handleMessage(const shared::XBusMessage& msg,
     case O::ListModules: {
         uint32_t page = 0; std::memcpy(&page, msg.payload_, sizeof(page));
         // posix_spawn, not popen (popen deadlocks the threaded compositor).
-        auto mods = kmod::parseKldstat(spawnCapture("kldstat 2>/dev/null"));
+        auto mods = kmod::parseKldstat(spawnArgvCapture({"kldstat"}));
 
         shared::KmodPage pg{};
         pg.page_  = page;

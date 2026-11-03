@@ -97,14 +97,11 @@ PkgSigningService::VerifyPackage(const std::string& xpkg_path) noexcept {
                     if (!e.is_regular_file()) continue;
                     if (e.path().extension() != ".pub") continue;
 
-                    // All paths must be shell-quoted: a crafted package path with
-                    // an embedded quote could otherwise inject a command that
-                    // forces system() to return 0 — a verification bypass.
-                    std::string cmd = "minisign -V -q -p " + shellQuote(e.path().string())
-                                    + " -m " + shellQuote(xpkg_path)
-                                    + " -x " + shellQuote(minisig)
-                                    + " 2>/dev/null";
-                    if (fbx::xserver::spawnStatus(cmd.c_str()) == 0) {
+                    // argv, no shell: a crafted package path can't inject a
+                    // command that makes the check "succeed" (a verification
+                    // bypass) — it is only ever an argument.
+                    if (fbx::xserver::spawnArgvRun({"minisign", "-V", "-q", "-p", e.path().string(),
+                                                    "-m", xpkg_path, "-x", minisig}, 30) == 0) {
                         auto [fp, lbl] = parsePubKey(e.path());
                         return {true, "verified by key: " + (lbl.empty() ? fp : lbl)};
                     }
@@ -115,9 +112,7 @@ PkgSigningService::VerifyPackage(const std::string& xpkg_path) noexcept {
     }
 
     // GPG detached signature fallback
-    std::string cmd = "gpg --quiet --batch --verify "
-                    + shellQuote(gpgsig) + " " + shellQuote(xpkg_path) + " 2>/dev/null";
-    if (fbx::xserver::spawnStatus(cmd.c_str()) == 0) {
+    if (fbx::xserver::spawnArgvRun({"gpg", "--quiet", "--batch", "--verify", "--", gpgsig, xpkg_path}, 30) == 0) {
         return {true, "verified via GPG"};
     }
     return {false, "GPG signature verification failed or key not in keyring"};
@@ -208,8 +203,7 @@ void PkgSigningService::ProcessMessage(std::shared_ptr<IpcSocket> client,
 
         // For GPG keys, also import into the GPG keyring so --verify works
         if (is_gpg) {
-            std::string cmd = "gpg --import " + shellQuote(src) + " 2>/dev/null";
-            fbx::xserver::spawnStatus(cmd.c_str());
+            (void)fbx::xserver::spawnArgvRun({"gpg", "--batch", "--import", "--", src}, 30);
         }
 
         auto [fp, lbl] = is_minisign

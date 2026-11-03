@@ -17,12 +17,10 @@ namespace {
 // posix_spawn, not popen (popen deadlocks the threaded compositor — async_shell).
 std::vector<smart::SmartInfo> enumerate() {
     std::vector<smart::SmartInfo> drives;
-    for (auto& name : smart::parseDiskList(spawnCapture("sysctl -n kern.disks 2>/dev/null"))) {
+    for (auto& name : smart::parseDiskList(spawnArgvCapture({"sysctl", "-n", "kern.disks"}))) {
         smart::SmartInfo d;
         d.name = name;
-        char cmd[96];
-        std::snprintf(cmd, sizeof(cmd), "smartctl -H -A /dev/%s 2>/dev/null", name.c_str());
-        smart::parseSmartctl(spawnCapture(cmd), d);
+        smart::parseSmartctl(spawnArgvCapture({"smartctl", "-H", "-A", "/dev/" + name}, {.timeout_sec = 10}), d);
         drives.push_back(std::move(d));
     }
     return drives;

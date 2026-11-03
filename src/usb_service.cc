@@ -19,12 +19,12 @@ namespace {
 // dump_device_desc per device for vid/pid/class/manufacturer. posix_spawn, not
 // popen (popen deadlocks in this threaded compositor — see async_shell.h).
 std::vector<usb::UsbInfo> enumerate() {
-    auto devs = usb::parseList(spawnCapture("usbconfig list 2>/dev/null"));
+    auto devs = usb::parseList(spawnArgvCapture({"usbconfig", "list"}));
     if (devs.empty()) {
         // usbconfig sees nothing without read access to /dev/usb/* (root:
         // operator); fall back to devinfo, which any user can read — devices
         // with a driver attached, named by the driver's %desc.
-        devs = usb::parseDevinfo(spawnCapture("devinfo -v 2>/dev/null"));
+        devs = usb::parseDevinfo(spawnArgvCapture({"devinfo", "-v"}));
         for (auto& u : devs) {
             size_t i = u.driver.find_first_of("0123456789");
             if (i == std::string::npos) continue;
@@ -37,10 +37,8 @@ std::vector<usb::UsbInfo> enumerate() {
         return devs;
     }
     for (auto& u : devs) {
-        char cmd[96];
-        std::snprintf(cmd, sizeof(cmd),
-                      "usbconfig -d ugen%u.%u dump_device_desc 2>/dev/null", u.bus, u.addr);
-        usb::parseDeviceDesc(spawnCapture(cmd), u);
+        usb::parseDeviceDesc(spawnArgvCapture({"usbconfig", "-d", "ugen" + std::to_string(u.bus) + "." +
+                                                std::to_string(u.addr), "dump_device_desc"}), u);
     }
     return devs;
 }
@@ -48,7 +46,7 @@ std::vector<usb::UsbInfo> enumerate() {
 // A USB stick's size: the GEOM disk whose serial (ident) is the device's.
 uint32_t capacityMb(const usb::UsbInfo& u) {
     if (u.cls != "MSC" || u.serial.empty()) return 0;
-    for (const auto& d : geom::parseDisks(spawnCapture("geom disk list 2>/dev/null")))
+    for (const auto& d : geom::parseDisks(spawnArgvCapture({"geom", "disk", "list"})))
         if (d.ident == u.serial) return static_cast<uint32_t>(d.bytes >> 20);
     return 0;
 }

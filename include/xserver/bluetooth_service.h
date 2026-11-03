@@ -24,7 +24,7 @@ public:
 
 private:
     // CLI helpers (popen-based, same pattern as PrintService)
-    static std::string runCmd(const std::string& cmd) noexcept;
+    static std::string runCmd(std::vector<std::string> args) noexcept;
     static bool adapterPresent() noexcept;
     static bool adapterEnabled() noexcept;
     static void setEnabled(bool on) noexcept;

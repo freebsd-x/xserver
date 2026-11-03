@@ -17,7 +17,7 @@ namespace {
 // forks in this multithreaded compositor and the child deadlocks on a libc stdio
 // lock held by another thread at fork time (see async_shell.h).
 std::string runSockstat() {
-    return spawnCapture("sockstat -46sn 2>/dev/null");
+    return spawnArgvCapture({"sockstat", "-46sn"});
 }
 }  // namespace
 

@@ -80,10 +80,14 @@ std::vector<shared::FontInfo> FontManagerService::enumerateFonts() noexcept {
     const char* home = std::getenv("HOME");
     std::string user_prefix = home ? (std::string(home) + "/.fonts/") : "";
 
-    std::istringstream fs_in(xserver::runCapped(
-        "fc-list --format '%{family[0]}|%{style[0]}|%{file}\n' 2>/dev/null | sort -u"));
-    std::string line;
-    while (std::getline(fs_in, line)) {
+    // argv, no shell; sorted and de-duplicated here rather than by `| sort -u`.
+    std::istringstream raw(xserver::runCapped(
+        {"fc-list", "--format", "%{family[0]}|%{style[0]}|%{file}\n"}));
+    std::vector<std::string> lines;
+    for (std::string l; std::getline(raw, l);) lines.push_back(std::move(l));
+    std::sort(lines.begin(), lines.end());
+    lines.erase(std::unique(lines.begin(), lines.end()), lines.end());
+    for (std::string line : lines) {
         // strip trailing newline
         if (!line.empty() && line.back() == '\n') line.pop_back();
         if (line.empty()) continue;
@@ -158,8 +162,7 @@ bool FontManagerService::installFont(const std::string& src_path) noexcept {
     }
 
     // Rebuild font cache for user fonts (non-blocking, quick)
-    std::string cmd = "fc-cache -f " + fonts_dir + " 2>/dev/null";
-    (void)fbx::xserver::spawnStatus(cmd.c_str());
+    (void)fbx::xserver::spawnArgvRun({"fc-cache", "-f", fonts_dir}, 60);
 
     return true;
 }
@@ -182,8 +185,7 @@ bool FontManagerService::removeFont(const std::string& path) noexcept {
 
     const char* home = std::getenv("HOME");
     if (home) {
-        std::string cmd = "fc-cache -f " + std::string(home) + "/.fonts 2>/dev/null";
-        (void)fbx::xserver::spawnStatus(cmd.c_str());
+        (void)fbx::xserver::spawnArgvRun({"fc-cache", "-f", std::string(home) + "/.fonts"}, 60);
     }
 
     return true;

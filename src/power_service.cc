@@ -115,20 +115,20 @@ void PowerService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         std::cout << "[PowerService] Suspend requested\n";
         LockService::lock(); // lock before suspending
         (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-        (void)fbx::xserver::spawnStatus("acpiconf -s 3");
+        (void)fbx::xserver::spawnArgvRun({"acpiconf", "-s", "3"});
         break;
 
     case PowerOpcode::Hibernate:
         std::cout << "[PowerService] Hibernate requested\n";
         LockService::lock(); // lock before hibernating
         (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-        (void)fbx::xserver::spawnStatus("acpiconf -s 4");
+        (void)fbx::xserver::spawnArgvRun({"acpiconf", "-s", "4"});
         break;
 
     case PowerOpcode::Reboot:
         std::cout << "[PowerService] Reboot requested\n";
         (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-        (void)fbx::xserver::spawnStatus("shutdown -r now");
+        (void)fbx::xserver::spawnArgvRun({"shutdown", "-r", "now"});
         break;
 
     case PowerOpcode::SetLidPolicy: {
@@ -139,9 +139,7 @@ void PowerService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         // Reflect to ACPI if possible (best-effort; may require root)
         const char* states[] = {"none", "S3", "S4", "S5"};
         if (req.action_ < 4) {
-            std::string cmd = std::string("sysctl hw.acpi.lid_switch_state=")
-                              + states[req.action_];
-            (void)fbx::xserver::spawnStatus(cmd.c_str());
+            (void)fbx::xserver::spawnArgvRun({"sysctl", std::string("hw.acpi.lid_switch_state=") + states[req.action_]});
         }
         (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
         break;

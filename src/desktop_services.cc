@@ -294,7 +294,7 @@ void GameControllerService::handleMessage(const shared::XBusMessage& msg,
     switch (static_cast<O>(msg.opcode_)) {
     case O::ListControllers: {
         std::vector<desktop::EvdevDevice> pads;
-        for (auto& d : desktop::parseEvdevSysctl(spawnCapture("sysctl kern.evdev.input 2>/dev/null")))
+        for (auto& d : desktop::parseEvdevSysctl(spawnArgvCapture({"sysctl", "kern.evdev.input"})))
             if (desktop::isGameController(d)) pads.push_back(std::move(d));
         uint32_t page = readPage(msg);
         shared::GameControllerPage pg{};

@@ -18,7 +18,7 @@ std::string runPkgUpgrade() {
     // Can take a while (may consult the repo catalogue) and handlers run on
     // the compositor thread: answer from the last result, refresh in the
     // background (capped at 30 s).
-    return g_asyncShell.get("pkg upgrade -n 2>/dev/null", 30);
+    return g_asyncShell.get({"pkg", "upgrade", "-n"}, 30);
 }
 }  // namespace
 

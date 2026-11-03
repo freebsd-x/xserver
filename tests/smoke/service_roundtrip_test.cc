@@ -3168,7 +3168,7 @@ TEST_F(ServiceRoundtrip, BackupRunsTarOnAWorker) {
     for (const auto& de : std::filesystem::directory_iterator(dst)) archives.push_back(de.path().string());
     ASSERT_EQ(archives.size(), 1u);
     EXPECT_NE(archives[0].find("/data-"), std::string::npos);
-    std::string listing = spawnCapture("tar -tzf '" + archives[0] + "'");
+    std::string listing = spawnArgvCapture({"tar", "-tzf", archives[0]});
     EXPECT_NE(listing.find("a.txt"), std::string::npos);
 }
 

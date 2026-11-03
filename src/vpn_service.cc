@@ -1,3 +1,6 @@
+#include <vector>
+#include <algorithm>
+#include <filesystem>
 #include "xserver/vpn_service.h"
 #include "xserver/ipc_socket.h"
 #include "xserver/shell_util.h"
@@ -14,10 +17,10 @@ namespace fbx::xserver { void BroadcastXBusMessage(const shared::XBusMessage& ms
 
 namespace fbx::xserver {
 
-static std::string runCmd(const std::string& cmd) noexcept {
+static std::string runCmd(std::vector<std::string> args) noexcept {
     // Async + cached: `wg show`/ifconfig status queries must never block the
     // single-threaded compositor event loop (all callers here are read-only).
-    return g_asyncShell.get(cmd);
+    return g_asyncShell.get(std::move(args));
 }
 
 // Parse `wg show <iface>` output for endpoint and transfer bytes.
@@ -63,7 +66,7 @@ shared::VpnStatus VpnService::getStatus() noexcept {
     shared::VpnStatus st{};
 
     // Detect which wg interfaces are up
-    std::string ifaces_out = runCmd("wg show interfaces 2>/dev/null");
+    std::string ifaces_out = runCmd({"wg", "show", "interfaces"});
     if (ifaces_out.empty()) return st;
 
     // Take the first reported interface
@@ -76,11 +79,11 @@ shared::VpnStatus VpnService::getStatus() noexcept {
     st.connected_ = 1;
 
     // Parse endpoint + transfer stats
-    std::string wgout = runCmd("wg show " + iface + " 2>/dev/null");
+    std::string wgout = runCmd({"wg", "show", iface});
     parseWgShow(wgout, st);
 
     // Tunnel IP from ifconfig
-    std::string ifout = runCmd("ifconfig " + iface + " inet 2>/dev/null");
+    std::string ifout = runCmd({"ifconfig", iface, "inet"});
     std::istringstream ifs(ifout);
     std::string tok;
     while (ifs >> tok) {
@@ -113,23 +116,19 @@ void VpnService::connectBackground(const char* iface) noexcept {
     std::string name(iface);
 
     if (name.empty()) {
-        // Find the first available .conf in /etc/wireguard/
-        std::string listing = runCmd("ls /etc/wireguard/*.conf 2>/dev/null | head -1");
-        // Strip trailing newline/spaces
-        while (!listing.empty() &&
-               (listing.back() == '\n' || listing.back() == '\r' || listing.back() == ' '))
-            listing.pop_back();
-        if (listing.empty()) {
+        // The first .conf in /etc/wireguard/ (by name), as its basename:
+        // /etc/wireguard/wg0.conf → wg0. (Read directly: the cached `ls`
+        // returned nothing on the first connect.)
+        std::vector<std::string> confs;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator("/etc/wireguard", ec))
+            if (e.path().extension() == ".conf") confs.push_back(e.path().stem().string());
+        if (confs.empty()) {
             LOG_INFO("VPN: no .conf files found in /etc/wireguard/");
             return;
         }
-        // Extract basename without extension: /etc/wireguard/wg0.conf → wg0
-        size_t slash = listing.rfind('/');
-        size_t dot   = listing.rfind('.');
-        if (slash != std::string::npos && dot != std::string::npos && dot > slash)
-            name = listing.substr(slash + 1, dot - slash - 1);
-        else
-            name = listing;
+        std::sort(confs.begin(), confs.end());
+        name = confs.front();
     }
 
     if (!isValidInterfaceName(name)) {
@@ -140,7 +139,7 @@ void VpnService::connectBackground(const char* iface) noexcept {
     LOG_INFO("VPN: bringing up {}", name);
 
     // Ensure kernel module is loaded
-    (void)fbx::xserver::spawnStatus("kldload if_wg 2>/dev/null");
+    (void)fbx::xserver::spawnArgvRun({"kldload", "if_wg"});
 
     int rc = fbx::xserver::spawnArgvRun({"wg-quick", "up", name});
     if (rc != 0)
@@ -156,7 +155,7 @@ void VpnService::disconnectBackground(const char* iface) noexcept {
 
     if (name.empty()) {
         // Bring down every active wg interface
-        std::string ifaces_out = runCmd("wg show interfaces 2>/dev/null");
+        std::string ifaces_out = spawnArgvCapture({"wg", "show", "interfaces"}, {.timeout_sec = 5});   // fresh, not cached: this decides what to bring down
         std::istringstream ss(ifaces_out);
         std::string tok;
         while (ss >> tok) {
@@ -205,7 +204,7 @@ bool VpnService::importConfig(const char* src_path,
     }
 
     // Ensure /etc/wireguard/ exists
-    (void)fbx::xserver::spawnStatus("mkdir -p /etc/wireguard 2>/dev/null");
+    (void)fbx::xserver::spawnArgvRun({"mkdir", "-p", "/etc/wireguard"});
 
     FILE* fdst = fopen(dst.c_str(), "w");
     if (!fdst) {

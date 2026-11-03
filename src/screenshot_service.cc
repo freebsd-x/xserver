@@ -248,12 +248,13 @@ void ScreenshotService::recordingLoop(uint32_t output_idx, uint32_t fps,
         ::mkdir((std::string(home) + "/Videos").c_str(), 0755);
     }
 
-    char ffcmd[1024];
-    std::snprintf(ffcmd, sizeof(ffcmd),
-        "ffmpeg -y -r %u -i '%s/frame-%%06d.png' -c:v libx264 -pix_fmt yuv420p '%s' "
-        ">/dev/null 2>&1 && rm -rf '%s'",
-        fps, frames_dir.c_str(), out_path.c_str(), frames_dir.c_str());
-    (void)spawnStatus(ffcmd); // best-effort (posix_spawn, fork-safe — see async_shell.h); frames stay if ffmpeg absent
+    // argv (no shell); the frames are removed only once ffmpeg has made the
+    // video — if ffmpeg is missing or fails they stay.
+    if (spawnArgvRun({"ffmpeg", "-y", "-r", std::to_string(fps), "-i", frames_dir + "/frame-%06d.png",
+                      "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path}) == 0) {
+        std::error_code ec;
+        std::filesystem::remove_all(frames_dir, ec);
+    }
 
     {
         std::lock_guard<std::mutex> lock(record_mutex_);

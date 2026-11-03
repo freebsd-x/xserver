@@ -24,7 +24,7 @@ using namespace svc;
 
 // Why there's no hotspot on this machine (for the log).
 std::string hotspotUnavailableReason() {
-    auto wlans = sysadmin::parseWlanIfaces(spawnCapture("ifconfig -l 2>/dev/null"));
+    auto wlans = sysadmin::parseWlanIfaces(spawnArgvCapture({"ifconfig", "-l"}));
     if (wlans.empty()) return "there's no Wi-Fi interface";
     for (const auto& w : wlans)
         if (extras::driverSupportsHostap(spawnArgvCapture({"ifconfig", w, "list", "caps"})))
@@ -35,7 +35,7 @@ std::string hotspotUnavailableReason() {
 // ── Bluetooth ────────────────────────────────────────────────────────────────
 
 bool haveBluetoothController() {
-    std::string tree = spawnCapture("devinfo 2>/dev/null");
+    std::string tree = spawnArgvCapture({"devinfo"});
     for (std::string_view drv : {"ubt", "iwmbt", "iwbt", "ng_ubt"}) {
         size_t p = 0;
         while ((p = tree.find(drv, p)) != std::string::npos) {

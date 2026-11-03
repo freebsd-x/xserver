@@ -27,9 +27,9 @@ static std::atomic<bool>     g_update_check_inflight{false};
 static uint32_t queryPendingUpdatesBlocking() noexcept {
     // posix_spawn, not popen (see async_shell.h — popen deadlocks the forked child on
     // a libc stdio lock in the multithreaded compositor).
-    std::string out = spawnCapture("pkg version -l '<' 2>/dev/null | wc -l");
-    long n = std::strtol(out.c_str(), nullptr, 10);
-    return (n > 0) ? static_cast<uint32_t>(n) : 0u;
+    // One line per outdated package (counted here rather than by `| wc -l`).
+    std::string out = spawnArgvCapture({"pkg", "version", "-l", "<"}, {.timeout_sec = 120});
+    return static_cast<uint32_t>(std::count(out.begin(), out.end(), '\n'));
 }
 
 // Kick a background refresh of the cached count if one isn't already running.

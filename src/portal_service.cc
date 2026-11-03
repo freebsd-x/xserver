@@ -167,7 +167,7 @@ static std::string datasetForPath(const std::string& path) {
 
     // posix_spawn, not popen (fork-safe in the multithreaded compositor — see
     // async_shell.h), then split the captured output into lines.
-    std::string listing = fbx::xserver::spawnCapture("zfs list -H -o name,mountpoint 2>/dev/null");
+    std::string listing = fbx::xserver::spawnArgvCapture({"zfs", "list", "-H", "-o", "name,mountpoint"});
 
     std::string best_dataset;
     size_t best_len = 0;
@@ -244,12 +244,12 @@ void PortalService::handleZfsRollback(std::shared_ptr<IpcSocket> client, const s
     }
     std::string snap_spec = dataset + "@" + snapname;
     // -r: recursively destroy intermediate snapshots so rollback can proceed
-    // snap_spec ends in a client-supplied snapshot name — quote it.
-    std::string cmd = "zfs rollback -r " + shellQuote(snap_spec) + " 2>&1";
-    std::cout << "[PortalService] ZfsRollback: " << cmd << "\n";
+    // snap_spec ends in a client-supplied snapshot name — an argument, no shell.
+    std::cout << "[PortalService] ZfsRollback: " << snap_spec << "\n";
 
     int rc = -1;
-    std::string output = fbx::xserver::spawnCaptureStatus(cmd, &rc);  // posix_spawn, fork-safe
+    std::string output = fbx::xserver::spawnArgvCapture({"zfs", "rollback", "-r", snap_spec},
+                                                        {.timeout_sec = 120, .exit_code = &rc, .merge_stderr = true});
     if (rc == 0) {
         sendZfsResponse(client, msg, true, "Rolled back to " + snapname);
     } else {
@@ -293,11 +293,11 @@ void PortalService::handleZfsSnapshot(std::shared_ptr<IpcSocket> client, const s
     }
     std::string snap_spec = dataset + "@snap-" + ts;
 
-    std::string cmd = "zfs snapshot " + shellQuote(snap_spec) + " 2>&1";
-    std::cout << "[PortalService] ZfsSnapshot: " << cmd << "\n";
+    std::cout << "[PortalService] ZfsSnapshot: " << snap_spec << "\n";
 
     int rc = -1;
-    std::string output = fbx::xserver::spawnCaptureStatus(cmd, &rc);  // posix_spawn, fork-safe
+    std::string output = fbx::xserver::spawnArgvCapture({"zfs", "snapshot", snap_spec},
+                                                        {.timeout_sec = 120, .exit_code = &rc, .merge_stderr = true});
     if (rc == 0) {
         sendZfsResponse(client, msg, true, "Snapshot created: snap-" + std::string(ts));
     } else {

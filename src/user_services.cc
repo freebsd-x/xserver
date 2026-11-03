@@ -53,7 +53,7 @@ std::mutex g_cron_mu;
 // The user's crontab text; nullopt when they have none (crontab -l exits 1).
 std::optional<std::string> readCrontab() {
     int rc = -1;
-    std::string out = spawnCaptureStatus("/usr/bin/crontab -l 2>/dev/null", &rc);
+    std::string out = spawnArgvCapture({"/usr/bin/crontab", "-l"}, {.exit_code = &rc});
     if (rc != 0) return std::nullopt;
     return out;
 }

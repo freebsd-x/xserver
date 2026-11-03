@@ -106,7 +106,7 @@ shared::HardwareStatus HardwareService::getStatus() noexcept {
     len = sizeof(brightness);
     if (sysctlbyname("hw.acpi.video.lcd0.brightness", &brightness, &len, nullptr, 0) == 0) {
         status.backlight_level_ = static_cast<uint32_t>(brightness);
-    } else if (int b = backlight::parseBrightness(spawnCapture("backlight 2>/dev/null")); b >= 0) {
+    } else if (int b = backlight::parseBrightness(spawnArgvCapture({"backlight"})); b >= 0) {
         status.backlight_level_ = static_cast<uint32_t>(b);
     }
 

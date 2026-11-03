@@ -228,12 +228,14 @@ shared::CameraState CameraService::startRecording(const shared::CameraRecordRequ
 
     record_path_ = timestampedPath(dir, "camera", "mp4");
 
-    // Built here and started with posix_spawn: the old fork() child built this
-    // string (allocating) — unsafe after fork in the multi-threaded compositor.
-    const std::string cmd = std::format(
-        "ffmpeg -f v4l2 -video_size {}x{} -i {} -c:v libx264 -preset ultrafast {}",
-        current_width_, current_height_, shellQuote(dev), shellQuote(record_path_));
-    const pid_t pid = spawn::start("/bin/sh", "sh", {"-c", cmd});
+    // ffmpeg itself, not `sh -c "ffmpeg …"`: record_pid_ must be ffmpeg's, or
+    // stopRecording's SIGTERM killed only the shell — ffmpeg was orphaned and
+    // kept recording, its MP4 never finalized. (argv: dev and the path are
+    // client-derived, only ever arguments.)
+    const pid_t pid = spawn::start(
+        spawn::firstExecutable({"/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"}), "ffmpeg",
+        {"-f", "v4l2", "-video_size", std::format("{}x{}", current_width_, current_height_),
+         "-i", dev, "-c:v", "libx264", "-preset", "ultrafast", record_path_});
     if (pid < 0) return getState();
     record_pid_ = pid;
     recording_  = true;
