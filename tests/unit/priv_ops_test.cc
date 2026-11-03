@@ -178,3 +178,57 @@ TEST(PrivOps, AdBlockApplyIsOnlyOnOrOff) {
     EXPECT_FALSE(validateOp(kAdBlockApply, "/etc/master.passwd"));   // never a path
     EXPECT_FALSE(validateOp(kAdBlockApply, "0.0.0.0 ads.example.com"));
 }
+
+// ── What the broker refuses to touch as root ─────────────────────────────────
+
+TEST(PrivOps, KmodUnloadRefusesProtectedModules) {
+    for (const char* m : {"mac_portacl", "mac_bsdextended", "mac_portacl.ko",          // security policy
+                          "pf", "pflog", "ipfw", "ipfilter", "ipfw.ko",                 // packet filters
+                          "drm", "drm2", "i915kms", "amdgpu", "linuxkpi", "nvidia-modeset",   // GPU
+                          "evdev", "hidbus", "hkbd", "hms", "ukbd", "psm", "kbdmux"})        // input
+        EXPECT_FALSE(validateOp(kKmodUnload, m)) << m;
+    // Ordinary modules still can be unloaded.
+    EXPECT_TRUE(validateOp(kKmodUnload, "ichsmb"));
+    EXPECT_TRUE(validateOp(kKmodUnload, "if_wg"));
+    EXPECT_TRUE(validateOp(kKmodUnload, "pflash"));   // a "pf" prefix alone isn't a filter
+}
+
+TEST(PrivOps, ServiceStopRefusesSecurityServices) {
+    for (const char* svc : {"xsessiond", "seatd", "auditd", "blacklistd"}) {
+        EXPECT_FALSE(validateOp(kServiceStop, svc)) << svc;
+        EXPECT_FALSE(validateOp(kServiceStart, svc)) << svc;
+    }
+    EXPECT_TRUE(validateOp(kServiceStop, "sshd"));
+}
+
+// Property: whatever validateOp accepts can never be read as an option, name a
+// path, or carry a shell metacharacter or control character — for every verb,
+// over many random arguments. (resolv.conf's body is the one multi-line arg;
+// its lines are checked as nameserver lines instead.)
+TEST(PrivOps, AcceptedArgumentsAreAlwaysInert) {
+    const char* verbs[] = {kAudioDefaultUnit, kFirewallEnable, kKmodUnload, kServiceStart, kServiceStop,
+                           kZfsScrub, kBeActivate, kBeDestroy, kJailRemove, kFirewallBlockIn,
+                           kWlanState, kAdBlockApply, kResolvConfWrite};
+    const std::string alphabet = "abcwlanpfmac_0123456789.:-/ \t\n;|&$`'\"\\*?<>()";
+    uint32_t seed = 20261103;
+    auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    int accepted = 0;
+    for (const char* verb : verbs) {
+        for (int i = 0; i < 20000; ++i) {
+            std::string arg;
+            size_t len = rnd() % 12;
+            if (std::string_view(verb) == kResolvConfWrite) arg = "nameserver ";
+            for (size_t k = 0; k < len; ++k) arg += alphabet[rnd() % alphabet.size()];
+            if (!validateOp(verb, arg)) continue;
+            ++accepted;
+            if (std::string_view(verb) == kResolvConfWrite) {
+                EXPECT_EQ(arg.find_first_of(";|&$`'\"\\*?<>()"), std::string::npos) << arg;
+                continue;
+            }
+            EXPECT_NE(arg.front(), '-') << verb << ": " << arg;
+            EXPECT_EQ(arg.find('/'), std::string::npos) << verb << ": " << arg;
+            EXPECT_EQ(arg.find_first_of(" \t\n;|&$`'\"\\*?<>()"), std::string::npos) << verb << ": " << arg;
+        }
+    }
+    EXPECT_GT(accepted, 100);   // the generator does reach the accepting paths
+}

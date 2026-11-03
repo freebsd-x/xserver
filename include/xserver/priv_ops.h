@@ -52,8 +52,33 @@ inline bool safeName(std::string_view arg, size_t max, std::string_view extra) n
 
 // rc services the desktop session itself depends on. Stopping (or restarting)
 // them from a Settings panel would kill the session, so the broker refuses.
+// Services the broker won't start/stop: the session's own (stopping them
+// ends the desktop) and the system's security record/defence — the audit
+// trail and brute-force blocking. Stopping those is for root, not for a
+// password-less request from the seat user.
 inline bool sessionCriticalService(std::string_view name) noexcept {
-    return name == "xsessiond" || name == "seatd";
+    return name == "xsessiond" || name == "seatd" || name == "auditd" || name == "blacklistd";
+}
+
+// Kernel modules the broker won't unload: MAC security policies (unloading one
+// silently drops system security rules), packet filters (the firewall has its
+// own setting, which keeps pf consistent), and the GPU/DRM and input drivers
+// the session itself runs on. A ".ko" suffix is ignored, so "mac_portacl.ko"
+// is "mac_portacl".
+inline bool protectedModule(std::string_view name) noexcept {
+    if (name.size() > 3 && name.substr(name.size() - 3) == ".ko") name.remove_suffix(3);
+    auto starts = [&](std::string_view p) { return name.substr(0, p.size()) == p; };
+    if (starts("mac_")) return true;                                      // MAC policies
+    for (std::string_view m : {"pf", "pflog", "pfsync", "ipfw", "ipfw_nat", "ipfw_nat64",
+                               "ipfw_nptv6", "ipfilter", "ipl", "ipdivert"})       // packet filters
+        if (name == m) return true;
+    if (starts("drm") || starts("linuxkpi") || starts("nvidia") || starts("amdgpu"))
+        return true;                                                      // GPU stack
+    for (std::string_view m : {"i915kms", "radeonkms", "ttm", "dmabuf", "lindebugfs",
+                               "evdev", "uinput", "hidbus", "hkbd", "hms", "hmt", "hgame",
+                               "usbhid", "ukbd", "ums", "psm", "atkbdc", "kbdmux"})   // display + input
+        if (name == m) return true;
+    return false;
 }
 
 // True only when `verb` is known AND `arg` is safe for it. This is the gate the
@@ -103,7 +128,7 @@ inline bool validateOp(std::string_view verb, std::string_view arg) noexcept {
                       (c >= 'A' && c <= 'Z') || c == '.' || c == '_' || c == '-';
             if (!ok) return false;
         }
-        return true;
+        return !protectedModule(arg);
     }
     if (verb == kServiceStart || verb == kServiceStop) {
         // An rc(8) script name; the daemon runs FIXED `service <name> start|stop`.
