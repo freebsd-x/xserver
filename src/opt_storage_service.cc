@@ -5,6 +5,7 @@
 #include "xserver/xbus_reply.h"
 #include "shared/logger.h"
 
+#include <mutex>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -50,6 +51,10 @@ uint32_t freePct() {
 }  // namespace
 
 void OptStorageService::broadcastState() noexcept {
+    // Snapshot and send as one step: the scan worker and a settings change both
+    // come here, and an older snapshot sent last would stand as the current state.
+    static std::mutex broadcast_mutex;
+    std::lock_guard<std::mutex> lk(broadcast_mutex);
     auto st = state();
     st.reclaimable_mb_ = reclaimable_mb_.load();
     broadcast("com.freebsdx.OptStorage", static_cast<uint32_t>(shared::OptStorageOpcode::StateChanged), &st);

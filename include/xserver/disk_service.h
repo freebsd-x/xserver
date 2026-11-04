@@ -28,7 +28,7 @@ private:
     static bool isValidPath(const std::string& path) noexcept;
 
     // Response helpers
-    static void sendStatus(std::shared_ptr<IpcSocket> client,
+    static void sendStatus(std::shared_ptr<IpcSocket> client, uint32_t txn,
                            bool ok, const std::string& msg) noexcept;
 
     static std::mutex mutex_;

@@ -149,8 +149,9 @@ void NotesService::fillEntry(shared::NoteEntry& out, const Note& n) noexcept {
     std::strncpy(out.body_,  n.body.c_str(),  sizeof(out.body_)  - 1);
 }
 
-void NotesService::sendEntry(IpcSocket* client, const Note& n) noexcept {
+void NotesService::sendEntry(IpcSocket* client, uint32_t txn, const Note& n) noexcept {
     shared::XBusMessage resp{};
+    resp.transaction_id_ = txn;
     std::strncpy(resp.service_name_, "com.freebsdx.Notes", sizeof(resp.service_name_) - 1);
     resp.opcode_ = static_cast<uint32_t>(shared::NotesOpcode::Get);
 
@@ -164,8 +165,9 @@ void NotesService::sendEntry(IpcSocket* client, const Note& n) noexcept {
     client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
 }
 
-void NotesService::sendStatus(IpcSocket* client, bool ok, uint32_t id) noexcept {
+void NotesService::sendStatus(IpcSocket* client, uint32_t txn, bool ok, uint32_t id) noexcept {
     shared::XBusMessage resp{};
+    resp.transaction_id_ = txn;
     std::strncpy(resp.service_name_, "com.freebsdx.Notes", sizeof(resp.service_name_) - 1);
     resp.opcode_ = static_cast<uint32_t>(shared::NotesOpcode::Add); // reused as ACK
     shared::NotesStatusResponse sr{};
@@ -175,13 +177,14 @@ void NotesService::sendStatus(IpcSocket* client, bool ok, uint32_t id) noexcept 
     client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
 }
 
-void NotesService::sendListPage(IpcSocket* client,
+void NotesService::sendListPage(IpcSocket* client, uint32_t txn,
                                 const std::vector<const Note*>& filtered,
                                 uint32_t page) noexcept {
     constexpr uint32_t kPerPage = 1;
     uint32_t offset = page * kPerPage;
 
     shared::XBusMessage resp{};
+    resp.transaction_id_ = txn;
     std::strncpy(resp.service_name_, "com.freebsdx.Notes", sizeof(resp.service_name_) - 1);
     resp.opcode_ = static_cast<uint32_t>(shared::NotesOpcode::List);
 
@@ -233,7 +236,7 @@ void NotesService::handleMessage(const shared::XBusMessage& msg,
         items_.push_back(std::move(n));
         saveToDisk();
         broadcastChanged();
-        sendStatus(client.get(), true, new_id);
+        sendStatus(client.get(), msg.transaction_id_, true, new_id);
 
     } else if (op == Op::Update) {
         shared::NoteEntry req{};
@@ -251,9 +254,9 @@ void NotesService::handleMessage(const shared::XBusMessage& msg,
             it->body     = req.body_;
             saveToDisk();
             broadcastChanged();
-            sendStatus(client.get(), true, it->id);
+            sendStatus(client.get(), msg.transaction_id_, true, it->id);
         } else {
-            sendStatus(client.get(), false);
+            sendStatus(client.get(), msg.transaction_id_, false);
         }
 
     } else if (op == Op::Delete) {
@@ -266,9 +269,9 @@ void NotesService::handleMessage(const shared::XBusMessage& msg,
             items_.erase(it);
             saveToDisk();
             broadcastChanged();
-            sendStatus(client.get(), true);
+            sendStatus(client.get(), msg.transaction_id_, true);
         } else {
-            sendStatus(client.get(), false);
+            sendStatus(client.get(), msg.transaction_id_, false);
         }
 
     } else if (op == Op::Get) {
@@ -278,9 +281,9 @@ void NotesService::handleMessage(const shared::XBusMessage& msg,
         auto it = std::find_if(items_.begin(), items_.end(),
                                [&](const Note& n){ return n.id == req.id_; });
         if (it != items_.end()) {
-            sendEntry(client.get(), *it);
+            sendEntry(client.get(), msg.transaction_id_, *it);
         } else {
-            sendStatus(client.get(), false);
+            sendStatus(client.get(), msg.transaction_id_, false);
         }
 
     } else if (op == Op::List) {
@@ -288,7 +291,7 @@ void NotesService::handleMessage(const shared::XBusMessage& msg,
         std::memcpy(&req, msg.payload_, sizeof(req));
 
         auto view = sortedView();
-        sendListPage(client.get(), view, req.page_);
+        sendListPage(client.get(), msg.transaction_id_, view, req.page_);
 
     } else if (op == Op::Search) {
         shared::NotesSearchRequest req{};
@@ -312,7 +315,7 @@ void NotesService::handleMessage(const shared::XBusMessage& msg,
             if (ci_contains(np->title) || ci_contains(np->body))
                 filtered.push_back(np);
         }
-        sendListPage(client.get(), filtered, req.page_);
+        sendListPage(client.get(), msg.transaction_id_, filtered, req.page_);
 
     } else if (op == Op::Pin || op == Op::Unpin) {
         shared::NotesIdRequest req{};
@@ -325,9 +328,9 @@ void NotesService::handleMessage(const shared::XBusMessage& msg,
             it->modified = static_cast<uint32_t>(std::time(nullptr));
             saveToDisk();
             broadcastChanged();
-            sendStatus(client.get(), true, it->id);
+            sendStatus(client.get(), msg.transaction_id_, true, it->id);
         } else {
-            sendStatus(client.get(), false);
+            sendStatus(client.get(), msg.transaction_id_, false);
         }
     }
 }

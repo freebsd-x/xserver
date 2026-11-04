@@ -239,6 +239,7 @@ void WeatherService::handleMessage(const XBusMessage& msg,
     if (op == WeatherOpcode::GetCurrent) {
         std::lock_guard<std::mutex> lk(mutex_);
         XBusMessage resp{};
+        resp.transaction_id_ = msg.transaction_id_;
         std::strncpy(resp.service_name_, "com.freebsdx.Weather",
                      sizeof(resp.service_name_) - 1);
         resp.opcode_ = static_cast<uint32_t>(WeatherOpcode::WeatherChanged);
@@ -249,21 +250,25 @@ void WeatherService::handleMessage(const XBusMessage& msg,
 
     if (op == WeatherOpcode::GetForecast) {
         std::lock_guard<std::mutex> lk(mutex_);
+        // One request, one reply: the page asked for (an empty request is page 0).
+        uint32_t want = 0;
+        std::memcpy(&want, msg.payload_, sizeof(want));
         uint32_t total = static_cast<uint32_t>(forecast_.size());
-        for (uint32_t i = 0; i < total; ++i) {
-            WeatherForecastPage page{};
-            page.page_     = i;
-            page.has_more_ = (i + 1 < total) ? 1 : 0;
-            page.total_    = total;
+        WeatherForecastPage page{};
+        page.page_  = want;
+        page.total_ = total;
+        if (want < total) {
+            page.has_more_ = (want + 1 < total) ? 1 : 0;
             page.count_    = 1;
-            page.day_      = forecast_[i];
-            XBusMessage resp{};
-            std::strncpy(resp.service_name_, "com.freebsdx.Weather",
-                         sizeof(resp.service_name_) - 1);
-            resp.opcode_ = static_cast<uint32_t>(WeatherOpcode::GetForecast);
-            std::memcpy(resp.payload_, &page, sizeof(page));
-            client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
+            page.day_      = forecast_[want];
         }
+        XBusMessage resp{};
+        resp.transaction_id_ = msg.transaction_id_;
+        std::strncpy(resp.service_name_, "com.freebsdx.Weather",
+                     sizeof(resp.service_name_) - 1);
+        resp.opcode_ = static_cast<uint32_t>(WeatherOpcode::GetForecast);
+        std::memcpy(resp.payload_, &page, sizeof(page));
+        client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
         return;
     }
 
@@ -288,6 +293,7 @@ void WeatherService::handleMessage(const XBusMessage& msg,
         resp.success_ = 1;
         std::strncpy(resp.message_, "Location updated", sizeof(resp.message_) - 1);
         XBusMessage out{};
+        out.transaction_id_ = msg.transaction_id_;
         std::strncpy(out.service_name_, "com.freebsdx.Weather",
                      sizeof(out.service_name_) - 1);
         out.opcode_ = static_cast<uint32_t>(WeatherOpcode::SetLocation);

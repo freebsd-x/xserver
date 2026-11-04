@@ -48,10 +48,10 @@ private:
                               uint32_t& out_count,
                               std::string& out_message) noexcept;
 
-    static void sendListPage(IpcSocket* client,
+    static void sendListPage(IpcSocket* client, uint32_t txn,
                              const std::vector<Entry>& entries,
                              uint32_t page) noexcept;
-    static void sendStatus(IpcSocket* client,
+    static void sendStatus(IpcSocket* client, uint32_t txn,
                            bool ok,
                            uint32_t total,
                            const std::string& message) noexcept;

@@ -203,17 +203,40 @@ std::vector<ZpoolInfo> DiskService::listZpools() noexcept {
 
 // ── Response helper ───────────────────────────────────────────────────────────
 
-void DiskService::sendStatus(std::shared_ptr<IpcSocket> client,
+void DiskService::sendStatus(std::shared_ptr<IpcSocket> client, uint32_t txn,
                              bool ok, const std::string& msg_text) noexcept {
     DiskStatusResponse resp{};
     resp.success_ = ok ? 1 : 0;
     std::strncpy(resp.message_, msg_text.c_str(), sizeof(resp.message_) - 1);
     XBusMessage out{};
+    out.transaction_id_ = txn;
     std::strncpy(out.service_name_, "com.freebsdx.Disk",
                  sizeof(out.service_name_) - 1);
     out.opcode_ = static_cast<uint32_t>(DiskOpcode::DiskChanged);
     std::memcpy(out.payload_, &resp, sizeof(resp));
     client->sendMessage({reinterpret_cast<const uint8_t*>(&out), sizeof(out)});
+}
+
+template <typename Page, typename Item, typename Set>
+static void fillPage(Page& page, uint32_t want, const std::vector<Item>& items, Set set) {
+    uint32_t total = static_cast<uint32_t>(items.size());
+    page.page_  = want;
+    page.total_ = total;
+    if (want < total) {
+        page.has_more_ = (want + 1 < total) ? 1 : 0;
+        page.count_    = 1;
+        set(items[want]);
+    }
+}
+
+template <typename Page>
+static void sendPage(IpcSocket& client, uint32_t txn, DiskOpcode op, const Page& page) noexcept {
+    XBusMessage resp{};
+    resp.transaction_id_ = txn;
+    std::strncpy(resp.service_name_, "com.freebsdx.Disk", sizeof(resp.service_name_) - 1);
+    resp.opcode_ = static_cast<uint32_t>(op);
+    std::memcpy(resp.payload_, &page, sizeof(page));
+    client.sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
 }
 
 static void broadcastDiskChanged() noexcept {
@@ -233,102 +256,42 @@ void DiskService::init() noexcept {
 void DiskService::handleMessage(const XBusMessage& msg,
                                 std::shared_ptr<IpcSocket> client) noexcept {
     auto op = static_cast<DiskOpcode>(msg.opcode_);
+    const uint32_t txn = msg.transaction_id_;   // worker threads reply with it after msg is gone
+
+    // The lists are paged: one request, one reply, the page asked for (an empty
+    // request is page 0). The client fetches the next while has_more_ is set.
+    uint32_t want = 0;
+    std::memcpy(&want, msg.payload_, sizeof(want));
 
     // ── ListDisks ─────────────────────────────────────────────────────────────
     if (op == DiskOpcode::ListDisks) {
         auto disks = enumerateDisks();
-        uint32_t total = static_cast<uint32_t>(disks.size());
-        if (total == 0) {
-            // Empty sentinel
-            DiskListPage page{};
-            XBusMessage resp{};
-            std::strncpy(resp.service_name_, "com.freebsdx.Disk",
-                         sizeof(resp.service_name_) - 1);
-            resp.opcode_ = static_cast<uint32_t>(DiskOpcode::ListDisks);
-            std::memcpy(resp.payload_, &page, sizeof(page));
-            client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-            return;
-        }
-        for (uint32_t i = 0; i < total; ++i) {
-            DiskListPage page{};
-            page.page_     = i;
-            page.has_more_ = (i + 1 < total) ? 1 : 0;
-            page.total_    = total;
-            page.count_    = 1;
-            page.disk_     = disks[i];
-            XBusMessage resp{};
-            std::strncpy(resp.service_name_, "com.freebsdx.Disk",
-                         sizeof(resp.service_name_) - 1);
-            resp.opcode_ = static_cast<uint32_t>(DiskOpcode::ListDisks);
-            std::memcpy(resp.payload_, &page, sizeof(page));
-            client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-        }
+        DiskListPage page{};
+        fillPage(page, want, disks, [&](const DiskInfo& d) { page.disk_ = d; });
+        sendPage(*client, txn, op, page);
         return;
     }
 
     // ── ListPartitions ────────────────────────────────────────────────────────
     if (op == DiskOpcode::ListPartitions) {
-        const auto* req = reinterpret_cast<const DiskNameRequest*>(msg.payload_);
-        std::string disk(req->name_, strnlen(req->name_, sizeof(req->name_)));
-        if (!isValidDevice(disk)) { sendStatus(client, false, "Invalid device name"); return; }
+        DiskPartitionsRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        std::string disk(req.disk_, strnlen(req.disk_, sizeof(req.disk_)));
+        if (!isValidDevice(disk)) { sendStatus(client, txn, false, "Invalid device name"); return; }
 
         auto parts = listPartitions(disk);
-        uint32_t total = static_cast<uint32_t>(parts.size());
-        if (total == 0) {
-            PartitionListPage page{};
-            XBusMessage resp{};
-            std::strncpy(resp.service_name_, "com.freebsdx.Disk",
-                         sizeof(resp.service_name_) - 1);
-            resp.opcode_ = static_cast<uint32_t>(DiskOpcode::ListPartitions);
-            std::memcpy(resp.payload_, &page, sizeof(page));
-            client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-            return;
-        }
-        for (uint32_t i = 0; i < total; ++i) {
-            PartitionListPage page{};
-            page.page_      = i;
-            page.has_more_  = (i + 1 < total) ? 1 : 0;
-            page.total_     = total;
-            page.count_     = 1;
-            page.partition_ = parts[i];
-            XBusMessage resp{};
-            std::strncpy(resp.service_name_, "com.freebsdx.Disk",
-                         sizeof(resp.service_name_) - 1);
-            resp.opcode_ = static_cast<uint32_t>(DiskOpcode::ListPartitions);
-            std::memcpy(resp.payload_, &page, sizeof(page));
-            client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-        }
+        PartitionListPage page{};
+        fillPage(page, req.page_, parts, [&](const PartitionInfo& p) { page.partition_ = p; });
+        sendPage(*client, txn, op, page);
         return;
     }
 
     // ── ListZpools ────────────────────────────────────────────────────────────
     if (op == DiskOpcode::ListZpools) {
         auto pools = listZpools();
-        uint32_t total = static_cast<uint32_t>(pools.size());
-        if (total == 0) {
-            ZpoolListPage page{};
-            XBusMessage resp{};
-            std::strncpy(resp.service_name_, "com.freebsdx.Disk",
-                         sizeof(resp.service_name_) - 1);
-            resp.opcode_ = static_cast<uint32_t>(DiskOpcode::ListZpools);
-            std::memcpy(resp.payload_, &page, sizeof(page));
-            client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-            return;
-        }
-        for (uint32_t i = 0; i < total; ++i) {
-            ZpoolListPage page{};
-            page.page_     = i;
-            page.has_more_ = (i + 1 < total) ? 1 : 0;
-            page.total_    = total;
-            page.count_    = 1;
-            page.pool_     = pools[i];
-            XBusMessage resp{};
-            std::strncpy(resp.service_name_, "com.freebsdx.Disk",
-                         sizeof(resp.service_name_) - 1);
-            resp.opcode_ = static_cast<uint32_t>(DiskOpcode::ListZpools);
-            std::memcpy(resp.payload_, &page, sizeof(page));
-            client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
-        }
+        ZpoolListPage page{};
+        fillPage(page, want, pools, [&](const ZpoolInfo& z) { page.pool_ = z; });
+        sendPage(*client, txn, op, page);
         return;
     }
 
@@ -338,17 +301,17 @@ void DiskService::handleMessage(const XBusMessage& msg,
         std::string dev(req->device_,      strnlen(req->device_,      sizeof(req->device_)));
         std::string mnt(req->mount_point_, strnlen(req->mount_point_, sizeof(req->mount_point_)));
         if (!isValidDevice(dev) || !isValidPath(mnt)) {
-            sendStatus(client, false, "Invalid device or mount point"); return;
+            sendStatus(client, txn, false, "Invalid device or mount point"); return;
         }
-        std::thread([dev, mnt, client]() {
+        std::thread([dev, mnt, client, txn]() {
             try {
                 int rc = -1;
                 std::string out = fbx::xserver::spawnArgvCapture({"mount", "/dev/" + dev, mnt},
                                                                  {.timeout_sec = 60, .exit_code = &rc, .merge_stderr = true});
                 broadcastDiskChanged();
-                DiskService::sendStatus(client, rc == 0, rc == 0 ? "Mounted" : out);
+                DiskService::sendStatus(client, txn, rc == 0, rc == 0 ? "Mounted" : out);
             } catch (...) {
-                DiskService::sendStatus(client, false, "Internal error");
+                DiskService::sendStatus(client, txn, false, "Internal error");
             }
         }).detach();
         return;
@@ -358,16 +321,16 @@ void DiskService::handleMessage(const XBusMessage& msg,
     if (op == DiskOpcode::Unmount) {
         const auto* req = reinterpret_cast<const DiskNameRequest*>(msg.payload_);
         std::string dev(req->name_, strnlen(req->name_, sizeof(req->name_)));
-        if (!isValidDevice(dev)) { sendStatus(client, false, "Invalid device"); return; }
-        std::thread([dev, client]() {
+        if (!isValidDevice(dev)) { sendStatus(client, txn, false, "Invalid device"); return; }
+        std::thread([dev, client, txn]() {
             try {
                 int rc = -1;
                 std::string out = fbx::xserver::spawnArgvCapture({"umount", "/dev/" + dev},
                                                                  {.timeout_sec = 60, .exit_code = &rc, .merge_stderr = true});
                 broadcastDiskChanged();
-                DiskService::sendStatus(client, rc == 0, rc == 0 ? "Unmounted" : out);
+                DiskService::sendStatus(client, txn, rc == 0, rc == 0 ? "Unmounted" : out);
             } catch (...) {
-                DiskService::sendStatus(client, false, "Internal error");
+                DiskService::sendStatus(client, txn, false, "Internal error");
             }
         }).detach();
         return;
@@ -380,7 +343,7 @@ void DiskService::handleMessage(const XBusMessage& msg,
         std::string fs (req->fs_type_,strnlen(req->fs_type_,sizeof(req->fs_type_)));
         std::string lbl(req->label_,  strnlen(req->label_,  sizeof(req->label_)));
 
-        if (!isValidDevice(dev)) { sendStatus(client, false, "Invalid device"); return; }
+        if (!isValidDevice(dev)) { sendStatus(client, txn, false, "Invalid device"); return; }
 
         // Build format command based on fs type
         // argv: the label is client text, only ever an argument.
@@ -390,21 +353,21 @@ void DiskService::handleMessage(const XBusMessage& msg,
         } else if (fs == "msdos" || fs == "fat32") {
             cmd = {"newfs_msdos", "-F", "32"};
         } else {
-            sendStatus(client, false, "Unsupported filesystem: " + fs);
+            sendStatus(client, txn, false, "Unsupported filesystem: " + fs);
             return;
         }
         if (!lbl.empty()) { cmd.push_back("-L"); cmd.push_back(lbl); }
         cmd.push_back("/dev/" + dev);
 
-        std::thread([cmd = std::move(cmd), client]() mutable {
+        std::thread([cmd = std::move(cmd), client, txn]() mutable {
             try {
                 int rc = -1;
                 // No timeout: killing newfs partway would leave a half-formatted disk.
                 std::string out = fbx::xserver::spawnArgvCapture(std::move(cmd), {.exit_code = &rc, .merge_stderr = true});
                 broadcastDiskChanged();
-                DiskService::sendStatus(client, rc == 0, rc == 0 ? "Format complete" : out);
+                DiskService::sendStatus(client, txn, rc == 0, rc == 0 ? "Format complete" : out);
             } catch (...) {
-                DiskService::sendStatus(client, false, "Internal error");
+                DiskService::sendStatus(client, txn, false, "Internal error");
             }
         }).detach();
         return;
@@ -414,16 +377,16 @@ void DiskService::handleMessage(const XBusMessage& msg,
     if (op == DiskOpcode::Eject) {
         const auto* req = reinterpret_cast<const DiskNameRequest*>(msg.payload_);
         std::string dev(req->name_, strnlen(req->name_, sizeof(req->name_)));
-        if (!isValidDevice(dev)) { sendStatus(client, false, "Invalid device"); return; }
-        std::thread([dev, client]() {
+        if (!isValidDevice(dev)) { sendStatus(client, txn, false, "Invalid device"); return; }
+        std::thread([dev, client, txn]() {
             try {
                 int rc = -1;
                 std::string out = fbx::xserver::spawnArgvCapture({"camcontrol", "eject", "/dev/" + dev},
                                                                  {.timeout_sec = 60, .exit_code = &rc, .merge_stderr = true});
                 broadcastDiskChanged();
-                DiskService::sendStatus(client, rc == 0, rc == 0 ? "Ejected" : out);
+                DiskService::sendStatus(client, txn, rc == 0, rc == 0 ? "Ejected" : out);
             } catch (...) {
-                DiskService::sendStatus(client, false, "Internal error");
+                DiskService::sendStatus(client, txn, false, "Internal error");
             }
         }).detach();
         return;

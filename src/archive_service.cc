@@ -234,13 +234,14 @@ bool ArchiveService::createArchive(const std::string& archive_path,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-void ArchiveService::sendListPage(IpcSocket* client,
+void ArchiveService::sendListPage(IpcSocket* client, uint32_t txn,
                                   const std::vector<Entry>& entries,
                                   uint32_t page) noexcept {
     constexpr uint32_t kPerPage = 1;
     uint32_t offset = page * kPerPage;
 
     shared::XBusMessage resp{};
+    resp.transaction_id_ = txn;
     std::strncpy(resp.service_name_, "com.freebsdx.Archive",
                  sizeof(resp.service_name_) - 1);
     resp.opcode_ = static_cast<uint32_t>(shared::ArchiveOpcode::List);
@@ -267,10 +268,11 @@ void ArchiveService::sendListPage(IpcSocket* client,
     client->sendMessage({reinterpret_cast<const uint8_t*>(&resp), sizeof(resp)});
 }
 
-void ArchiveService::sendStatus(IpcSocket* client,
+void ArchiveService::sendStatus(IpcSocket* client, uint32_t txn,
                                 bool ok, uint32_t total,
                                 const std::string& message) noexcept {
     shared::XBusMessage resp{};
+    resp.transaction_id_ = txn;
     std::strncpy(resp.service_name_, "com.freebsdx.Archive",
                  sizeof(resp.service_name_) - 1);
     resp.opcode_ = static_cast<uint32_t>(shared::ArchiveOpcode::Extract);
@@ -315,12 +317,12 @@ void ArchiveService::handleMessage(const shared::XBusMessage& msg,
         if (cache_.path != path || cache_.entries.empty()) {
             CachedArchive fresh;
             if (!listArchive(path, fresh)) {
-                sendStatus(client.get(), false, 0, "Cannot open archive");
+                sendStatus(client.get(), msg.transaction_id_, false, 0, "Cannot open archive");
                 return;
             }
             cache_ = std::move(fresh);
         }
-        sendListPage(client.get(), cache_.entries, req.page_);
+        sendListPage(client.get(), msg.transaction_id_, cache_.entries, req.page_);
 
     } else if (op == Op::Extract) {
         shared::ArchiveExtractRequest req{};
@@ -331,7 +333,7 @@ void ArchiveService::handleMessage(const shared::XBusMessage& msg,
         std::string dpath(req.dest_path_, strnlen(req.dest_path_, sizeof(req.dest_path_)));
 
         // Ack immediately, do work on background thread
-        sendStatus(client.get(), true, 0, "Extracting…");
+        sendStatus(client.get(), msg.transaction_id_, true, 0, "Extracting…");
 
         std::thread([apath, dpath]() {
             try {
@@ -352,7 +354,7 @@ void ArchiveService::handleMessage(const shared::XBusMessage& msg,
         std::string apath(req.archive_path_, strnlen(req.archive_path_, sizeof(req.archive_path_)));
         std::string spath(req.source_path_, strnlen(req.source_path_, sizeof(req.source_path_)));
 
-        sendStatus(client.get(), true, 0, "Creating archive…");
+        sendStatus(client.get(), msg.transaction_id_, true, 0, "Creating archive…");
 
         std::thread([apath, spath]() {
             try {

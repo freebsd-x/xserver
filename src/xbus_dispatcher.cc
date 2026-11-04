@@ -211,6 +211,8 @@ static bool appMayCall(const shared::XBusMessage& m, int fd) noexcept {
     const uint32_t op = m.opcode_;
     auto is = [op](auto o) { return op == static_cast<uint32_t>(o); };
     auto from = [fd](std::initializer_list<const char*> bins) { return peer::isOneOf(fd, bins); };
+    if (svc == "com.freebsdx.FileChooser")  // a Respond is the user's choice: an app
+        return !is(FileChooserOpcode::Respond);   // saying it would get any file it names
     if (svc == "com.freebsdx.Power")
         return is(PowerOpcode::GetPowerState) || is(PowerOpcode::GetLidPolicy) ||
                is(PowerOpcode::GetSleepTimeout) || from({"settings"});
@@ -500,6 +502,19 @@ void RebuildAndBroadcastWindowList(const WindowStack* stack) noexcept {
 void BroadcastXBusMessage(const shared::XBusMessage& msg) {
     std::lock_guard<std::mutex> lock(g_clients_mutex);
     broadcastXBusMsg(msg);
+}
+
+bool SendToShell(const shared::XBusMessage& msg) {
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+    bool sent = false;
+    for (const auto& weak : g_active_clients) {
+        auto client = weak.lock();
+        if (client && client->isTrusted()) {
+            (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
+            sent = true;
+        }
+    }
+    return sent;
 }
 
 void BroadcastPresentFeedback(const shared::PresentFeedback& fb) {
@@ -1117,7 +1132,8 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
     else if (std::strcmp(msg->service_name_, "com.freebsdx.FileChooser") == 0) {
         using O = shared::FileChooserOpcode;
         const auto op = static_cast<O>(msg->opcode_);
-        if (op == O::OpenFile || op == O::OpenFiles || op == O::SaveFile) {
+        if (op == O::OpenFile || op == O::OpenFiles || op == O::SaveFile ||
+            op == O::OpenFd || op == O::SaveFd) {
             shared::FileChooserRequest req{};
             std::memcpy(&req, msg->payload_, sizeof(req));
             FileChooserService::requestOpen(msg->opcode_, msg->transaction_id_, req, client);

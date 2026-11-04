@@ -1,10 +1,12 @@
 #version 450
 
+// Every caller pushes 10 floats, the colour at offset 24. Four floats, not a vec4:
+// a vec4 is aligned to 16 bytes, which would read it from offset 32.
 layout(push_constant) uniform SolidData {
     vec2 pos;
     vec2 size;
     vec2 screen_size;
-    vec4 color;
+    float r, g, b, a;
 } pc;
 
 void main() {

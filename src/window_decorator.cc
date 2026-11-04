@@ -81,13 +81,18 @@ std::expected<void, DecorationError> WindowDecorator::decorate(
         {  3.0f, 1.5f, 0.200f },
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, solid_pipeline_);
+    // Only around the window: this pass runs after its content is drawn, and a
+    // shadow across the whole rect would darken what's inside.
     for (const auto& s : kShadows) {
-        drawRect(cmd,
-            x  - s.expand,
-            by - s.expand + s.dy,
-            w  + s.expand * 2.0f,
-            win_h + s.expand * 2.0f,
-            0.0f, 0.0f, 0.0f, s.alpha * shadow_mul);
+        const float alpha = s.alpha * shadow_mul;
+        const float top = by - s.expand + s.dy;
+        const float bottom = by + win_h + s.expand + s.dy;
+        const float left = x - s.expand, right = x + w + s.expand;
+        const float outer_w = right - left;
+        drawRect(cmd, left, top, outer_w, by - top, 0.0f, 0.0f, 0.0f, alpha);
+        drawRect(cmd, left, by + win_h, outer_w, bottom - (by + win_h), 0.0f, 0.0f, 0.0f, alpha);
+        drawRect(cmd, left, by, s.expand, win_h, 0.0f, 0.0f, 0.0f, alpha);
+        drawRect(cmd, x + w, by, s.expand, win_h, 0.0f, 0.0f, 0.0f, alpha);
     }
 
     // ── Title bar colour ──────────────────────────────────────────────────────

@@ -32,9 +32,9 @@ private:
     static bool saveToDisk() noexcept;
 
     static void fillEntry(shared::NoteEntry& out, const Note& n) noexcept;
-    static void sendEntry(IpcSocket* client, const Note& n) noexcept;
-    static void sendStatus(IpcSocket* client, bool ok, uint32_t id = 0) noexcept;
-    static void sendListPage(IpcSocket* client,
+    static void sendEntry(IpcSocket* client, uint32_t txn, const Note& n) noexcept;
+    static void sendStatus(IpcSocket* client, uint32_t txn, bool ok, uint32_t id = 0) noexcept;
+    static void sendListPage(IpcSocket* client, uint32_t txn,
                              const std::vector<const Note*>& filtered,
                              uint32_t page) noexcept;
     static void broadcastChanged() noexcept;

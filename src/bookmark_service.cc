@@ -84,38 +84,27 @@ bool BookmarkService::ProcessMessage(std::shared_ptr<IpcSocket> client,
     }
 
     case BookmarkOpcode::List: {
+        // One request, one reply: the page asked for (an empty request is page 0).
+        uint32_t want = 0;
+        std::memcpy(&want, msg.payload_, sizeof(want));
         uint32_t total = static_cast<uint32_t>(bookmarks_.size());
-        for (uint32_t i = 0; i < total; ++i) {
-            XBusMessage page_resp{};
-            page_resp.magic_ = XBUS_MAGIC;
-            std::strncpy(page_resp.service_name_, "com.freebsdx.Bookmarks",
-                         sizeof(page_resp.service_name_) - 1);
-            page_resp.opcode_ = static_cast<uint32_t>(BookmarkOpcode::BookmarkPage);
-            BookmarkPage pg{};
-            pg.page_  = i;
-            pg.total_ = total;
-            pg.valid_ = 1;
-            std::strncpy(pg.title_, bookmarks_[i].title.c_str(),
-                         sizeof(pg.title_) - 1);
-            std::strncpy(pg.url_,   bookmarks_[i].url.c_str(),
-                         sizeof(pg.url_)   - 1);
-            std::memcpy(page_resp.payload_, &pg, sizeof(pg));
-            (void)client->sendMessage(
-                {reinterpret_cast<const uint8_t*>(&page_resp), sizeof(page_resp)});
+        XBusMessage page_resp{};
+        page_resp.transaction_id_ = msg.transaction_id_;
+        std::strncpy(page_resp.service_name_, "com.freebsdx.Bookmarks",
+                     sizeof(page_resp.service_name_) - 1);
+        page_resp.opcode_ = static_cast<uint32_t>(BookmarkOpcode::BookmarkPage);
+        BookmarkPage pg{};
+        pg.page_  = want;
+        pg.total_ = total;
+        if (want < total) {
+            pg.valid_    = 1;
+            pg.has_more_ = (want + 1 < total) ? 1 : 0;
+            std::strncpy(pg.title_, bookmarks_[want].title.c_str(), sizeof(pg.title_) - 1);
+            std::strncpy(pg.url_,   bookmarks_[want].url.c_str(),   sizeof(pg.url_)   - 1);
         }
-        // End sentinel
-        XBusMessage end{};
-        end.magic_ = XBUS_MAGIC;
-        std::strncpy(end.service_name_, "com.freebsdx.Bookmarks",
-                     sizeof(end.service_name_) - 1);
-        end.opcode_ = static_cast<uint32_t>(BookmarkOpcode::BookmarkPage);
-        BookmarkPage sentinel{};
-        sentinel.page_  = total;
-        sentinel.total_ = total;
-        sentinel.valid_ = 0;
-        std::memcpy(end.payload_, &sentinel, sizeof(sentinel));
+        std::memcpy(page_resp.payload_, &pg, sizeof(pg));
         (void)client->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&end), sizeof(end)});
+            {reinterpret_cast<const uint8_t*>(&page_resp), sizeof(page_resp)});
         break;
     }
 
