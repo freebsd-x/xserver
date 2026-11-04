@@ -14,6 +14,16 @@
 #include <unistd.h>
 #include <unordered_map>
 
+#include <arpa/inet.h>
+#include <atomic>
+#include <cerrno>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/capsicum.h>
+#include <sys/socket.h>
+
 namespace fbx::xserver {
 namespace {
 
@@ -63,6 +73,108 @@ void failAllPendingLocked() {
     g_pending.clear();
 }
 
+// ── Direct connections ──────────────────────────────────────────────────────
+
+std::atomic<int> g_connecting{0};
+constexpr int kMaxConnecting = 8;
+constexpr int kConnectTimeoutMs = 15000;
+
+void replyConnect(const std::shared_ptr<IpcSocket>& c, uint32_t txn, shared::FetchStatus st,
+                  const std::string& error = {}, int fd = -1) {
+    shared::NetConnectReply r{};
+    r.status_ = static_cast<int32_t>(st);
+    std::strncpy(r.error_, error.c_str(), sizeof(r.error_) - 1);
+    shared::XBusMessage m{};
+    m.magic_ = shared::XBUS_MAGIC;
+    m.transaction_id_ = txn;
+    std::strncpy(m.service_name_, kName, sizeof(m.service_name_) - 1);
+    m.opcode_ = static_cast<uint32_t>(shared::FetchOpcode::Connect);
+    std::memcpy(m.payload_, &r, sizeof(r));
+    (void)c->sendMessage({reinterpret_cast<const uint8_t*>(&m), sizeof(m)}, fd);
+}
+
+// Tests talk to a server on an unprivileged port. Headless sessions only, so it
+// can't widen what a real desktop allows.
+bool g_test_ports_allowed = false;
+
+bool testPortAllowed(uint16_t port) {
+    if (!g_test_ports_allowed) return false;
+    const char* ports = std::getenv("FBX_TEST_CONNECT_PORTS");
+    if (!ports) return false;
+    const std::string list = std::string(",") + ports + ",";
+    return list.find("," + std::to_string(port) + ",") != std::string::npos;
+}
+
+UniqueFd connectTo(const std::string& host, uint16_t port, std::string& error) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* found = nullptr;
+    if (int rc = ::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &found); rc != 0) {
+        error = std::string("can't find ") + host + ": " + ::gai_strerror(rc);
+        return {};
+    }
+    UniqueFd result;
+    for (addrinfo* a = found; a && !result; a = a->ai_next) {
+        UniqueFd s(::socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK, a->ai_protocol));
+        if (!s) { error = std::strerror(errno); continue; }
+        int rc = ::connect(s.get(), a->ai_addr, a->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            pollfd p{s.get(), POLLOUT, 0};
+            rc = ::poll(&p, 1, kConnectTimeoutMs);
+            if (rc == 0) { error = "the connection timed out"; continue; }
+            int so = 0;
+            socklen_t len = sizeof(so);
+            (void)::getsockopt(s.get(), SOL_SOCKET, SO_ERROR, &so, &len);
+            errno = so;
+            rc = (rc > 0 && so == 0) ? 0 : -1;
+        }
+        if (rc != 0) { error = std::strerror(errno); continue; }
+        result = std::move(s);
+    }
+    ::freeaddrinfo(found);
+    if (!result) return {};
+    // A connection, not a way to make others: it can't connect, bind or listen.
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_READ, CAP_WRITE, CAP_EVENT, CAP_FCNTL, CAP_FSTAT, CAP_GETPEERNAME,
+                    CAP_GETSOCKNAME, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_SHUTDOWN);
+    (void)cap_rights_limit(result.get(), &rights);
+    return result;
+}
+
+void handleConnect(const std::shared_ptr<IpcSocket>& client, const shared::XBusMessage& msg) {
+    shared::NetConnectRequest req{};
+    std::memcpy(&req, msg.payload_, sizeof(req));
+    req.host_[sizeof(req.host_) - 1] = '\0';
+    const std::string host = req.host_;
+    const uint16_t port = req.port_;
+    const std::string app = verifiedAppId(client->fd());
+    if (app.empty() || (!fetch_policy::mayConnect(app, port) && !(app == "com.freebsdx.mail" && testPortAllowed(port)))) {
+        std::cerr << "[Fetch] DENIED: " << (app.empty() ? "unknown app" : app) << " connecting to " << host << ":" << port << "\n";
+        replyConnect(client, msg.transaction_id_, shared::FetchStatus::Denied, "that port isn't allowed");
+        return;
+    }
+    if (host.empty()) {
+        replyConnect(client, msg.transaction_id_, shared::FetchStatus::BadRequest, "no server name");
+        return;
+    }
+    if (g_connecting.fetch_add(1) >= kMaxConnecting) {
+        g_connecting.fetch_sub(1);
+        replyConnect(client, msg.transaction_id_, shared::FetchStatus::Unavailable, "too many connections at once");
+        return;
+    }
+    // Name lookup and connecting can take seconds: not on the compositor's thread.
+    std::thread([weak = std::weak_ptr<IpcSocket>(client), txn = msg.transaction_id_, host, port] {
+        std::string error;
+        UniqueFd s = connectTo(host, port, error);
+        if (auto c = weak.lock()) {
+            if (s) replyConnect(c, txn, shared::FetchStatus::Ok, {}, s.get());
+            else replyConnect(c, txn, shared::FetchStatus::NetworkError, error);
+        }
+        g_connecting.fetch_sub(1);
+    }).detach();
+}
+
 uint32_t nextIdLocked() {
     uint32_t id = g_next_id++;
     return id ? id : g_next_id++;
@@ -70,9 +182,15 @@ uint32_t nextIdLocked() {
 
 }  // namespace
 
+void FetchBroker::allowTestPorts() noexcept { g_test_ports_allowed = true; }
+
 void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
                                  const shared::XBusMessage& msg, UniqueFd& fd) noexcept {
     using O = shared::FetchOpcode;
+    if (static_cast<O>(msg.opcode_) == O::Connect) {
+        handleConnect(client, msg);
+        return;
+    }
     std::lock_guard<std::mutex> lk(g_mu);
     switch (static_cast<O>(msg.opcode_)) {
     case O::ProviderRegister:

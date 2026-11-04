@@ -1,4 +1,5 @@
 #include <cstdio>
+#include "xserver/fetch_broker.h"
 #include "xserver/crash_handler.h"
 #include "xserver/drm_device.h"
 #include "xserver/event_loop.h"
@@ -379,7 +380,7 @@ int main(int argc, char** argv) {
         if (arg == "--no-input")  enable_input = false;
         if (arg == "--virtual")   virtual_boot = true;
         if (arg == "--no-greeter") skip_greeter = true;
-        if (arg == "--headless") { headless = true; virtual_boot = true; g_headless = true; }
+        if (arg == "--headless") { headless = true; virtual_boot = true; g_headless = true; fbx::xserver::FetchBroker::allowTestPorts(); }
         if (arg == "--strict-shell-trust") g_strict_shell_trust = true;
         if (arg.starts_with("--headless-size=")) {
             auto sz = arg.substr(16);

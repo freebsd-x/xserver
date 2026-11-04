@@ -12,6 +12,10 @@ class IpcSocket;
 // its reply (with the body fd) back to the app. Policy: fetch_policy.h.
 class FetchBroker {
 public:
+    // Headless sessions only: let FBX_TEST_CONNECT_PORTS add ports for direct
+    // connections, so tests can talk to a server of their own.
+    static void allowTestPorts() noexcept;
+
     // Every com.freebsdx.Fetch message, from apps and from xfetch itself.
     static void ProcessMessage(std::shared_ptr<IpcSocket> client,
                                const shared::XBusMessage& msg, UniqueFd& fd) noexcept;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -42,6 +43,15 @@ struct Url {
     std::string host;
     std::string path;   // from the first '/' on (always non-empty)
 };
+
+// Direct connections, for what HTTP relaying can't carry. Mail speaks IMAP and
+// SMTP to whichever server the user set up, so it's the port that's limited.
+inline bool mayConnect(std::string_view app, uint16_t port) {
+    if (app != "com.freebsdx.mail") return false;
+    for (uint16_t p : {uint16_t{25}, uint16_t{143}, uint16_t{465}, uint16_t{587}, uint16_t{993}})
+        if (port == p) return true;
+    return false;
+}
 
 // Parse an absolute http(s) URL. Rejects anything with userinfo, an explicit
 // port, whitespace/control characters, or an empty host.
