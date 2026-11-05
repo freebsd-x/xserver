@@ -6,6 +6,7 @@
 
 #include "xserver/fetch_broker.h"
 #include "xserver/weather_service.h"
+#include "xserver/weather_parse.h"
 #include "xserver/async_shell.h"
 #include "xserver/url_encode.h"
 
@@ -86,26 +87,6 @@ static int jsonInt(const std::string& json, const std::string& key) noexcept {
     try { return std::stoi(v); } catch (...) { return 0; }
 }
 
-// Find the Nth occurrence of "key" in the json and return the string value.
-static std::string jsonStrN(const std::string& json,
-                            const std::string& key, int n) noexcept {
-    std::string needle = "\"" + key + "\"";
-    size_t pos = 0;
-    for (int i = 0; i <= n; ++i) {
-        pos = json.find(needle, pos);
-        if (pos == std::string::npos) return {};
-        if (i < n) pos += needle.size();
-    }
-    pos = json.find(':', pos + needle.size());
-    if (pos == std::string::npos) return {};
-    pos = json.find('"', pos);
-    if (pos == std::string::npos) return {};
-    size_t start = pos + 1;
-    size_t end   = json.find('"', start);
-    if (end == std::string::npos) return {};
-    return json.substr(start, end - start);
-}
-
 // ── Fetch and parse ───────────────────────────────────────────────────────────
 
 bool WeatherService::fetchAndStore() noexcept {
@@ -134,12 +115,12 @@ bool WeatherService::fetchAndStore() noexcept {
     // ── Current conditions ────────────────────────────────────────────────────
     WeatherCondition cond{};
 
-    // City name: wttr.in sometimes returns it in "nearest_area"
-    std::string area = jsonStr(json, "areaName");
+    const xserver::wttr::Report report = xserver::wttr::parse(json);
+    std::string area = report.area;
     if (area.empty()) area = city == "auto" ? "Unknown" : city;
     std::strncpy(cond.city_, area.c_str(), sizeof(cond.city_) - 1);
 
-    std::string desc = jsonStr(json, "value"); // weatherDesc[0].value
+    const std::string& desc = report.desc;
     std::strncpy(cond.condition_, desc.c_str(),           sizeof(cond.condition_) - 1);
     std::strncpy(cond.icon_,      conditionIcon(desc),    sizeof(cond.icon_)      - 1);
     std::strncpy(cond.wind_dir_,  jsonStr(json, "winddir16Point").c_str(),
@@ -153,26 +134,17 @@ bool WeatherService::fetchAndStore() noexcept {
     cond.uv_index_ = static_cast<uint32_t>(jsonInt(json, "uvIndex"));
 
     // ── 3-day forecast ────────────────────────────────────────────────────────
-    // "weather":[{"date":"YYYY-MM-DD","maxtempC":"28","mintempC":"18",...}, ...]
     std::vector<WeatherForecastDay> forecast;
-    for (int day = 0; day < 3; ++day) {
+    for (const auto& day : report.days) {
+        if (forecast.size() == 3) break;
         WeatherForecastDay fd{};
-        std::string date   = jsonStrN(json, "date",      day);
-        std::string maxC   = jsonStrN(json, "maxtempC",  day);
-        std::string minC   = jsonStrN(json, "mintempC",  day);
-        std::string maxF   = jsonStrN(json, "maxtempF",  day);
-        std::string minF   = jsonStrN(json, "mintempF",  day);
-        // description is inside hourly[4] or the "description" field
-        std::string fdesc  = jsonStrN(json, "value",     day + 1); // skip current_condition's "value"
-        if (date.empty()) break;
-
-        std::strncpy(fd.date_,      date.c_str(),         sizeof(fd.date_)      - 1);
-        std::strncpy(fd.condition_, fdesc.c_str(),        sizeof(fd.condition_) - 1);
-        std::strncpy(fd.icon_,      conditionIcon(fdesc), sizeof(fd.icon_)      - 1);
-        try { fd.max_c_ = maxC.empty() ? 0 : std::stoi(maxC); } catch(...) {}
-        try { fd.min_c_ = minC.empty() ? 0 : std::stoi(minC); } catch(...) {}
-        try { fd.max_f_ = maxF.empty() ? 0 : std::stoi(maxF); } catch(...) {}
-        try { fd.min_f_ = minF.empty() ? 0 : std::stoi(minF); } catch(...) {}
+        std::strncpy(fd.date_,      day.date.c_str(),         sizeof(fd.date_)      - 1);
+        std::strncpy(fd.condition_, day.desc.c_str(),         sizeof(fd.condition_) - 1);
+        std::strncpy(fd.icon_,      conditionIcon(day.desc),  sizeof(fd.icon_)      - 1);
+        try { fd.max_c_ = day.max_c.empty() ? 0 : std::stoi(day.max_c); } catch(...) {}
+        try { fd.min_c_ = day.min_c.empty() ? 0 : std::stoi(day.min_c); } catch(...) {}
+        try { fd.max_f_ = day.max_f.empty() ? 0 : std::stoi(day.max_f); } catch(...) {}
+        try { fd.min_f_ = day.min_f.empty() ? 0 : std::stoi(day.min_f); } catch(...) {}
         forecast.push_back(fd);
     }
 

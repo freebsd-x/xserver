@@ -1,4 +1,6 @@
 #include "xserver/calendar_service.h"
+#include <unistd.h>
+#include <sys/stat.h>
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
@@ -157,7 +159,27 @@ static std::vector<std::string> unfoldIcs(std::istream& in) {
 
 int CalendarService::importIcs(const std::string& path) noexcept {
     std::ifstream f(path);
-    if (!f.is_open()) return 0;
+    return f.is_open() ? importIcs(f) : 0;
+}
+
+// What the app sent with a file the user picked. This runs on the compositor's
+// thread, so a pipe or a device, which could block it forever, isn't read.
+static bool readPickedFile(int fd, std::string& out) noexcept {
+    constexpr off_t kMaxIcs = 8 * 1024 * 1024;
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size > kMaxIcs) return false;
+    out.resize(static_cast<size_t>(st.st_size));
+    size_t got = 0;
+    while (got < out.size()) {
+        const ssize_t n = ::pread(fd, out.data() + got, out.size() - got, static_cast<off_t>(got));
+        if (n <= 0) break;
+        got += static_cast<size_t>(n);
+    }
+    out.resize(got);
+    return true;
+}
+
+int CalendarService::importIcs(std::istream& f) noexcept {
     auto lines = unfoldIcs(f);
 
     int imported = 0;
@@ -253,7 +275,7 @@ int CalendarService::importIcs(const std::string& path) noexcept {
 // ── IPC message handler ───────────────────────────────────────────────────────
 
 bool CalendarService::ProcessMessage(std::shared_ptr<IpcSocket> client,
-                                     const shared::XBusMessage& msg) noexcept {
+                                     const shared::XBusMessage& msg, int fd) noexcept {
     using namespace shared;
     if (std::strncmp(msg.service_name_, "com.freebsdx.Calendar",
                      sizeof(msg.service_name_)) != 0)
@@ -393,10 +415,20 @@ bool CalendarService::ProcessMessage(std::shared_ptr<IpcSocket> client,
     }
 
     case CalendarOpcode::ImportIcs: {
-        CalendarImportRequest req{};
-        std::memcpy(&req, msg.payload_, sizeof(req));
-        req.path_[sizeof(req.path_) - 1] = '\0';
-        int n = importIcs(std::string(req.path_, strnlen(req.path_, sizeof(req.path_))));
+        // A file the user picked comes as a descriptor; a path only from a drop.
+        int n = 0;
+        if (fd >= 0) {
+            std::string text;
+            if (readPickedFile(fd, text)) {
+                std::istringstream in(text);
+                n = importIcs(in);
+            }
+        } else {
+            CalendarImportRequest req{};
+            std::memcpy(&req, msg.payload_, sizeof(req));
+            req.path_[sizeof(req.path_) - 1] = '\0';
+            n = importIcs(std::string(req.path_, strnlen(req.path_, sizeof(req.path_))));
+        }
         if (n > 0) save();
         CalendarImportResult res{}; res.imported_ = (uint32_t)n;
         resp.opcode_ = static_cast<uint32_t>(CalendarOpcode::ImportIcs);

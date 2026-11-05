@@ -2,6 +2,7 @@
 #include "xserver/ipc_socket.h"
 #include "xserver/shell_util.h"
 #include "xserver/async_shell.h"
+#include "xserver/path_policy.h"
 #include <sstream>
 #include <fcntl.h>
 #include <unistd.h>
@@ -19,11 +20,6 @@ namespace fbx::xserver {
 
 bool PortalService::ProcessMessage(std::shared_ptr<IpcSocket> client, const shared::XBusMessage& msg) noexcept {
     if (std::strcmp(msg.service_name_, "com.freebsdx.Portal") != 0) return false;
-
-    if (msg.opcode_ == static_cast<uint32_t>(shared::PortalOpcode::OpenFile)) {
-        handleOpenFile(client, msg);
-        return true;
-    }
 
     if (msg.opcode_ == static_cast<uint32_t>(shared::PortalOpcode::ListDir)) {
         handleListDir(client, msg);
@@ -43,57 +39,14 @@ bool PortalService::ProcessMessage(std::shared_ptr<IpcSocket> client, const shar
     return false;
 }
 
-void PortalService::handleOpenFile(std::shared_ptr<IpcSocket> client, const shared::XBusMessage& msg) noexcept {
-    // Path is a null-terminated string in the first bytes of the payload
-    const char* requested_path = reinterpret_cast<const char*>(msg.payload_);
-
-    // Validate: only allow paths under $HOME or /tmp
-    const char* home = std::getenv("HOME");
-    bool allowed = (std::strncmp(requested_path, "/tmp/", 5) == 0);
-    if (!allowed && home) {
-        size_t home_len = std::strlen(home);
-        allowed = (std::strncmp(requested_path, home, home_len) == 0 &&
-                   (requested_path[home_len] == '/' || requested_path[home_len] == '\0'));
-    }
-
-    shared::XBusMessage response = msg;
-
-    if (!allowed) {
-        std::cout << "[PortalService] Access DENIED for path: " << requested_path << "\n";
-        std::strncpy(reinterpret_cast<char*>(response.payload_), "DENIED", sizeof(response.payload_) - 1);
-        std::span<const uint8_t> resp_span(reinterpret_cast<const uint8_t*>(&response), sizeof(response));
-        (void)client->sendMessage(resp_span);
-        return;
-    }
-
-    std::cout << "[PortalService] Secure file request for: " << requested_path << "\n";
-    int fd = open(requested_path, O_RDONLY);
-    if (fd >= 0) {
-        std::strncpy(reinterpret_cast<char*>(response.payload_), "SUCCESS", sizeof(response.payload_) - 1);
-        std::span<const uint8_t> resp_span(reinterpret_cast<const uint8_t*>(&response), sizeof(response));
-        (void)client->sendMessage(resp_span, fd);
-        close(fd);
-        std::cout << "[PortalService] FD handed to client. Access granted.\n";
-    } else {
-        std::strncpy(reinterpret_cast<char*>(response.payload_), "ERROR", sizeof(response.payload_) - 1);
-        std::span<const uint8_t> resp_span(reinterpret_cast<const uint8_t*>(&response), sizeof(response));
-        (void)client->sendMessage(resp_span);
-    }
-}
-
 void PortalService::handleListDir(std::shared_ptr<IpcSocket> client, const shared::XBusMessage& msg) noexcept {
     shared::DirListRequest req{};
     std::memcpy(&req, msg.payload_, sizeof(req));
     req.path_[sizeof(req.path_) - 1] = '\0';
 
-    const char* home = std::getenv("HOME");
-    bool allowed = (std::strncmp(req.path_, "/tmp", 4) == 0);
-    if (!allowed && home) {
-        size_t hlen = std::strlen(home);
-        // Allow $HOME and all subdirectories, including .zfs/snapshot virtual dirs.
-        allowed = (std::strncmp(req.path_, home, hlen) == 0 &&
-                   (req.path_[hlen] == '/' || req.path_[hlen] == '\0'));
-    }
+    // Includes .zfs/snapshot under $HOME, which resolves like any other folder.
+    const std::string dir = pathpolicy::resolveWithin(req.path_, {std::getenv("HOME"), "/tmp"});
+    const bool allowed = !dir.empty();
 
     shared::XBusMessage response = msg;
     shared::DirListing listing{};
@@ -108,7 +61,7 @@ void PortalService::handleListDir(std::shared_ptr<IpcSocket> client, const share
     // Collect all entries (dirs first, then files, both alphabetical)
     struct RawEntry { std::string name; bool is_dir; };
     std::vector<RawEntry> all;
-    DIR* dp = opendir(req.path_);
+    DIR* dp = opendir(dir.c_str());
     if (dp) {
         struct dirent* de;
         while ((de = readdir(dp)) != nullptr) {
@@ -116,7 +69,7 @@ void PortalService::handleListDir(std::shared_ptr<IpcSocket> client, const share
             bool is_dir = (de->d_type == DT_DIR);
             if (de->d_type == DT_UNKNOWN) {
                 // Fall back to stat for filesystems that don't populate d_type
-                std::string full = std::string(req.path_, strnlen(req.path_, sizeof(req.path_))) + "/" + de->d_name;
+                std::string full = dir + "/" + de->d_name;
                 struct stat st{};
                 if (stat(full.c_str(), &st) == 0) is_dir = S_ISDIR(st.st_mode);
             }
@@ -207,17 +160,9 @@ void PortalService::handleZfsRollback(std::shared_ptr<IpcSocket> client, const s
     shared::ZfsActionRequest req{};
     std::memcpy(&req, msg.payload_, sizeof(req));
     req.path_[sizeof(req.path_) - 1] = '\0';
-    std::string snap_path = req.path_;
-
-    // Validate: must be under $HOME
-    const char* home = std::getenv("HOME");
-    bool allowed = false;
-    if (home) {
-        size_t hlen = std::strlen(home);
-        allowed = (snap_path.size() >= hlen &&
-                   snap_path.compare(0, hlen, home) == 0);
-    }
-    if (!allowed) {
+    // Must be under $HOME, however it's spelled.
+    std::string snap_path = pathpolicy::resolveWithin(req.path_, {std::getenv("HOME")});
+    if (snap_path.empty()) {
         sendZfsResponse(client, msg, false, "Access denied");
         return;
     }
@@ -262,17 +207,9 @@ void PortalService::handleZfsSnapshot(std::shared_ptr<IpcSocket> client, const s
     shared::ZfsActionRequest req{};
     std::memcpy(&req, msg.payload_, sizeof(req));
     req.path_[sizeof(req.path_) - 1] = '\0';
-    std::string dir_path = req.path_;
-
-    // Validate: must be under $HOME
-    const char* home = std::getenv("HOME");
-    bool allowed = false;
-    if (home) {
-        size_t hlen = std::strlen(home);
-        allowed = (dir_path.size() >= hlen &&
-                   dir_path.compare(0, hlen, home) == 0);
-    }
-    if (!allowed) {
+    // Must be under $HOME, however it's spelled.
+    std::string dir_path = pathpolicy::resolveWithin(req.path_, {std::getenv("HOME")});
+    if (dir_path.empty()) {
         sendZfsResponse(client, msg, false, "Access denied");
         return;
     }

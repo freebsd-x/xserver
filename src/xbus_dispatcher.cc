@@ -237,6 +237,22 @@ static bool appMayCall(const shared::XBusMessage& m, int fd) noexcept {
                from({"appmanager"});
     if (svc == "com.freebsdx.Configuration")   // screen lock, firewall, location… settings
         return op == 0x01 /* GetValue */ || from({"settings"});
+    // The compositor is outside every sandbox: what it opens because an app named
+    // the path, that app could read or write without any sandbox. So each of these
+    // is for the one built-in app it belongs to; others use the file picker.
+    if (svc == "com.freebsdx.Portal")          // folders by name, ZFS snapshots and rollback
+        return from({"files"});
+    if (svc == "com.freebsdx.Archive")         // packs, unpacks and lists any path
+        return from({"archive"});
+    if (svc == "com.freebsdx.Calendar")
+        return !is(CalendarOpcode::ImportIcs) || from({"calendar"});
+    if (svc == "com.freebsdx.Contacts")
+        return !is(ContactsOpcode::ImportVCard) || from({"contacts"});
+    if (svc == "com.freebsdx.Wallpaper")       // decodes the file it's given, and changes the desktop
+        return is(WallpaperOpcode::GetWallpaper) || is(WallpaperOpcode::GetWorkspaceWallpaper) ||
+               from({"settings"});
+    if (svc == "com.freebsdx.Print")           // prints a file by name, cancels anyone's job
+        return is(PrintSpoolerOpcode::ListPrinters) || is(PrintSpoolerOpcode::GetJobStatus);
     return true;
 }
 
@@ -504,6 +520,21 @@ void BroadcastXBusMessage(const shared::XBusMessage& msg) {
     broadcastXBusMsg(msg);
 }
 
+// A file being opened is the user's business: the shell acts on it, and only the
+// app it's for may hear (a running window can load it). Which app is checked by
+// its executable; sending it to everyone told every app what was being opened.
+static void sendLaunchWithFile(const shared::XBusMessage& msg) {
+    shared::ShellLaunchRequest req{};
+    std::memcpy(&req, msg.payload_, sizeof(req));
+    req.app_id_[sizeof(req.app_id_) - 1] = '\0';
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+    for (const auto& weak : g_active_clients) {
+        auto client = weak.lock();
+        if (client && (client->isTrusted() || verifiedAppId(client->fd()) == req.app_id_))
+            (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
+    }
+}
+
 bool SendToShell(const shared::XBusMessage& msg) {
     std::lock_guard<std::mutex> lock(g_clients_mutex);
     bool sent = false;
@@ -647,7 +678,7 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         return {true};
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.Calendar") == 0) {
-        CalendarService::ProcessMessage(client, *msg);
+        CalendarService::ProcessMessage(client, *msg, fd_opt.get());
         return {true};
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.RemoteDesktop") == 0) {
@@ -915,9 +946,8 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
         }
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.Shell") == 0) {
-        // LaunchWithFile: broadcast to all clients so the shell can handle it.
         if (msg->opcode_ == static_cast<uint32_t>(shared::ShellOpcode::LaunchWithFile)) {
-            BroadcastXBusMessage(*msg);
+            sendLaunchWithFile(*msg);
         }
         // The shell asks for the keyboard while a popup that takes typing is open.
         else if (msg->opcode_ == static_cast<uint32_t>(shared::ShellOpcode::KeyboardGrab) && client->isTrusted()) {
