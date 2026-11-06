@@ -406,9 +406,15 @@ void SaveTheme() {
     }
 }
 
+// Who hears about presented frames. Checked once, when it connects: this goes out
+// every frame, so it can't look the peer up each time.
+static std::weak_ptr<IpcSocket> g_present_feedback_client;
+
 void RegisterClientForBroadcast(std::shared_ptr<IpcSocket> client) {
+    const bool is_bridge = peer::isOneOf(client->fd(), {"xwayland-bridge"});
     std::lock_guard<std::mutex> lock(g_clients_mutex);
     g_active_clients.push_back(client);
+    if (is_bridge) g_present_feedback_client = client;
 }
 
 void BroadcastThemeChanged() {
@@ -548,13 +554,12 @@ bool SendToShell(const shared::XBusMessage& msg) {
     return sent;
 }
 
-void BroadcastPresentFeedback(const shared::PresentFeedback& fb) {
+// Only the Wayland bridge paces anything by this. Sent to everyone it would wake
+// every app on every frame, and tell each of them when the others draw.
+void SendPresentFeedback(const shared::PresentFeedback& fb) {
     std::lock_guard<std::mutex> lock(g_clients_mutex);
-    std::span<const uint8_t> span(reinterpret_cast<const uint8_t*>(&fb), sizeof(fb));
-    for (auto it = g_active_clients.begin(); it != g_active_clients.end();) {
-        if (auto client = it->lock()) { (void)client->sendMessage(span); ++it; }
-        else it = g_active_clients.erase(it);
-    }
+    if (auto client = g_present_feedback_client.lock())
+        (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&fb), sizeof(fb)});
 }
 
 XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, const std::span<const uint8_t>& data, UniqueFd& fd_opt, VulkanCompositor* comp, WindowStack* stack, bool has_focus, DrmDevice* drm) noexcept {

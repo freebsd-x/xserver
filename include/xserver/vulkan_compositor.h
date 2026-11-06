@@ -87,6 +87,9 @@ public:
     [[nodiscard]] std::expected<VkImage, VulkanError> importExternalBuffer(int fd, uint32_t width, uint32_t height) noexcept;
     // Creates a 1×1 device-local VkImage filled with the given ARGB color (0xAARRGGBB)
     [[nodiscard]] std::expected<VkImage, VulkanError> createSolidColorImage(uint32_t argb) noexcept;
+    // Uploads tightly packed RGBA8 as a device-local sampled texture + descriptor set.
+    [[nodiscard]] std::expected<VkImage, VulkanError>
+        createImageFromPixels(const uint8_t* rgba, uint32_t w, uint32_t h) noexcept;
     void releaseImage(VkImage image) noexcept;
 
     // Desktop wallpaper: decode the image at `path` (PNG/SVG) and upload it as the
@@ -229,9 +232,6 @@ private:
     std::string   wallpaper_path_;   // currently-loaded path (dedup live reloads)
     uint32_t      wallpaper_fit_{0}; // 0=Cover 1=Contain 2=Stretch 3=Center
     uint32_t      wallpaper_img_w_{0}, wallpaper_img_h_{0}; // decoded native size (for aspect)
-    // Uploads an RGBA8 pixel buffer as a device-local sampled texture + descriptor set.
-    [[nodiscard]] std::expected<VkImage, VulkanError>
-        createImageFromPixels(const uint8_t* rgba, uint32_t w, uint32_t h) noexcept;
 
     std::unique_ptr<WindowDecorator> decorator_;
 

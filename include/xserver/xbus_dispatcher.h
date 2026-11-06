@@ -50,7 +50,7 @@ void InjectInputAction(const shared::InputMessage& input_msg);
 void BroadcastNotification(const shared::NotificationPayload& payload);
 void BroadcastNotificationDismiss(uint32_t id);
 void BroadcastXBusMessage(const shared::XBusMessage& msg);
-void BroadcastPresentFeedback(const shared::PresentFeedback& fb);
+void SendPresentFeedback(const shared::PresentFeedback& fb);
 void BroadcastWorkspaceChanged(uint32_t index) noexcept;
 void BroadcastSwitcherUpdate(const shared::SwitcherPayload& payload) noexcept;
 void BroadcastSwitcherDismiss() noexcept;

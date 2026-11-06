@@ -80,6 +80,7 @@
 #include "xserver/calendar_service.h"
 #include "xserver/virtual_keyboard_service.h"
 #include "xserver/headless_service.h"
+#include "xserver/shm_frame.h"
 #include "shared/protocol.h"
 #include "shared/logger.h"
 #include <iostream>
@@ -795,7 +796,7 @@ int main(int argc, char** argv) {
             fb.tv_nsec_    = tv_usec * 1000u;
             fb.refresh_ns_ = refresh_ns;
             fb.seq_lo_     = seq;
-            BroadcastPresentFeedback(fb);
+            SendPresentFeedback(fb);
         });
     }
 
@@ -957,6 +958,21 @@ int main(int argc, char** argv) {
             {.env = {{"XBUS_SOCKET", kSocketPath}}, .stdout_path = "/tmp/xfetch.log"});
         if (fetch_pid < 0)
             std::cerr << "[xserver] xfetch not found: sandboxed apps have no network\n";
+
+        // Wayland apps connect to wayland-0, which the shell names in their
+        // environment, in a folder only this user can reach.
+        if (!std::getenv("XDG_RUNTIME_DIR")) {
+            const std::string dir = "/tmp/fbx-runtime-" + std::to_string(::getuid());
+            ::mkdir(dir.c_str(), 0700);
+            ::setenv("XDG_RUNTIME_DIR", dir.c_str(), 1);
+        }
+        pid_t bridge_pid = spawn::start(
+            spawn::firstExecutable({own + "xwayland-bridge", "./out/xwayland-bridge", "/usr/local/bin/xwayland-bridge"}),
+            "xwayland-bridge", {},
+            {.env = {{"XBUS_SOCKET", kSocketPath}, {"XDG_RUNTIME_DIR", std::getenv("XDG_RUNTIME_DIR")}},
+             .stdout_path = "/tmp/xwayland-bridge.log"});
+        if (bridge_pid < 0)
+            std::cerr << "[xserver] xwayland-bridge not found: Wayland apps can't run\n";
     }
     
     (void)loop->addFd(master_fd.get(), [&, m_fd = master_fd.get()]() {
@@ -1216,6 +1232,28 @@ int main(int argc, char** argv) {
                                     r->geom_x_, r->geom_y_, r->geom_w_, r->geom_h_);
                         }
                         g_scene_dirty = true;  // a client presented a new frame
+                    } else if (r->status_ == RenderMessageStatus::ShmFrame) {
+                        if (!g_surface_clients.contains(r->surface_id_)) return;
+                        const size_t bytes = shmframe::frameBytes(r->width_, r->height_);
+                        if (!f.isValid() || !shmframe::safeToMap(f.get(), bytes)) {
+                            std::cerr << "[xserver] Refusing a shared-memory frame for surface " << r->surface_id_ << "\n";
+                            return;
+                        }
+                        void* pixels = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, f.get(), 0);
+                        if (pixels == MAP_FAILED) return;
+                        releaseSurfaceImages(comp.get(), r->surface_id_);
+                        auto i = comp->createImageFromPixels(static_cast<const uint8_t*>(pixels), r->width_, r->height_);
+                        ::munmap(pixels, bytes);
+                        if (i) {
+                            g_surface_images[r->surface_id_] = i.value();     // owned, like a solid colour
+                            window_stack.updateSurface(r->surface_id_, i.value(), r->width_, r->height_,
+                                r->damage_x_, r->damage_y_, r->damage_width_, r->damage_height_);
+                            if (g_subsurface_ids.contains(r->surface_id_))
+                                window_stack.updateSubsurfacePosition(r->surface_id_, r->damage_x_, r->damage_y_);
+                            if (r->geom_w_ > 0)
+                                window_stack.setWindowGeometry(r->surface_id_, r->geom_x_, r->geom_y_, r->geom_w_, r->geom_h_);
+                        }
+                        g_scene_dirty = true;
                     } else if (r->status_ == RenderMessageStatus::SolidColor) {
                         // stride_ = ARGB color (0xAARRGGBB); no fd — always recreate image
                         if (!g_surface_clients.contains(r->surface_id_)) {
@@ -1234,7 +1272,13 @@ int main(int argc, char** argv) {
                         g_scene_dirty = true;  // solid-color surface updated
                     } else if (r->status_ == RenderMessageStatus::SurfaceClosed) {
                         g_scene_dirty = true;  // a window went away
+                        // Keys that were going to a menu go back to its window.
+                        uint32_t parent = 0;
+                        for (const auto& w : window_stack.getWindows())
+                            if (w.surface_id_ == r->surface_id_ && w.is_subsurface_) parent = w.parent_id_;
                         window_stack.removeWindow(r->surface_id_);
+                        if (focused_surface == r->surface_id_)
+                            focused_surface = g_surface_clients.contains(parent) ? parent : 999u;
                         RebuildAndBroadcastWindowList(&window_stack);
                         releaseSurfaceImages(comp.get(), r->surface_id_);
                         if (g_surface_clients.contains(r->surface_id_)) g_surface_clients.erase(r->surface_id_);
@@ -1514,6 +1558,17 @@ int main(int argc, char** argv) {
                 close(export_res.value());
             }
         }
+            // No display, so no page flip to report: this frame is as presented as it
+            // gets. Wayland apps wait for this before they draw again.
+            if (!drm_ptr) {
+                timespec now{};
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                shared::PresentFeedback fb{};
+                fb.tv_sec_lo_  = static_cast<uint32_t>(now.tv_sec);
+                fb.tv_nsec_    = static_cast<uint32_t>(now.tv_nsec);
+                fb.refresh_ns_ = 16666667u;
+                SendPresentFeedback(fb);
+            }
         }  // end if (must_render)
 
         // Drain remotely injected input from VNC clients and forward to focused app
@@ -2026,6 +2081,23 @@ int main(int argc, char** argv) {
             uint32_t target = g_pointer_button_down
                 ? focused_surface
                 : pointerTarget({cursor_x, cursor_y}).value_or(999u);
+            // The bridge has many windows on one connection, so it has to be told
+            // which one the pointer is over. Apps have the one and need no telling.
+            static uint32_t pointer_over = 0;
+            if (target != pointer_over) {
+                auto tell = [](uint32_t client_of, uint32_t surface) {
+                    auto it = g_surface_clients.find(client_of);
+                    if (it == g_surface_clients.end() || !it->second ||
+                        !peer::isOneOf(it->second->fd(), {"xwayland-bridge"})) return;
+                    shared::InputMessage over{};
+                    over.type_ = InputEventType::PointerSurface;
+                    over.value_a_ = static_cast<int32_t>(surface);
+                    (void)it->second->sendMessage({reinterpret_cast<const uint8_t*>(&over), sizeof(over)});
+                };
+                tell(pointer_over, 0);
+                tell(target, target);
+                pointer_over = target;
+            }
             if (g_surface_clients.contains(target)) {
                 shared::InputMessage local = msg;
                 auto o = window_stack.windowOrigin(target);
