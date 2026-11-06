@@ -1,5 +1,9 @@
 #pragma once
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +47,74 @@ struct Url {
     std::string host;
     std::string path;   // from the first '/' on (always non-empty)
 };
+
+// ── Browsing ──────────────────────────────────────────────────────────────────
+// One client may ask for any public web address: our web engine's viewer, recognised
+// by its executable. It's a single process in a sandbox, it runs no scripts yet, and
+// xfetch refuses to connect to anything on this machine or the local network.
+inline constexpr const char* kWebApp = "com.freebsdx.web";
+inline constexpr size_t kWebMaxBytes = 32 * kMiB;
+inline constexpr size_t kWebMaxUrl = 8192;   // real stylesheet and search addresses get long
+
+// An http(s) URL a browser may ask for: no userinfo (a classic way to disguise where a
+// link goes), a real port if any. Addresses are checked when connecting, not here: a
+// name can resolve to anything.
+inline bool webUrlAllowed(std::string_view url) {
+    if (url.empty() || url.size() >= kWebMaxUrl) return false;
+    for (char c : url)
+        if (static_cast<unsigned char>(c) <= 0x20 || c == 0x7f || c == '\\') return false;
+    std::string lower(url.substr(0, 8));
+    for (char& c : lower)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    std::string_view rest;
+    if (lower.starts_with("https://")) rest = url.substr(8);
+    else if (lower.starts_with("http://")) rest = url.substr(7);
+    else return false;
+    const std::string_view authority = rest.substr(0, rest.find_first_of("/?#"));
+    if (authority.empty() || authority.find_first_of("@[]") != std::string_view::npos) return false;
+    const size_t colon = authority.find(':');
+    if (colon == std::string_view::npos) return true;
+    if (colon == 0) return false;
+    const std::string_view digits = authority.substr(colon + 1);
+    if (digits.empty() || digits.size() > 5) return false;
+    uint32_t port = 0;
+    for (char c : digits) {
+        if (c < '0' || c > '9') return false;
+        port = port * 10 + static_cast<uint32_t>(c - '0');
+    }
+    // The web's ports, not mail's or ssh's.
+    return port == 80 || port == 443 || (port >= 1024 && port <= 65535);
+}
+
+// This machine, the local network, and addresses that aren't really anywhere: what a
+// page must never be able to reach, even by redirecting there.
+inline bool isPrivateAddress(const struct sockaddr* sa) {
+    if (sa->sa_family == AF_INET) {
+        const auto* in = reinterpret_cast<const struct sockaddr_in*>(sa);
+        const uint32_t a = ntohl(in->sin_addr.s_addr);
+        const auto within = [a](uint32_t net, int bits) { return (a >> (32 - bits)) == (net >> (32 - bits)); };
+        return within(0x00000000, 8) || within(0x0A000000, 8) || within(0x7F000000, 8) || within(0x64400000, 10) ||
+               within(0xA9FE0000, 16) || within(0xAC100000, 12) || within(0xC0A80000, 16) || within(0xC0000000, 24) ||
+               a >= 0xE0000000;   // multicast and reserved
+    }
+    if (sa->sa_family == AF_INET6) {
+        const auto* in6 = reinterpret_cast<const struct sockaddr_in6*>(sa);
+        const uint8_t* b = in6->sin6_addr.s6_addr;
+        static constexpr uint8_t kMapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+        if (std::equal(b, b + 12, kMapped)) {   // an IPv4 address in disguise
+            struct sockaddr_in v4{};
+            v4.sin_family = AF_INET;
+            std::copy(b + 12, b + 16, reinterpret_cast<uint8_t*>(&v4.sin_addr.s_addr));
+            return isPrivateAddress(reinterpret_cast<const struct sockaddr*>(&v4));
+        }
+        const bool all_zero_but_last = std::all_of(b, b + 15, [](uint8_t x) { return x == 0; });
+        return (all_zero_but_last && b[15] <= 1) ||   // :: and ::1
+               (b[0] & 0xFE) == 0xFC ||               // unique local
+               (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) ||   // link local
+               b[0] == 0xFF;                          // multicast
+    }
+    return true;   // not an internet address at all
+}
 
 // Direct connections, for what HTTP relaying can't carry. Mail speaks IMAP and
 // SMTP to whichever server the user set up, so it's the port that's limited.

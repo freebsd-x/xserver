@@ -1,3 +1,7 @@
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "xserver/fetch_broker.h"
 #include "xserver/desktop_services.h"
 #include "xserver/fetch_policy.h"
@@ -184,6 +188,32 @@ uint32_t nextIdLocked() {
 
 void FetchBroker::allowTestPorts() noexcept { g_test_ports_allowed = true; }
 
+namespace {
+
+// A long address from a client's descriptor: an ordinary memory object of a sane size,
+// not a pipe that would leave the compositor waiting.
+bool readLongUrl(int fd, std::string& out) {
+    struct stat st{};
+    if (fd < 0 || ::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        static_cast<size_t>(st.st_size) >= fetch_policy::kWebMaxUrl)
+        return false;
+    out.resize(static_cast<size_t>(st.st_size));
+    const ssize_t got = ::pread(fd, out.data(), out.size(), 0);
+    return got == st.st_size;
+}
+
+UniqueFd textFd(const std::string& text) {
+    UniqueFd fd(shm_open(SHM_ANON, O_RDWR | O_CLOEXEC, 0600));
+    if (!fd || ::ftruncate(fd.get(), static_cast<off_t>(text.size())) != 0) return {};
+    void* map = ::mmap(nullptr, text.size(), PROT_WRITE, MAP_SHARED, fd.get(), 0);
+    if (map == MAP_FAILED) return {};
+    std::memcpy(map, text.data(), text.size());
+    ::munmap(map, text.size());
+    return fd;
+}
+
+}  // namespace
+
 void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
                                  const shared::XBusMessage& msg, UniqueFd& fd) noexcept {
     using O = shared::FetchOpcode;
@@ -229,10 +259,25 @@ void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
         shared::FetchRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         req.url_[sizeof(req.url_) - 1] = '\0';
-        const std::string app = verifiedAppId(client->fd());
+        const bool web = (req.flags_ & shared::kFetchWeb) != 0;
+        // A long address comes in a descriptor. It's read once and passed on as our own
+        // copy: the client could change its copy after we'd checked it.
+        std::string long_url;
+        UniqueFd url_copy;
+        if (web && (req.flags_ & shared::kFetchUrlInFd)) {
+            if (!readLongUrl(fd.get(), long_url) || !(url_copy = textFd(long_url))) {
+                fail(client, msg.transaction_id_, shared::FetchStatus::BadRequest);
+                return;
+            }
+        }
+        const std::string url = long_url.empty() ? std::string(req.url_) : long_url;
+        // Browsing is for our web engine's viewer alone, known by what it runs.
+        const std::string app = web && peer::isOneOf(client->fd(), {"xwebview"}) ? fetch_policy::kWebApp : verifiedAppId(client->fd());
+        const bool permitted = web ? app == fetch_policy::kWebApp && fetch_policy::webUrlAllowed(url)
+                                   : fetch_policy::allowed(app, req.url_);
         // The compositor's identity can't be claimed by an app's manifest.
-        if (app == fetch_policy::kCompositor || !fetch_policy::allowed(app, req.url_)) {
-            std::cerr << "[Fetch] DENIED: " << (app.empty() ? "unknown app" : app) << " → " << req.url_ << "\n";
+        if (app == fetch_policy::kCompositor || !permitted) {
+            std::cerr << "[Fetch] DENIED: " << (app.empty() ? "unknown app" : app) << " → " << url.substr(0, 200) << "\n";
             fail(client, msg.transaction_id_, shared::FetchStatus::Denied);
             return;
         }
@@ -245,7 +290,7 @@ void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
         fwd.transaction_id_ = id;
         fwd.opcode_ = static_cast<uint32_t>(O::Get);
         std::memcpy(fwd.payload_, &req, sizeof(req));
-        if (!provider->sendMessage({reinterpret_cast<const uint8_t*>(&fwd), sizeof(fwd)})) {
+        if (!provider->sendMessage({reinterpret_cast<const uint8_t*>(&fwd), sizeof(fwd)}, url_copy ? url_copy.get() : -1)) {
             fail(client, msg.transaction_id_, shared::FetchStatus::Unavailable);
             return;
         }

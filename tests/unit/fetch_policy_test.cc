@@ -80,3 +80,59 @@ TEST(FetchPolicy, SizeLimitsFollowTheRule) {
     EXPECT_EQ(limit, 8 * fp::kMiB);
     EXPECT_TRUE(cacheable);
 }
+
+namespace {
+bool privateV4(const char* text) {
+    struct sockaddr_in a{};
+    a.sin_family = AF_INET;
+    inet_pton(AF_INET, text, &a.sin_addr);
+    return fbx::xserver::fetch_policy::isPrivateAddress(reinterpret_cast<const struct sockaddr*>(&a));
+}
+bool privateV6(const char* text) {
+    struct sockaddr_in6 a{};
+    a.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, text, &a.sin6_addr);
+    return fbx::xserver::fetch_policy::isPrivateAddress(reinterpret_cast<const struct sockaddr*>(&a));
+}
+}  // namespace
+
+TEST(WebPolicy, UrlsABrowserMayAskFor) {
+    using fbx::xserver::fetch_policy::webUrlAllowed;
+    EXPECT_TRUE(webUrlAllowed("https://example.com/"));
+    EXPECT_TRUE(webUrlAllowed("HTTP://example.com"));
+    EXPECT_TRUE(webUrlAllowed("https://example.com:8443/a?b=c#d"));
+    EXPECT_TRUE(webUrlAllowed("http://example.com:80/"));
+    EXPECT_FALSE(webUrlAllowed("file:///etc/passwd"));
+    EXPECT_FALSE(webUrlAllowed("ftp://example.com/"));
+    EXPECT_FALSE(webUrlAllowed("javascript:alert(1)"));
+    EXPECT_FALSE(webUrlAllowed("https://user:pw@example.com/"));
+    EXPECT_FALSE(webUrlAllowed("https://example.com@evil.test/"));
+    EXPECT_FALSE(webUrlAllowed("http://example.com:25/"));     // not the web's ports
+    EXPECT_FALSE(webUrlAllowed("http://example.com:22/"));
+    EXPECT_FALSE(webUrlAllowed("http://example.com:99999/"));
+    EXPECT_FALSE(webUrlAllowed("http://example.com:x/"));
+    EXPECT_FALSE(webUrlAllowed("http://[::1]/"));
+    EXPECT_FALSE(webUrlAllowed("http:///nohost"));
+    EXPECT_FALSE(webUrlAllowed("http://a b/"));
+    EXPECT_FALSE(webUrlAllowed("http://a\\b/"));
+    EXPECT_TRUE(webUrlAllowed("https://example.com/" + std::string(1000, 'a')));
+    EXPECT_FALSE(webUrlAllowed("https://example.com/" + std::string(9000, 'a')));
+}
+
+TEST(WebPolicy, ReachingForTheLocalNetworkIsRefused) {
+    for (const char* a : {"127.0.0.1", "127.1.2.3", "10.0.0.1", "192.168.0.1", "172.16.0.1", "172.31.255.255", "169.254.169.254",
+                          "0.0.0.0", "100.64.0.1", "224.0.0.1", "255.255.255.255"})
+        EXPECT_TRUE(privateV4(a)) << a;
+    for (const char* a : {"1.1.1.1", "8.8.8.8", "172.32.0.1", "172.15.0.1", "192.167.0.1", "100.128.0.1", "93.184.216.34"})
+        EXPECT_FALSE(privateV4(a)) << a;
+    for (const char* a : {"::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:192.168.1.1"})
+        EXPECT_TRUE(privateV6(a)) << a;
+    for (const char* a : {"2001:4860:4860::8888", "::ffff:8.8.8.8"}) EXPECT_FALSE(privateV6(a)) << a;
+}
+
+TEST(WebPolicy, OtherAppsKeepTheirAllowlists) {
+    using namespace fbx::xserver::fetch_policy;
+    EXPECT_FALSE(allowed("com.freebsdx.maps", "https://example.com/"));
+    EXPECT_FALSE(allowed(kWebApp, "https://example.com/"));   // only the web flag's path, which checks who asks
+    EXPECT_FALSE(knownHost("https://example.com/"));
+}

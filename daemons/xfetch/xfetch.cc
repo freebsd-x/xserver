@@ -39,6 +39,7 @@ using namespace fbx;
 
 namespace {
 
+constexpr const char* kWebUserAgent = "Mozilla/5.0 (FreeBSD; x86_64) FreeBSD-X-xweb/0.1";
 constexpr size_t kMaxCached    = 8u << 20;       // cache entries are tiles; anything larger isn't cached
 constexpr long   kTimeoutSec   = 15;
 constexpr time_t kCacheMaxAge  = 7 * 24 * 3600;  // tiles: a week (OSM tile usage policy)
@@ -53,7 +54,7 @@ fs::path                            g_cache_dir;
 // streams, multiplexed), so a screenful of map tiles costs one TLS handshake
 // and arrives about as fast as the server sends them. (One easy handle per
 // request paid a handshake per tile; six pooled ones still took ~2x longer.)
-struct Job { uint32_t txn; std::string url; std::chrono::steady_clock::time_point queued; };
+struct Job { uint32_t txn; std::string url; bool web; std::chrono::steady_clock::time_point queued; };
 const bool g_trace = std::getenv("FBX_FETCH_TRACE") != nullptr;   // per-request timing to the log
 std::mutex              g_jobs_mu;
 std::deque<Job>         g_jobs;
@@ -119,6 +120,24 @@ void setOptions(CURL* c, const std::string& url, Sink* sink) {
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(c, CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(sink->limit));
     curl_easy_setopt(c, CURLOPT_PIPEWAIT, 1L);   // wait to multiplex rather than open another connection
+}
+
+// Browsing: the extra rules for a kFetchWeb transfer.
+// Refuses, as it connects, anything on this machine or the local network, so neither a
+// link nor a redirect can reach them. (Tests serve their pages locally and say so.)
+curl_socket_t openPublicSocket(void*, curlsocktype, struct curl_sockaddr* addr) {
+    static const bool allow_local = std::getenv("FBX_TEST_WEB_LOCAL") != nullptr;
+    if (!allow_local && xserver::fetch_policy::isPrivateAddress(&addr->addr)) return CURL_SOCKET_BAD;
+    return ::socket(addr->family, addr->socktype, addr->protocol);
+}
+
+void setWebOptions(CURL* c) {
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");   // whatever curl can decompress
+    curl_easy_setopt(c, CURLOPT_OPENSOCKETFUNCTION, openPublicSocket);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, kWebUserAgent);
 }
 
 // The body in a sealed-for-reading anonymous shm object.
@@ -198,7 +217,10 @@ void networkLoop() {
             bool cacheable = false;
             size_t limit = 0;
             std::string body;
-            if (!xserver::fetch_policy::knownHost(job.url, &cacheable, &limit)) {
+            if (job.web) {
+                limit = xserver::fetch_policy::kWebMaxBytes;   // the compositor checked who's asking
+            }
+            if (!job.web && !xserver::fetch_policy::knownHost(job.url, &cacheable, &limit)) {
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::Denied);
                 finish(job, r, body, now);
             } else if (cacheable && readCache(job.url, body)) {
@@ -209,6 +231,7 @@ void networkLoop() {
             } else if (CURL* c = curl_easy_init()) {
                 auto* t = new Transfer{std::move(job), {{}, limit}, cacheable, now};
                 setOptions(c, t->job.url, &t->body);
+                if (t->job.web) setWebOptions(c);
                 curl_easy_setopt(c, CURLOPT_PRIVATE, t);
                 curl_multi_add_handle(multi, c);
             } else {
@@ -234,10 +257,22 @@ void networkLoop() {
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::TooLarge);
             else if (rc != CURLE_OK)
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::NetworkError);
+            else if (t->job.web)
+                r.status_ = static_cast<int32_t>(shared::FetchStatus::Ok);   // a 404 page is still a page
             else if (code < 200 || code >= 300)
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::HttpError);
             else
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::Ok);
+            if (t->job.web && r.status_ == static_cast<int32_t>(shared::FetchStatus::Ok)) {
+                // Where it ended up, and what it says it is: relative links need the one,
+                // and deciding how to show it the other.
+                char* final_url = nullptr;
+                char* content_type = nullptr;
+                curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &final_url);
+                curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &content_type);
+                t->body.data.insert(0, std::string(final_url ? final_url : t->job.url.c_str()) + "\n" +
+                                           (content_type ? content_type : "") + "\n");
+            }
             if (r.status_ == static_cast<int32_t>(shared::FetchStatus::Ok) && t->cacheable &&
                 t->body.data.size() <= kMaxCached)
                 writeCache(t->job.url, t->body.data);
@@ -300,9 +335,20 @@ int main() {
         shared::FetchRequest req{};
         std::memcpy(&req, m.payload_, sizeof(req));
         req.url_[sizeof(req.url_) - 1] = '\0';
+        std::string url(req.url_);
+        if (req.flags_ & shared::kFetchUrlInFd) {
+            // The compositor's own copy of a long address, already checked.
+            struct stat st{};
+            const int url_fd = res->second.get();
+            if (url_fd < 0 || ::fstat(url_fd, &st) != 0 || st.st_size <= 0 ||
+                static_cast<size_t>(st.st_size) >= xserver::fetch_policy::kWebMaxUrl)
+                continue;
+            url.resize(static_cast<size_t>(st.st_size));
+            if (::pread(url_fd, url.data(), url.size(), 0) != st.st_size) continue;
+        }
         {
             std::lock_guard<std::mutex> lk(g_jobs_mu);
-            g_jobs.push_back({m.transaction_id_, std::string(req.url_), std::chrono::steady_clock::now()});
+            g_jobs.push_back({m.transaction_id_, std::move(url), (req.flags_ & shared::kFetchWeb) != 0, std::chrono::steady_clock::now()});
         }
         if (CURLM* multi = g_multi.load()) curl_multi_wakeup(multi);
     }
