@@ -54,7 +54,14 @@ fs::path                            g_cache_dir;
 // streams, multiplexed), so a screenful of map tiles costs one TLS handshake
 // and arrives about as fast as the server sends them. (One easy handle per
 // request paid a handshake per tile; six pooled ones still took ~2x longer.)
-struct Job { uint32_t txn; std::string url; bool web; std::chrono::steady_clock::time_point queued; };
+struct Job {
+    uint32_t txn;
+    std::string url;
+    bool web;
+    std::chrono::steady_clock::time_point queued;
+    bool post = false;           // a form's POST (web only)
+    std::string content_type, body;
+};
 const bool g_trace = std::getenv("FBX_FETCH_TRACE") != nullptr;   // per-request timing to the log
 std::mutex              g_jobs_mu;
 std::deque<Job>         g_jobs;
@@ -195,6 +202,7 @@ struct Transfer {
     Sink        body;
     bool        cacheable = false;
     std::chrono::steady_clock::time_point started;
+    curl_slist* headers = nullptr;   // a POST's content type
 };
 
 // The network thread: takes queued requests, answers policy refusals and cache
@@ -232,6 +240,12 @@ void networkLoop() {
                 auto* t = new Transfer{std::move(job), {{}, limit}, cacheable, now};
                 setOptions(c, t->job.url, &t->body);
                 if (t->job.web) setWebOptions(c);
+                if (t->job.web && t->job.post) {
+                    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(t->job.body.size()));
+                    curl_easy_setopt(c, CURLOPT_COPYPOSTFIELDS, t->job.body.c_str());
+                    t->headers = curl_slist_append(nullptr, ("Content-Type: " + t->job.content_type).c_str());
+                    curl_easy_setopt(c, CURLOPT_HTTPHEADER, t->headers);
+                }
                 curl_easy_setopt(c, CURLOPT_PRIVATE, t);
                 curl_multi_add_handle(multi, c);
             } else {
@@ -279,6 +293,7 @@ void networkLoop() {
             finish(t->job, r, t->body.data, t->started);
             curl_multi_remove_handle(multi, c);
             curl_easy_cleanup(c);
+            if (t->headers) curl_slist_free_all(t->headers);
             delete t;
         }
         // Sleep until a socket is ready, a timer is due, or main() queues a
@@ -336,7 +351,23 @@ int main() {
         std::memcpy(&req, m.payload_, sizeof(req));
         req.url_[sizeof(req.url_) - 1] = '\0';
         std::string url(req.url_);
-        if (req.flags_ & shared::kFetchUrlInFd) {
+        Job job{m.transaction_id_, {}, (req.flags_ & shared::kFetchWeb) != 0, std::chrono::steady_clock::now()};
+        if ((req.flags_ & shared::kFetchPost) && job.web) {
+            // The compositor's own copy, already checked: "<url>\n<content type>\n<body>".
+            struct stat st{};
+            const int fd = res->second.get();
+            if (fd < 0 || ::fstat(fd, &st) != 0 || st.st_size <= 0 || static_cast<size_t>(st.st_size) >= xserver::fetch_policy::kWebMaxPost)
+                continue;
+            std::string request(static_cast<size_t>(st.st_size), '\0');
+            if (::pread(fd, request.data(), request.size(), 0) != st.st_size) continue;
+            const size_t first = request.find('\n');
+            const size_t second = first == std::string::npos ? std::string::npos : request.find('\n', first + 1);
+            if (second == std::string::npos) continue;
+            url = request.substr(0, first);
+            job.post = true;
+            job.content_type = request.substr(first + 1, second - first - 1);
+            job.body = request.substr(second + 1);
+        } else if (req.flags_ & shared::kFetchUrlInFd) {
             // The compositor's own copy of a long address, already checked.
             struct stat st{};
             const int url_fd = res->second.get();
@@ -348,7 +379,8 @@ int main() {
         }
         {
             std::lock_guard<std::mutex> lk(g_jobs_mu);
-            g_jobs.push_back({m.transaction_id_, std::move(url), (req.flags_ & shared::kFetchWeb) != 0, std::chrono::steady_clock::now()});
+            job.url = std::move(url);
+            g_jobs.push_back(std::move(job));
         }
         if (CURLM* multi = g_multi.load()) curl_multi_wakeup(multi);
     }

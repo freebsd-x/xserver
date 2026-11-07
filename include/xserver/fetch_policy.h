@@ -55,6 +55,14 @@ struct Url {
 inline constexpr const char* kWebApp = "com.freebsdx.web";
 inline constexpr size_t kWebMaxBytes = 32 * kMiB;
 inline constexpr size_t kWebMaxUrl = 8192;   // real stylesheet and search addresses get long
+inline constexpr size_t kWebMaxPost = 4 * kMiB;   // a form's whole request, address and body
+
+// A POST's content type: one of the three a form can send, on one line.
+inline bool formContentTypeAllowed(const std::string& type) {
+    if (type.size() > 200 || type.find_first_of("\r\n") != std::string::npos) return false;
+    return type.starts_with("application/x-www-form-urlencoded") || type.starts_with("multipart/form-data") ||
+           type.starts_with("text/plain");
+}
 
 // An http(s) URL a browser may ask for: no userinfo (a classic way to disguise where a
 // link goes), a real port if any. Addresses are checked when connecting, not here: a

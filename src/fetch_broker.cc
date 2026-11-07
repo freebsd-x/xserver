@@ -192,10 +192,10 @@ namespace {
 
 // A long address from a client's descriptor: an ordinary memory object of a sane size,
 // not a pipe that would leave the compositor waiting.
-bool readLongUrl(int fd, std::string& out) {
+bool readLongUrl(int fd, std::string& out, size_t limit = fetch_policy::kWebMaxUrl) {
     struct stat st{};
     if (fd < 0 || ::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
-        static_cast<size_t>(st.st_size) >= fetch_policy::kWebMaxUrl)
+        static_cast<size_t>(st.st_size) >= limit)
         return false;
     out.resize(static_cast<size_t>(st.st_size));
     const ssize_t got = ::pread(fd, out.data(), out.size(), 0);
@@ -264,7 +264,21 @@ void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
         // copy: the client could change its copy after we'd checked it.
         std::string long_url;
         UniqueFd url_copy;
-        if (web && (req.flags_ & shared::kFetchUrlInFd)) {
+        const bool post = web && (req.flags_ & shared::kFetchPost);
+        if (!web) req.flags_ &= ~(shared::kFetchUrlInFd | shared::kFetchPost);
+        if (post) {
+            // "<url>\n<content type>\n<body>": the address is checked like any other.
+            std::string request;
+            const size_t first = readLongUrl(fd.get(), request, fetch_policy::kWebMaxPost) ? request.find('\n') : std::string::npos;
+            const size_t second = first == std::string::npos ? std::string::npos : request.find('\n', first + 1);
+            if (second == std::string::npos || first >= fetch_policy::kWebMaxUrl ||
+                !fetch_policy::formContentTypeAllowed(request.substr(first + 1, second - first - 1)) || !(url_copy = textFd(request))) {
+                fail(client, msg.transaction_id_, shared::FetchStatus::BadRequest);
+                return;
+            }
+            long_url = request.substr(0, first);
+            req.flags_ &= ~shared::kFetchUrlInFd;
+        } else if (web && (req.flags_ & shared::kFetchUrlInFd)) {
             if (!readLongUrl(fd.get(), long_url) || !(url_copy = textFd(long_url))) {
                 fail(client, msg.transaction_id_, shared::FetchStatus::BadRequest);
                 return;
