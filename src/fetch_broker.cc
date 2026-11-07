@@ -265,7 +265,7 @@ void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
         std::string long_url;
         UniqueFd url_copy;
         const bool post = web && (req.flags_ & shared::kFetchPost);
-        if (!web) req.flags_ &= ~(shared::kFetchUrlInFd | shared::kFetchPost);
+        if (!web) req.flags_ &= ~(shared::kFetchUrlInFd | shared::kFetchPost | shared::kFetchCookies);
         if (post) {
             // "<url>\n<content type>\n<body>": the address is checked like any other.
             std::string request;

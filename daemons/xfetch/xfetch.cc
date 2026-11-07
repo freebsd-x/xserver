@@ -59,6 +59,7 @@ struct Job {
     std::string url;
     bool web;
     std::chrono::steady_clock::time_point queued;
+    bool cookies = false;        // send and keep them (web only)
     bool post = false;           // a form's POST (web only)
     std::string content_type, body;
 };
@@ -205,9 +206,41 @@ struct Transfer {
     curl_slist* headers = nullptr;   // a POST's content type
 };
 
+// Cookies: curl's own engine, one jar shared by the transfers that may use it, kept in
+// a file only the user can read. Session cookies are written too, so a sign-in lasts
+// until the site ends it. Everything here runs on the network thread.
+fs::path g_cookie_file;
+CURLSH* g_cookies = nullptr;
+CURL* g_cookie_jar = nullptr;   // a handle that never transfers: it loads and writes the file
+bool g_cookies_dirty = false;
+std::chrono::steady_clock::time_point g_cookies_written;
+
+void openCookies() {
+    if (g_cookie_file.empty()) return;
+    g_cookies = curl_share_init();
+    curl_share_setopt(g_cookies, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+    g_cookie_jar = curl_easy_init();
+    if (!g_cookies || !g_cookie_jar) return;
+    curl_easy_setopt(g_cookie_jar, CURLOPT_SHARE, g_cookies);
+    curl_easy_setopt(g_cookie_jar, CURLOPT_COOKIEFILE, g_cookie_file.c_str());
+    curl_easy_setopt(g_cookie_jar, CURLOPT_COOKIEJAR, g_cookie_file.c_str());
+    curl_easy_setopt(g_cookie_jar, CURLOPT_COOKIELIST, "RELOAD");
+}
+
+void writeCookies(bool now = false) {
+    const auto t = std::chrono::steady_clock::now();
+    if (!g_cookie_jar || !g_cookies_dirty || (!now && t - g_cookies_written < std::chrono::seconds(3))) return;
+    curl_easy_setopt(g_cookie_jar, CURLOPT_COOKIELIST, "FLUSH");
+    std::error_code ec;
+    fs::permissions(g_cookie_file, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+    g_cookies_dirty = false;
+    g_cookies_written = t;
+}
+
 // The network thread: takes queued requests, answers policy refusals and cache
 // hits at once, and runs everything else concurrently in one multi handle.
 void networkLoop() {
+    openCookies();
     CURLM* multi = curl_multi_init();
     curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
     curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, 2L);   // be a polite tile client
@@ -240,6 +273,10 @@ void networkLoop() {
                 auto* t = new Transfer{std::move(job), {{}, limit}, cacheable, now};
                 setOptions(c, t->job.url, &t->body);
                 if (t->job.web) setWebOptions(c);
+                if (t->job.web && t->job.cookies && g_cookies) {
+                    curl_easy_setopt(c, CURLOPT_SHARE, g_cookies);
+                    curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");   // the engine on, the jar shared
+                }
                 if (t->job.web && t->job.post) {
                     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(t->job.body.size()));
                     curl_easy_setopt(c, CURLOPT_COPYPOSTFIELDS, t->job.body.c_str());
@@ -292,12 +329,14 @@ void networkLoop() {
                 writeCache(t->job.url, t->body.data);
             finish(t->job, r, t->body.data, t->started);
             curl_multi_remove_handle(multi, c);
+            if (t->job.cookies) g_cookies_dirty = true;
             curl_easy_cleanup(c);
             if (t->headers) curl_slist_free_all(t->headers);
             delete t;
         }
         // Sleep until a socket is ready, a timer is due, or main() queues a
         // request (curl_multi_wakeup).
+        writeCookies();
         curl_multi_poll(multi, nullptr, 0, 1000, nullptr);
     }
 }
@@ -315,6 +354,9 @@ int main() {
         fs::path dir = fs::path(home) / ".cache" / "freebsdx" / "fetch";
         fs::create_directories(dir, ec);
         if (!ec) g_cache_dir = dir;
+        const fs::path data = fs::path(home) / ".local" / "share" / "freebsdx";
+        fs::create_directories(data, ec);
+        if (!ec) g_cookie_file = data / "cookies.txt";
     }
 
     const char* path = std::getenv("XBUS_SOCKET");
@@ -352,6 +394,7 @@ int main() {
         req.url_[sizeof(req.url_) - 1] = '\0';
         std::string url(req.url_);
         Job job{m.transaction_id_, {}, (req.flags_ & shared::kFetchWeb) != 0, std::chrono::steady_clock::now()};
+        job.cookies = job.web && (req.flags_ & shared::kFetchCookies);
         if ((req.flags_ & shared::kFetchPost) && job.web) {
             // The compositor's own copy, already checked: "<url>\n<content type>\n<body>".
             struct stat st{};
