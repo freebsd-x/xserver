@@ -271,8 +271,9 @@ void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
             }
         }
         const std::string url = long_url.empty() ? std::string(req.url_) : long_url;
-        // Browsing is for our web engine's viewer alone, known by what it runs.
-        const std::string app = web && peer::isOneOf(client->fd(), {"xwebview"}) ? fetch_policy::kWebApp : verifiedAppId(client->fd());
+        // Browsing is for our web engine alone, the viewer or the Browser app built on
+        // it, known by what they run.
+        const std::string app = web && peer::isOneOf(client->fd(), {"xwebview", "browser"}) ? fetch_policy::kWebApp : verifiedAppId(client->fd());
         const bool permitted = web ? app == fetch_policy::kWebApp && fetch_policy::webUrlAllowed(url)
                                    : fetch_policy::allowed(app, req.url_);
         // The compositor's identity can't be claimed by an app's manifest.
