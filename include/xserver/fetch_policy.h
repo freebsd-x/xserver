@@ -5,6 +5,8 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -50,18 +52,29 @@ struct Url {
 
 // ── Browsing ──────────────────────────────────────────────────────────────────
 // One client may ask for any public web address: our web engine's viewer, recognised
-// by its executable. It's a single process in a sandbox, it runs no scripts yet, and
-// xfetch refuses to connect to anything on this machine or the local network.
+// by its executable. It's a single process in a sandbox (its pages' scripts run inside
+// it, and it sends cookies only for a page's own site), and xfetch refuses to connect
+// to anything on this machine or the local network.
 inline constexpr const char* kWebApp = "com.freebsdx.web";
 inline constexpr size_t kWebMaxBytes = 32 * kMiB;
 inline constexpr size_t kWebMaxUrl = 8192;   // real stylesheet and search addresses get long
 inline constexpr size_t kWebMaxPost = 4 * kMiB;   // a form's whole request, address and body
 
-// A POST's content type: one of the three a form can send, on one line.
+// A POST's content type: a form's, or a script's (fetch, XMLHttpRequest: JSON and the
+// like): a MIME type ("type/subtype", then parameters), printable, on one line.
 inline bool formContentTypeAllowed(const std::string& type) {
-    if (type.size() > 200 || type.find_first_of("\r\n") != std::string::npos) return false;
-    return type.starts_with("application/x-www-form-urlencoded") || type.starts_with("multipart/form-data") ||
-           type.starts_with("text/plain");
+    if (type.empty() || type.size() > 200) return false;
+    for (char c : type)
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) >= 0x7f) return false;
+    const size_t slash = type.find('/');
+    if (slash == std::string::npos || slash == 0) return false;
+    const auto token = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || std::strchr("!#$&-^_.+", c) != nullptr; };
+    for (size_t i = 0; i < slash; ++i)
+        if (!token(type[i])) return false;
+    size_t i = slash + 1;
+    const size_t start = i;
+    while (i < type.size() && token(type[i])) ++i;
+    return i > start && (i == type.size() || type[i] == ';' || type[i] == ' ');
 }
 
 // An http(s) URL a browser may ask for: no userinfo (a classic way to disguise where a
