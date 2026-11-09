@@ -136,3 +136,19 @@ TEST(WebPolicy, OtherAppsKeepTheirAllowlists) {
     EXPECT_FALSE(allowed(kWebApp, "https://example.com/"));   // only the web flag's path, which checks who asks
     EXPECT_FALSE(knownHost("https://example.com/"));
 }
+
+TEST(WebPolicy, ScriptRequestsCarryOnlyWhatAPageMaySet) {
+    using namespace fbx::xserver::fetch_policy;
+    for (const char* m : {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}) EXPECT_TRUE(scriptMethodAllowed(m)) << m;
+    for (const char* m : {"CONNECT", "TRACE", "TRACK", "get", "", "GET\n"}) EXPECT_FALSE(scriptMethodAllowed(m)) << m;
+    EXPECT_TRUE(scriptHeaderAllowed("X-Token", "abc"));
+    EXPECT_TRUE(scriptHeaderAllowed("Content-Type", "application/json"));
+    EXPECT_TRUE(scriptHeaderAllowed("Origin", "https://example.org"));   // the engine sets it
+    for (const char* h : {"Host", "Cookie", "content-length", "Connection", "Transfer-Encoding", "Sec-Fetch-Mode", "Proxy-Authorization", "Set-Cookie"})
+        EXPECT_FALSE(scriptHeaderAllowed(h, "x")) << h;
+    EXPECT_FALSE(scriptHeaderAllowed("X-Bad", "a\r\nInjected: 1"));
+    EXPECT_FALSE(scriptHeaderAllowed("Bad Name", "x"));
+    EXPECT_FALSE(scriptHeaderAllowed("", "x"));
+    EXPECT_TRUE(formContentTypeAllowed("application/json; charset=utf-8"));
+    EXPECT_FALSE(formContentTypeAllowed("not a type"));
+}

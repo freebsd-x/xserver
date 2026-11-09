@@ -77,6 +77,29 @@ inline bool formContentTypeAllowed(const std::string& type) {
     return i > start && (i == type.size() || type[i] == ';' || type[i] == ' ');
 }
 
+// A script's request (kFetchScript): the methods, and the headers a page may set (not
+// the ones the browser owns: Host, Cookie, the connection's own; Origin and Referer the
+// engine sets itself and are let through).
+inline constexpr size_t kWebMaxScriptRequest = 4 * kMiB;
+inline bool scriptMethodAllowed(const std::string& m) {
+    for (const char* ok : {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+        if (m == ok) return true;
+    return false;
+}
+inline bool scriptHeaderAllowed(const std::string& name, const std::string& value) {
+    if (name.empty() || name.size() > 128 || value.size() > 8192) return false;
+    for (char c : name)
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || std::strchr("!#$%&'*+-.^_`|~", c))) return false;
+    for (char c : value)
+        if (c == '\r' || c == '\n' || c == '\0') return false;
+    std::string lower;
+    for (char c : name) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const char* no : {"host", "cookie", "cookie2", "content-length", "connection", "keep-alive", "transfer-encoding", "te",
+                           "trailer", "upgrade", "via", "expect", "date", "accept-charset", "accept-encoding", "set-cookie"})
+        if (lower == no) return false;
+    return !lower.starts_with("proxy-") && !lower.starts_with("sec-");
+}
+
 // An http(s) URL a browser may ask for: no userinfo (a classic way to disguise where a
 // link goes), a real port if any. Addresses are checked when connecting, not here: a
 // name can resolve to anything.

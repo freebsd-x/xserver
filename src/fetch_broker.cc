@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -265,8 +267,43 @@ void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
         std::string long_url;
         UniqueFd url_copy;
         const bool post = web && (req.flags_ & shared::kFetchPost);
-        if (!web) req.flags_ &= ~(shared::kFetchUrlInFd | shared::kFetchPost | shared::kFetchCookies);
-        if (post) {
+        const bool script = web && !post && (req.flags_ & shared::kFetchScript);
+        if (!web) req.flags_ &= ~(shared::kFetchUrlInFd | shared::kFetchPost | shared::kFetchCookies | shared::kFetchScript);
+        if (script) {
+            // "<method>\n<url>\n<headers>\n\n<body>": each part checked, and passed on
+            // rebuilt from what was checked (nothing the client could slip in after).
+            std::string request;
+            bool ok = readLongUrl(fd.get(), request, fetch_policy::kWebMaxScriptRequest);
+            const size_t m_end = ok ? request.find('\n') : std::string::npos;
+            const size_t u_end = m_end == std::string::npos ? std::string::npos : request.find('\n', m_end + 1);
+            std::string rebuilt;
+            if (u_end == std::string::npos) ok = false;
+            if (ok) {
+                const std::string method = request.substr(0, m_end);
+                long_url = request.substr(m_end + 1, u_end - m_end - 1);
+                ok = fetch_policy::scriptMethodAllowed(method) && long_url.size() < fetch_policy::kWebMaxUrl;
+                rebuilt = method + "\n" + long_url + "\n";
+                size_t at = u_end + 1;
+                while (ok) {
+                    const size_t eol = request.find('\n', at);
+                    if (eol == std::string::npos) { ok = false; break; }
+                    if (eol == at) { at = eol + 1; break; }   // the blank line: the body follows
+                    const std::string line = request.substr(at, eol - at);
+                    const size_t colon = line.find(':');
+                    if (colon == std::string::npos) { ok = false; break; }
+                    std::string name = line.substr(0, colon), value = line.substr(colon + 1);
+                    while (!value.empty() && value.front() == ' ') value.erase(value.begin());
+                    if (fetch_policy::scriptHeaderAllowed(name, value)) rebuilt += name + ": " + value + "\n";
+                    at = eol + 1;
+                }
+                if (ok) rebuilt += "\n" + request.substr(std::min(at, request.size()));
+            }
+            if (!ok || !(url_copy = textFd(rebuilt))) {
+                fail(client, msg.transaction_id_, shared::FetchStatus::BadRequest);
+                return;
+            }
+            req.flags_ &= ~shared::kFetchUrlInFd;
+        } else if (post) {
             // "<url>\n<content type>\n<body>": the address is checked like any other.
             std::string request;
             const size_t first = readLongUrl(fd.get(), request, fetch_policy::kWebMaxPost) ? request.find('\n') : std::string::npos;

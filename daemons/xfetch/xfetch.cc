@@ -12,6 +12,8 @@
 #include "xserver/fetch_policy.h"
 #include "xserver/ipc_socket.h"
 
+#include <algorithm>
+#include <vector>
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <sys/capsicum.h>
@@ -62,6 +64,9 @@ struct Job {
     bool cookies = false;        // send and keep them (web only)
     bool post = false;           // a form's POST (web only)
     std::string content_type, body;
+    bool script = false;         // a script's request (web only): method, headers, body
+    std::string method;
+    std::vector<std::string> headers;   // "Name: value", checked by the compositor
 };
 const bool g_trace = std::getenv("FBX_FETCH_TRACE") != nullptr;   // per-request timing to the log
 std::mutex              g_jobs_mu;
@@ -203,8 +208,30 @@ struct Transfer {
     Sink        body;
     bool        cacheable = false;
     std::chrono::steady_clock::time_point started;
-    curl_slist* headers = nullptr;   // a POST's content type
+    curl_slist* headers = nullptr;   // a POST's content type, a script's headers
+    std::string response_headers;    // a script's request: the last response's, as "name: value\r\n"
 };
+
+// A response header line, for a script's request. A redirect's headers are dropped
+// when the next status line comes; Set-Cookie never reaches a script.
+size_t onHeader(char* p, size_t sz, size_t n, void* ud) {
+    auto* out = static_cast<std::string*>(ud);
+    std::string line(p, sz * n);
+    if (line.rfind("HTTP/", 0) == 0) {
+        out->clear();
+        return sz * n;
+    }
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos || colon == 0) return sz * n;
+    std::string name = line.substr(0, colon);
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (name == "set-cookie" || name == "set-cookie2") return sz * n;
+    std::string value = line.substr(colon + 1);
+    while (!value.empty() && value.front() == ' ') value.erase(value.begin());
+    if (out->size() < 256 * 1024) *out += name + ": " + value + "\r\n";
+    return sz * n;
+}
 
 // Cookies: curl's own engine, one jar shared by the transfers that may use it, kept in
 // a file only the user can read. Session cookies are written too, so a sign-in lasts
@@ -277,7 +304,22 @@ void networkLoop() {
                     curl_easy_setopt(c, CURLOPT_SHARE, g_cookies);
                     curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");   // the engine on, the jar shared
                 }
-                if (t->job.web && t->job.post) {
+                if (t->job.web && t->job.script) {
+                    // The method, the page's headers, a body if there's one.
+                    if (t->job.method == "HEAD") curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+                    else if (t->job.method != "GET") curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, t->job.method.c_str());
+                    if (!t->job.body.empty() || t->job.method == "POST" || t->job.method == "PUT" || t->job.method == "PATCH") {
+                        curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(t->job.body.size()));
+                        curl_easy_setopt(c, CURLOPT_COPYPOSTFIELDS, t->job.body.c_str());
+                        if (t->job.method != "POST") curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, t->job.method.c_str());
+                    }
+                    for (const std::string& h : t->job.headers) t->headers = curl_slist_append(t->headers, h.c_str());
+                    // curl's own defaults a page didn't ask for go (an empty value removes one).
+                    t->headers = curl_slist_append(t->headers, "Expect:");
+                    curl_easy_setopt(c, CURLOPT_HTTPHEADER, t->headers);
+                    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, onHeader);
+                    curl_easy_setopt(c, CURLOPT_HEADERDATA, &t->response_headers);
+                } else if (t->job.web && t->job.post) {
                     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(t->job.body.size()));
                     curl_easy_setopt(c, CURLOPT_COPYPOSTFIELDS, t->job.body.c_str());
                     t->headers = curl_slist_append(nullptr, ("Content-Type: " + t->job.content_type).c_str());
@@ -321,8 +363,9 @@ void networkLoop() {
                 char* content_type = nullptr;
                 curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &final_url);
                 curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &content_type);
-                t->body.data.insert(0, std::string(final_url ? final_url : t->job.url.c_str()) + "\n" +
-                                           (content_type ? content_type : "") + "\n");
+                std::string head = std::string(final_url ? final_url : t->job.url.c_str()) + "\n" + (content_type ? content_type : "") + "\n";
+                if (t->job.script) head += std::to_string(t->response_headers.size()) + "\n" + t->response_headers;
+                t->body.data.insert(0, head);
             }
             if (r.status_ == static_cast<int32_t>(shared::FetchStatus::Ok) && t->cacheable &&
                 t->body.data.size() <= kMaxCached)
@@ -395,7 +438,30 @@ int main() {
         std::string url(req.url_);
         Job job{m.transaction_id_, {}, (req.flags_ & shared::kFetchWeb) != 0, std::chrono::steady_clock::now()};
         job.cookies = job.web && (req.flags_ & shared::kFetchCookies);
-        if ((req.flags_ & shared::kFetchPost) && job.web) {
+        if ((req.flags_ & shared::kFetchScript) && job.web) {
+            // The compositor's own checked copy: "<method>\n<url>\n<headers>\n\n<body>".
+            struct stat st{};
+            const int fd = res->second.get();
+            if (fd < 0 || ::fstat(fd, &st) != 0 || st.st_size <= 0 || static_cast<size_t>(st.st_size) > xserver::fetch_policy::kWebMaxScriptRequest)
+                continue;
+            std::string request(static_cast<size_t>(st.st_size), '\0');
+            if (::pread(fd, request.data(), request.size(), 0) != st.st_size) continue;
+            const size_t m_end = request.find('\n');
+            const size_t u_end = m_end == std::string::npos ? std::string::npos : request.find('\n', m_end + 1);
+            if (u_end == std::string::npos) continue;
+            job.script = true;
+            job.method = request.substr(0, m_end);
+            url = request.substr(m_end + 1, u_end - m_end - 1);
+            size_t at = u_end + 1;
+            while (at < request.size()) {
+                const size_t eol = request.find('\n', at);
+                if (eol == std::string::npos) break;
+                if (eol == at) { at = eol + 1; break; }
+                job.headers.push_back(request.substr(at, eol - at));
+                at = eol + 1;
+            }
+            job.body = request.substr(std::min(at, request.size()));
+        } else if ((req.flags_ & shared::kFetchPost) && job.web) {
             // The compositor's own copy, already checked: "<url>\n<content type>\n<body>".
             struct stat st{};
             const int fd = res->second.get();
