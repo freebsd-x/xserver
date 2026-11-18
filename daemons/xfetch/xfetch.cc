@@ -151,6 +151,13 @@ void setWebOptions(CURL* c) {
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");   // whatever curl can decompress
     curl_easy_setopt(c, CURLOPT_OPENSOCKETFUNCTION, openPublicSocket);
     curl_easy_setopt(c, CURLOPT_USERAGENT, kWebUserAgent);
+    // A page's many pictures share one HTTP/2 connection, each waiting its turn: a stalled
+    // transfer gives up, not one still coming (velog's 30 large thumbnails ran past a
+    // 15 s total and failed with their status already 200).
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kTimeoutSec);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 256L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, kTimeoutSec);
 }
 
 // The body in a sealed-for-reading anonymous shm object.
