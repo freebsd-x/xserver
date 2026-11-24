@@ -15,9 +15,9 @@ constexpr const char* kKey     = "screen.timeout_secs";
 constexpr uint32_t    kMax     = 86400;   // 24h; also 0 = never
 
 uint32_t current() {
-    std::string v = ConfigService::get(kKey, "300");   // default 5 min
-    uint32_t n = 300;
-    try { n = static_cast<uint32_t>(std::stoul(v)); } catch (...) { n = 300; }
+    std::string v = ConfigService::get(kKey, "600");   // default 10 min
+    uint32_t n = 600;
+    try { n = static_cast<uint32_t>(std::stoul(v)); } catch (...) { n = 600; }
     return n > kMax ? kMax : n;
 }
 
@@ -41,6 +41,8 @@ void broadcast(uint32_t secs) {
     BroadcastXBusMessage(b);
 }
 }  // namespace
+
+uint32_t ScreenTimeoutService::seconds() noexcept { return current(); }
 
 void ScreenTimeoutService::handleMessage(const shared::XBusMessage& msg,
                                          std::shared_ptr<IpcSocket> client) noexcept {

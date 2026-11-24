@@ -169,7 +169,7 @@ xbus_service_srcs = files(
   '../src/login_service.cc',
   '../src/xsessiond_client.cc',
   '../src/xsessiond_device.cc',
-  '../src/screensaver_service.cc',
+  '../src/idle_service.cc',
   '../src/xwayland_service.cc',
   '../src/remote_desktop_service.cc',
   '../src/bookmark_service.cc',

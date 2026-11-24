@@ -19,7 +19,7 @@
 #include "xserver/headless_service.h"
 #include "xserver/login_service.h"
 #include "xserver/lock_service.h"
-#include "xserver/screensaver_service.h"
+#include "xserver/idle_service.h"
 #include "xserver/terminal_service.h"
 #include "xserver/pkg_signing_service.h"
 #include "xserver/xwayland_service.h"
@@ -189,7 +189,7 @@ static bool shellOnlyName(std::string_view service) noexcept {
         "MicMute", "MonoAudio", "MountedVolumes", "NetConns", "Netstat", "NightLight",
         "NightShift", "OptStorage", "Packages", "PkgUpdates", "Pointer", "Privacy",
         "Process", "Proxy", "ReduceMotion", "RefreshRate", "RotationLock", "SavedWifi",
-        "ScreenTimeout", "Screenshot", "ScrollDir", "Security", "Sessions", "Smart",
+        "Screenshot", "ScrollDir", "Security", "Sessions", "Smart",
         "SpatialAudio", "StageManager", "Stylus", "SysInfo", "SysLog", "SystemSounds",
         "TextSize", "Thermal", "Timezone", "Touchpad", "Tray", "TrueTone",
         "TrustedDevices", "UpdateChannel", "Usb", "UsbDevice", "UsbDevices", "VirtualKeyboard",
@@ -213,6 +213,12 @@ static bool appMayCall(const shared::XBusMessage& m, int fd) noexcept {
     auto from = [fd](std::initializer_list<const char*> bins) { return peer::isOneOf(fd, bins); };
     if (svc == "com.freebsdx.FileChooser")  // a Respond is the user's choice: an app
         return !is(FileChooserOpcode::Respond);   // saying it would get any file it names
+    if (svc == "com.freebsdx.ScreenLock")      // (turning auto-lock off is the user's to do)
+        return from({"settings"});
+    if (svc == "com.freebsdx.ScreenTimeout")
+        return from({"settings"});
+    if (svc == "com.freebsdx.Lock")
+        return !is(LockOpcode::SetTimeout) || from({"settings"});
     if (svc == "com.freebsdx.Power")
         return is(PowerOpcode::GetPowerState) || is(PowerOpcode::GetLidPolicy) ||
                is(PowerOpcode::GetSleepTimeout) || from({"settings"});
@@ -309,7 +315,6 @@ static const ShellOnlyService* shellOnlyService(const char* name) noexcept {
         {"com.freebsdx.Totp",            &TotpService::handleMessage},
         {"com.freebsdx.Reminder",        &ReminderService::handleMessage},
         {"com.freebsdx.TextReplacement", &TextReplacementService::handleMessage},
-        {"com.freebsdx.ScreenLock",      &ScreenLockService::handleMessage},
         {"com.freebsdx.NotifSchedule",   &NotifScheduleService::handleMessage},
         {"com.freebsdx.NotifSound",      &NotifSoundService::handleMessage},
         {"com.freebsdx.ScreenCapture",   &ScreenCaptureService::handleMessage},
@@ -720,16 +725,11 @@ XBusResult XBusDispatcher::ProcessMessage(std::shared_ptr<IpcSocket> client, con
             LockService::ProcessMessage(client, *msg);
         }
     }
-    else if (std::strcmp(msg->service_name_, "com.freebsdx.ScreenSaver") == 0) {
-        // GetState/GetConfig/Inhibit/Uninhibit/Register: open to all apps.
-        // SetConfig: denied to sandboxed apps (prevents rogue apps disabling saver).
-        const bool is_write =
-            msg->opcode_ == static_cast<uint32_t>(shared::ScreenSaverOpcode::SetConfig);
-        if (client->isSandboxed() && is_write && !peer::isOneOf(client->fd(), {"settings"})) {
-            std::cerr << "[XBusDispatcher] DENIED: sandboxed app attempted ScreenSaver SetConfig\n";
-        } else {
-            ScreenSaverService::ProcessMessage(client, *msg);
-        }
+    else if (std::strcmp(msg->service_name_, "com.freebsdx.ScreenLock") == 0) {
+        ScreenLockService::handleMessage(*msg, client);   // (the shell's and Settings': appMayCall)
+    }
+    else if (std::strcmp(msg->service_name_, "com.freebsdx.Idle") == 0) {
+        IdleService::handleMessage(*msg, client);
     }
     else if (std::strcmp(msg->service_name_, "com.freebsdx.Terminal") == 0) {
         // Sandboxed apps may only attach/detach and send input to sessions

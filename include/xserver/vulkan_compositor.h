@@ -97,6 +97,10 @@ public:
     // to the solid clear colour). fit_mode: 0=Cover, 1=Contain, 2=Stretch, 3=Center
     // (matches WallpaperSetRequest). Safe to call live (single-threaded loop).
     void setWallpaper(const std::string& path, uint32_t fit_mode = 0) noexcept;
+    // Locked: nothing but the lock screen is drawn (nothing at all while it isn't there).
+    void setLocked(bool locked) noexcept { locked_ = locked; }
+    // Dark: nothing is drawn.
+    void setBlank(bool blank) noexcept { blank_ = blank; }
 
     // Per-output: allocate render + scanout images for output_idx
     std::expected<void, VulkanError> createTarget(size_t output_idx, uint32_t width, uint32_t height,
@@ -227,6 +231,7 @@ private:
 
     VkCommandPool command_pool_{VK_NULL_HANDLE};
 
+    bool locked_ = false, blank_ = false;
     // Desktop wallpaper background texture (drawn below all windows).
     VkImage       wallpaper_image_{VK_NULL_HANDLE};
     std::string   wallpaper_path_;   // currently-loaded path (dedup live reloads)

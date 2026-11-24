@@ -11,9 +11,9 @@
 
 namespace fbx::xserver {
 
-// LockService — idle-lock / screensaver for FreeBSD-X
+// LockService — the lock screen. (When: IdleService, Super+L, sleep.)
 //
-// Tracks the idle timer, spawns lockscreen when the screen should lock,
+// Spawns lockscreen when the screen should lock,
 // enforces exclusive input routing while locked, and authenticates via PAM.
 class LockService {
 public:
@@ -35,19 +35,11 @@ public:
     // Returns the IpcSocket of the registered lock screen app, or nullptr.
     [[nodiscard]] static std::shared_ptr<IpcSocket> lockscreenClient() noexcept;
 
-    // Reset idle timer — call on every user input event.
-    static void resetIdleTimer() noexcept;
-
-    // Check idle timeout and lock if exceeded — call from event-loop timer (~10 s).
-    static void pollIdle() noexcept;
-
-    // A predicate consulted in pollIdle; while true, the idle-lock clock is held
-    // reset (wired to WakeLock keep-awake).
-    static void setWakeInhibitor(std::function<bool()> pred) noexcept;
+    // Once a second: starts the lock screen again if it died while locked.
+    static void tick() noexcept;
 
 private:
     static void broadcastState() noexcept;
-    static std::function<bool()> wake_inhibitor_;
     static bool pamAuthenticate(const char* user, const char* password) noexcept;
     static void spawn_lockscreen() noexcept;
 
@@ -56,7 +48,6 @@ private:
     static std::mutex            state_mutex_;
     static std::weak_ptr<IpcSocket> lockscreen_client_;
     static pid_t                 lockscreen_pid_;
-    static std::chrono::steady_clock::time_point last_input_;
 };
 
 } // namespace fbx::xserver

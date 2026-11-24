@@ -94,6 +94,7 @@ shared::ScreenLockPolicy screenLockPolicy() {
                               nullptr, 10));
     p.require_password_ = 1;
     p.lock_on_sleep_    = 1;   // PowerService locks before suspend/hibernate
+    p.background_       = ConfigService::get("lock.background") == "matrix" ? 2u : 1u;
     return p;
 }
 
@@ -284,6 +285,8 @@ void ScreenLockService::handleMessage(const shared::XBusMessage& msg,
         ConfigService::set("screenlock.enabled", on ? "1" : "0");
         ConfigService::set("screenlock.timeout", std::to_string(t));
         LockService::setTimeoutSeconds(on ? t : 0);
+        if (req.background_ == 1 || req.background_ == 2)
+            ConfigService::set("lock.background", req.background_ == 2 ? "matrix" : "wallpaper");
         if (req.require_password_ == 0 || req.lock_on_sleep_ == 0)
             LOG_INFO("ScreenLockService: the lock screen always asks for the password and always locks before sleep");
         ack(msg, client, kName);

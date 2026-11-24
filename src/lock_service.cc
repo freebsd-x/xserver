@@ -1,6 +1,8 @@
 #include "xserver/lock_service.h"
 #include "xserver/spawn_util.h"
 #include "xserver/auth_helper.h"
+#include "xserver/config_service.h"
+#include "xserver/peer_identity.h"
 #include "xserver/auth_throttle.h"
 #include "xserver/security_events_service.h"
 #include <chrono>
@@ -8,6 +10,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
+#include <errno.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -19,20 +23,19 @@ namespace fbx::xserver {
 // ── Static state ──────────────────────────────────────────────────────────────
 
 std::atomic<bool>     LockService::locked_{false};
-std::function<bool()>  LockService::wake_inhibitor_;
 std::atomic<uint32_t> LockService::timeout_seconds_{10 * 60}; // 10 min default
 std::mutex            LockService::state_mutex_;
 std::weak_ptr<IpcSocket> LockService::lockscreen_client_;
 pid_t                 LockService::lockscreen_pid_{-1};
-std::chrono::steady_clock::time_point LockService::last_input_ =
-    std::chrono::steady_clock::now();
+
+// Whose session this is: the account the compositor (and all its apps) run as. Only
+// that account's password opens its screen, whatever name the lock screen sends.
+static std::string sessionUser() {
+    const passwd* pw = ::getpwuid(::geteuid());
+    return pw && pw->pw_name ? pw->pw_name : "";
+}
 
 bool LockService::pamAuthenticate(const char* user, const char* password) noexcept {
-    // Determine current user if caller passed empty string
-    if (!user || user[0] == '\0') {
-        user = ::getenv("USER");
-        if (!user) user = "root";
-    }
     // Shared full chain (xsessiond → in-process PAM w/ pam_acct_mgmt) — identical policy to the login greeter. See auth_helper.h.
     return pamAuthenticateFull("freebsdx", user, password);
 }
@@ -86,28 +89,24 @@ void LockService::unlock() noexcept {
         lockscreen_client_.reset();
     }
     broadcastState();
-    resetIdleTimer();
 }
 
-void LockService::resetIdleTimer() noexcept {
-    last_input_ = std::chrono::steady_clock::now();
-}
-
-void LockService::setWakeInhibitor(std::function<bool()> pred) noexcept {
-    wake_inhibitor_ = std::move(pred);
-}
-
-void LockService::pollIdle() noexcept {
-    uint32_t timeout = timeout_seconds_.load();
-    if (timeout == 0 || locked_.load()) return;
-    // A keep-awake (WakeLock) holds the idle-lock clock reset.
-    if (wake_inhibitor_ && wake_inhibitor_()) { resetIdleTimer(); return; }
-
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - last_input_).count();
-    if (static_cast<uint32_t>(elapsed) >= timeout) {
-        lock();
+// The lock screen is what stands between the session and whoever's at the keyboard: if
+// it's gone while the screen is locked, another is started (the compositor shows
+// nothing and delivers nothing meanwhile).
+void LockService::tick() noexcept {
+    if (!locked_.load()) return;
+    if (lockscreen_pid_ > 0) {
+        const pid_t r = ::waitpid(lockscreen_pid_, nullptr, WNOHANG);
+        if (r == 0) return;                                      // running
+        if (r < 0 && ::kill(lockscreen_pid_, 0) == 0) return;    // (someone else's to reap)
     }
+    std::cerr << "[LockService] The lock screen is gone; starting another\n";
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        lockscreen_client_.reset();
+    }
+    spawn_lockscreen();
 }
 
 // ── Broadcast ─────────────────────────────────────────────────────────────────
@@ -145,10 +144,23 @@ bool LockService::ProcessMessage(std::shared_ptr<IpcSocket> client,
     }
 
     case LockOpcode::Unlock: {
+        // Only the lock screen asks: anything else would be guessing passwords.
+        if (!client || client != lockscreenClient()) {
+            std::cerr << "[LockService] DENIED: Unlock from something that isn't the lock screen\n";
+            LockState no{};
+            no.locked_ = locked_.load() ? 1u : 0u;
+            no.timeout_secs_ = timeout_seconds_.load();
+            std::memset(response.payload_, 0, sizeof(response.payload_));
+            std::memcpy(response.payload_, &no, sizeof(no));
+            if (client) (void)client->sendMessage({reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
+            break;
+        }
         LockAuthRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
-        req.username_[sizeof(req.username_) - 1] = '\0';
         req.password_[sizeof(req.password_) - 1] = '\0';
+        const std::string user = sessionUser();
+        std::memset(req.username_, 0, sizeof(req.username_));
+        std::strncpy(req.username_, user.c_str(), sizeof(req.username_) - 1);
 
         // Same brute-force throttle as the login greeter (shared instance), so a
         // lockout can't be sidestepped by attacking the lock screen instead.
@@ -157,7 +169,7 @@ bool LockService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         auto gate = throttle.check(req.username_, now);
         bool ok = false;
         if (gate.allowed) {
-            ok = pamAuthenticate(req.username_, req.password_);
+            ok = !user.empty() && pamAuthenticate(req.username_, req.password_);
             if (ok) throttle.recordSuccess(req.username_);
             else    throttle.recordFailure(req.username_, now);
             SecurityEventsService::record(ok ? "unlock" : "fail", req.username_, "local", ok);
@@ -201,6 +213,9 @@ bool LockService::ProcessMessage(std::shared_ptr<IpcSocket> client,
         LockTimeoutRequest req{};
         std::memcpy(&req, msg.payload_, sizeof(req));
         timeout_seconds_.store(req.seconds_);
+        // Kept, as ScreenLock's policy is.
+        ConfigService::set("screenlock.enabled", req.seconds_ ? "1" : "0");
+        if (req.seconds_) ConfigService::set("screenlock.timeout", std::to_string(req.seconds_));
         std::cout << "[LockService] Idle timeout set to " << req.seconds_ << " s\n";
         (void)client->sendMessage(
             {reinterpret_cast<const uint8_t*>(&response), sizeof(response)});
@@ -218,8 +233,12 @@ bool LockService::ProcessMessage(std::shared_ptr<IpcSocket> client,
     }
 
     case LockOpcode::Register: {
-        // lockscreen identifies itself so the compositor can route
-        // exclusive input to it while locked.
+        // The lock screen says it's there: it gets all input while the screen is locked,
+        // so nothing else may (it would be handed the password).
+        if (!client || !peer::isOneOf(client->fd(), {"lockscreen"})) {
+            std::cerr << "[LockService] DENIED: Register from something that isn't the lock screen\n";
+            break;
+        }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             lockscreen_client_ = client;

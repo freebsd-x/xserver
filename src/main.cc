@@ -42,7 +42,7 @@
 #include "xserver/opt_storage_service.h"
 #include "xserver/notif_services.h"
 #include "xserver/lock_service.h"
-#include "xserver/screensaver_service.h"
+#include "xserver/idle_service.h"
 #include "xserver/terminal_service.h"
 #include "xserver/login_service.h"
 #include "xserver/session_service.h"
@@ -571,10 +571,6 @@ int main(int argc, char** argv) {
     if (input) input->setOnDevicesChanged([] { InputDeviceService::notifyDevicesChanged(); });
     // Mic mute gates the input at the OSS mixer.
     MicMuteService::init([](bool muted) { MicMuteService::applyToMixer(muted); });
-    // WakeLock inhibits the idle screensaver + idle-lock while a keep-awake holds.
-    // Presentation mode holds them off too.
-    ScreenSaverService::setWakeInhibitor([]() { return WakeLockService::isActive() || PresentationService::isActive(); });
-    LockService::setWakeInhibitor([]() { return WakeLockService::isActive() || PresentationService::isActive(); });
     NotifScheduleService::setExtraHold([] { return PresentationService::isActive(); });
     // Logout: tear down the desktop process group (xshell + its apps) but keep
     // the compositor + seat alive, end the login session, and return to the
@@ -668,6 +664,7 @@ int main(int argc, char** argv) {
     // Display colour profile (sRGB content → the display's gamut): applied
     // last of all, after the filter and the warm tint.
     static std::array<double, 9> g_profile_mat     = {1,0,0, 0,1,0, 0,0,1};
+    static std::array<double, 9> g_dim_mat         = {1,0,0, 0,1,0, 0,0,1};
     auto apply_color_pipeline = [drm_ptr]() {
         if (!drm_ptr) return;
         auto mul = [](const std::array<double, 9>& a, const std::array<double, 9>& b) {
@@ -678,8 +675,28 @@ int main(int argc, char** argv) {
             return p;
         };
         // profile × night-light × filter: the filter acts first, the profile last.
-        (void)drm_ptr->setColorMatrix(0, mul(g_profile_mat, mul(g_nightlight_mat, g_colorfilter_mat)));
+        (void)drm_ptr->setColorMatrix(0, mul(mul(g_profile_mat, mul(g_nightlight_mat, g_colorfilter_mat)), g_dim_mat));
     };
+    // Nobody at it: dimmed by the same matrix, then nothing drawn at all.
+    IdleService::init({
+        .set_phase = [comp, drm_ptr, apply_color_pipeline](idle::Phase p) {
+            const double k = p == idle::Phase::Dim ? 0.35 : 1.0;
+            if (g_dim_mat[0] != k) {
+                g_dim_mat = {k,0,0, 0,k,0, 0,0,k};
+                apply_color_pipeline();
+            }
+            comp->setBlank(p == idle::Phase::Off);
+            static bool dark = false;
+            if (drm_ptr && dark != (p == idle::Phase::Off)) {
+                if (p == idle::Phase::Off) drm_ptr->hideCursorAll();
+                else drm_ptr->showCursorAll();
+            }
+            dark = p == idle::Phase::Off;
+            g_scene_dirty = true;
+        },
+        .held = [] { return WakeLockService::isActive() || PresentationService::isActive(); },
+        .at_greeter = [] { return LoginService::isGreeterActive(); },
+    });
     ColorFilterService::init([apply_color_pipeline](const std::array<double, 9>& m) {
         g_colorfilter_mat = m;
         apply_color_pipeline();
@@ -1018,6 +1035,7 @@ int main(int argc, char** argv) {
                     }
                     // Detach this client from any terminal sessions it held.
                     TerminalService::OnClientDisconnect(c_sock);
+                    IdleService::onClientDisconnect(c_sock);
                     return;
                 }
                 // `slot` is RAII — released back to the pool at end of scope.
@@ -1407,10 +1425,8 @@ int main(int argc, char** argv) {
         PowerService::pollAndBroadcast();
     });
 
-    // Check idle-lock and idle-screensaver timeouts every 10 seconds (timer id=4).
+    // App limits and old caches, every 10 seconds (timer id=4).
     (void)loop->addTimer(4, 10000, []() {
-        ScreenSaverService::pollIdle();
-        LockService::pollIdle();
         OptStorageService::poll();   // ≤ hourly: old-cache measurement / cleanup
         // App time limits: credit 10 s to the app in the foreground (not the
         // shell or lock screen, and not while locked).
@@ -1423,6 +1439,8 @@ int main(int argc, char** argv) {
 
     // Poll calendar reminders and delayed screenshots every second (timer id=5).
     (void)loop->addTimer(5, 1000, []() {
+        IdleService::tick();
+        LockService::tick();
         CalendarService::pollReminders();
         ScreenCaptureService::poll();   // delayed screenshots
     });
@@ -1502,13 +1520,26 @@ int main(int argc, char** argv) {
             }
         }
         static int idle_skip = 0;
-        bool must_render = g_scene_dirty || animating || (++idle_skip >= 30);
+        // Locked or unlocked since the last frame: drawn now, not at the next safety redraw
+        // (the desktop stayed up for half a second).
+        static bool drawn_locked = false;
+        if (LockService::isLocked() != drawn_locked) {
+            drawn_locked = !drawn_locked;
+            g_scene_dirty = true;
+        }
+        // (Dark: drawn once, when it goes dark.)
+        const bool dark = IdleService::phase() == idle::Phase::Off;
+        static bool dark_drawn = false;
+        if (!dark) dark_drawn = false;
+        bool must_render = dark ? !dark_drawn : g_scene_dirty || animating || (++idle_skip >= 30);
+        if (must_render && dark) dark_drawn = true;
         // Wrapped (not early-return) so the input drains further below always run.
         if (must_render) {
         idle_skip = 0;
         g_scene_dirty = false;
 
         comp->setFocusedSurface(focused_surface);
+        comp->setLocked(LockService::isLocked());
         for (size_t i = 0; i < num_outputs; ++i) {
             (void)comp->composite(i, window_stack, cursor_x, cursor_y, dx, dy, dw, dh);
         }
@@ -1586,7 +1617,10 @@ int main(int argc, char** argv) {
             auto vk_keys = VirtualKeyboardService::drainInjectedKeys();
             if (!vk_keys.empty()) g_scene_dirty = true;
             for (const auto& imsg : vk_keys) {
-                if (g_surface_clients.contains(focused_surface)) {
+                if (LockService::isLocked()) {
+                    if (auto ls = LockService::lockscreenClient())
+                        (void)ls->sendMessage({reinterpret_cast<const uint8_t*>(&imsg), sizeof(imsg)});
+                } else if (g_surface_clients.contains(focused_surface)) {
                     (void)g_surface_clients[focused_surface]->sendMessage(
                         {reinterpret_cast<const uint8_t*>(&imsg), sizeof(imsg)});
                 }
@@ -1597,9 +1631,8 @@ int main(int argc, char** argv) {
     // One input event from libinput or injected (VNC, the headless harness):
     // shortcuts, focus, pointer routing, delivery to the right surface.
     handle_input = [&](shared::InputMessage& msg) {
-        // --- Reset idle timers on any user input ---
-        LockService::resetIdleTimer();
-        ScreenSaverService::resetIdleTimer();
+        // --- Any input: not idle ---
+        if (IdleService::noteInput()) return;   // it woke a dark screen, no more
 
         // Always track the hardware cursor on pointer motion, even
         // when input is redirected to the greeter or lock screen —
@@ -1639,20 +1672,26 @@ int main(int argc, char** argv) {
 
         // --- While locked, redirect all input to the lock screen ---
         if (LockService::isLocked()) {
-            auto ls_client = LockService::lockscreenClient();
-            if (ls_client) {
-                // Allow media keys through even while locked
-                bool is_media_key =
-                    msg.type_ == InputEventType::AudioVolumeUp   ||
-                    msg.type_ == InputEventType::AudioVolumeDown ||
-                    msg.type_ == InputEventType::AudioMute       ||
-                    msg.type_ == InputEventType::BrightnessUp    ||
-                    msg.type_ == InputEventType::BrightnessDown;
-                if (!is_media_key) {
-                    (void)ls_client->sendMessage(
-                        {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
-                    return;   // next event
+            // Allow media keys through even while locked
+            bool is_media_key =
+                msg.type_ == InputEventType::AudioVolumeUp   ||
+                msg.type_ == InputEventType::AudioVolumeDown ||
+                msg.type_ == InputEventType::AudioMute       ||
+                msg.type_ == InputEventType::BrightnessUp    ||
+                msg.type_ == InputEventType::BrightnessDown;
+            if (!is_media_key) {
+                // With no lock screen (starting, or it died) nobody gets it: it went to
+                // the desktop, locked or not.
+                if (auto ls_client = LockService::lockscreenClient()) {
+                    // Absolute, as for the greeter: its client takes it for that.
+                    shared::InputMessage lm = msg;
+                    if (lm.type_ == InputEventType::MouseMove) {
+                        lm.value_a_ = static_cast<int32_t>(cursor_x);
+                        lm.value_b_ = static_cast<int32_t>(cursor_y);
+                    }
+                    (void)ls_client->sendMessage({reinterpret_cast<const uint8_t*>(&lm), sizeof(lm)});
                 }
+                return;   // next event
             }
         }
 

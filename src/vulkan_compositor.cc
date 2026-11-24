@@ -794,6 +794,7 @@ std::expected<void, VulkanError> VulkanCompositor::composite(
     // app windows, so this clear colour is the wallpaper shown behind every app.
     VkClearValue cv;
     cv.color.float32[0] = 0.04f; cv.color.float32[1] = 0.10f; cv.color.float32[2] = 0.18f; cv.color.float32[3] = 1.0f;
+    if (locked_ || blank_) cv.color.float32[0] = cv.color.float32[1] = cv.color.float32[2] = 0.0f;
     VkRenderPassBeginInfo rpb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,0,render_pass_,ot.target_framebuffer[buf_idx],{{0,0},{ot.width,ot.height}},1,&cv};
     vkCmdBeginRenderPass(cmd, &rpb, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -813,7 +814,7 @@ std::expected<void, VulkanError> VulkanCompositor::composite(
     // Desktop wallpaper: background texture drawn below every window. The quad is
     // sized per fit_mode (overflow is clipped by the scissor; letterboxed areas keep
     // the clear colour). When unset, the render-pass clear colour is the background.
-    if (wallpaper_image_ != VK_NULL_HANDLE && graphics_pipeline_ != VK_NULL_HANDLE) {
+    if (!locked_ && !blank_ && wallpaper_image_ != VK_NULL_HANDLE && graphics_pipeline_ != VK_NULL_HANDLE) {
         auto wit = descriptor_sets_.find(wallpaper_image_);
         if (wit != descriptor_sets_.end()) {
             // Default (Stretch): fill the whole screen, ignoring aspect.
@@ -858,6 +859,7 @@ std::expected<void, VulkanError> VulkanCompositor::composite(
     auto windows = ws.getWindowsForOutput(output_idx);
     for (const auto& w : windows) {
         if (w.surface_image_ == VK_NULL_HANDLE) continue;
+        if (blank_ || (locked_ && w.surface_id_ != shared::kLockSurfaceId)) continue;
         auto it = descriptor_sets_.find(w.surface_image_);
         if (it != descriptor_sets_.end() && graphics_pipeline_ != VK_NULL_HANDLE) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_);
@@ -888,7 +890,7 @@ std::expected<void, VulkanError> VulkanCompositor::composite(
     }
 
     // ── iOS-style GPU cursor blob (touchpad/tablet mode only) ──────────────────
-    if (gpu_cursor_enabled_ && cursor_pipeline_ != VK_NULL_HANDLE) {
+    if (!blank_ && gpu_cursor_enabled_ && cursor_pipeline_ != VK_NULL_HANDLE) {
         // Step spring physics: compute dt from last frame
         auto now = std::chrono::steady_clock::now();
         float dt = std::chrono::duration<float>(now - cursor_last_frame_).count();
@@ -925,7 +927,7 @@ std::expected<void, VulkanError> VulkanCompositor::composite(
     }
 
     // Debug overlay: GPU timing HUD drawn on top of all windows (output 0 only).
-    if (debug_overlay_visible_ && output_idx == 0)
+    if (debug_overlay_visible_ && output_idx == 0 && !blank_ && !locked_)
         renderDebugOverlay(cmd, output_idx);
 
     vkCmdEndRenderPass(cmd);
