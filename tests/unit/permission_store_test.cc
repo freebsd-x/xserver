@@ -13,8 +13,11 @@ using Cap = PermissionStore::Capability;
 
 namespace {
 std::string tmpPath() {
-    return (fs::temp_directory_path() /
-            ("fbx_perms_" + std::to_string(::getpid()) + ".txt")).string();
+    // Afresh for each: what a past run of the same pid left was read as decisions made.
+    const fs::path p = fs::temp_directory_path() / ("fbx_perms_" + std::to_string(::getpid()) + ".txt");
+    std::error_code ec;
+    fs::remove(p, ec);
+    return p.string();
 }
 }  // namespace
 
