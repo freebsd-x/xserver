@@ -2,6 +2,7 @@
 #include "shared/protocol.h"
 #include "xserver/unique_fd.h"
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -15,6 +16,12 @@ public:
     // Headless sessions only: let FBX_TEST_CONNECT_PORTS add ports for direct
     // connections, so tests can talk to a server of their own.
     static void allowTestPorts() noexcept;
+
+    // A browser process handing its browsing to a new one (FetchOpcode::Handoff):
+    // `launcher` sends the shell the message that starts it (false: no shell), and
+    // `placer` puts the new one's window where the old one's was. Called on the loop.
+    static void onHandoff(std::function<bool(const shared::XBusMessage&)> launcher,
+                          std::function<void(const IpcSocket* from, const IpcSocket* to)> placer) noexcept;
 
     // Every com.freebsdx.Fetch message, from apps and from xfetch itself.
     static void ProcessMessage(std::shared_ptr<IpcSocket> client,

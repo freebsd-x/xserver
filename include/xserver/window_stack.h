@@ -914,6 +914,32 @@ public:
         }
     }
 
+    // A window carrying on from another (the Browser going on to another site in a new
+    // process): it takes that one's place, size and state, and shows at once, not
+    // fading in over it. The size it now has, for the client to be told; nothing if
+    // either isn't a window here.
+    std::optional<xkit::Size> takePlaceOf(uint32_t surface_id, uint32_t old_id) noexcept {
+        const Window* old = nullptr;
+        for (auto& ws : workspaces_)
+            for (auto& w : ws.windows_)
+                if (w.surface_id_ == old_id && !w.is_subsurface_ && !w.is_shell_) old = &w;
+        if (!old) return std::nullopt;
+        const Window from = *old;
+        for (auto& ws : workspaces_)
+            for (auto& w : ws.windows_) {
+                if (w.surface_id_ != surface_id || w.is_subsurface_ || w.is_shell_) continue;
+                w.position_ = w.target_position_ = from.target_position_;
+                w.size_ = w.target_size_ = from.target_size_;
+                w.restore_rect_.position_ = from.restore_rect_.position_;
+                w.restore_rect_.size_ = from.restore_rect_.size_;
+                w.is_maximized_ = from.is_maximized_;
+                w.output_idx_ = from.output_idx_;
+                w.opacity_ = w.target_opacity_ = 1.0f;
+                return w.target_size_;
+            }
+        return std::nullopt;
+    }
+
     // Apply committed xdg_surface.set_window_geometry. Called from xserver on FrameReady
     // when geom_w > 0. Propagates to all workspaces so the render offset is consistent.
     void setWindowGeometry(uint32_t surface_id, int32_t x, int32_t y, int32_t w, int32_t h) noexcept {

@@ -114,6 +114,8 @@ using namespace fbx::xserver;
 using namespace fbx::xwayland;
 using namespace fbx;
 
+namespace fbx::xserver { bool SendToShell(const shared::XBusMessage&); }   // xbus_dispatcher.cc
+
 static WindowStack window_stack;
 static std::shared_ptr<IpcSocket> active_client = nullptr;
 static std::shared_ptr<EventLoop> g_loop = nullptr;
@@ -424,6 +426,32 @@ int main(int argc, char** argv) {
 
     XBusDispatcher::OnRaise([](uint32_t sid) {
         focused_surface = sid;
+    });
+
+    // The Browser going on to another site in a new process: its window where the old
+    // one was, the same size (told, so it lays out for it), and the one in front.
+    FetchBroker::onHandoff([](const shared::XBusMessage& m) { return SendToShell(m); },
+                           [](const IpcSocket* from, const IpcSocket* to) {
+        uint32_t old_id = 0, new_id = 0;
+        for (const auto& [id, sock] : g_surface_clients) {
+            if (g_subsurface_ids.contains(id) || g_layer_surface_ids.contains(id)) continue;
+            if (sock.get() == from && !old_id) old_id = id;
+            if (sock.get() == to && !new_id) new_id = id;
+        }
+        if (!old_id || !new_id) return;
+        const auto size = window_stack.takePlaceOf(new_id, old_id);
+        if (!size) return;
+        std::cout << "[xserver] Browsing handed from window " << old_id << " to " << new_id << " (" << size->width_ << "x" << size->height_ << ")\n";
+        focused_surface = new_id;
+        window_stack.raiseToFocus(new_id);
+        RenderMessage cfg{
+            .surface_id_ = new_id,
+            .status_     = RenderMessageStatus::ConfigureRequest,
+            .width_      = static_cast<uint32_t>(size->width_),
+            .height_     = static_cast<uint32_t>(size->height_)
+        };
+        (void)g_surface_clients[new_id]->sendMessage({reinterpret_cast<const uint8_t*>(&cfg), sizeof(cfg)});
+        g_scene_dirty = true;
     });
 
     // In headless mode the virtual dimensions come from --headless-size (default 1920x1080).

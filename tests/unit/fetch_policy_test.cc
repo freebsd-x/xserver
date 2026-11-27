@@ -152,3 +152,29 @@ TEST(WebPolicy, ScriptRequestsCarryOnlyWhatAPageMaySet) {
     EXPECT_TRUE(formContentTypeAllowed("application/json; charset=utf-8"));
     EXPECT_FALSE(formContentTypeAllowed("not a type"));
 }
+
+// The site cookies are kept for: our engine's rule (sdk/xweb url_test's cases), which
+// decides what asks for cookies. A difference would take a page's own cookies away.
+TEST(WebPolicy, SitesAreOurEnginesSites) {
+    using fbx::xserver::fetch_policy::registrableDomain;
+    using fbx::xserver::fetch_policy::webSite;
+    EXPECT_EQ(webSite("https://www.example.com/a"), webSite("https://img.example.com/b.png"));
+    EXPECT_EQ(webSite("http://example.com/"), webSite("https://cdn.example.com:8443/x"));
+    EXPECT_NE(webSite("https://example.com/"), webSite("https://example.org/"));
+    EXPECT_EQ(webSite("https://www.naver.co.kr/"), "naver.co.kr");
+    EXPECT_EQ(webSite("https://news.naver.co.kr/?q"), "naver.co.kr");
+    EXPECT_NE(webSite("https://a.co.kr/"), webSite("https://b.co.kr/"));
+    EXPECT_EQ(webSite("https://alice.github.io/x"), "alice.github.io");
+    EXPECT_NE(webSite("https://alice.github.io/"), webSite("https://bob.github.io/"));
+    EXPECT_EQ(webSite("http://127.0.0.1:8000/"), webSite("http://127.0.0.1:9000/x"));
+    EXPECT_NE(webSite("http://127.0.0.1/"), webSite("http://localhost/"));
+    EXPECT_EQ(webSite("file:///a.html"), "");
+    EXPECT_EQ(webSite("data:text/plain,x"), "");
+    EXPECT_EQ(webSite("HTTPS://Mail.Google.COM/mail#inbox"), "google.com");
+    EXPECT_EQ(registrableDomain("WWW.Example.COM."), "example.com");
+    EXPECT_EQ(registrableDomain("bbc.co.uk"), "bbc.co.uk");
+    EXPECT_EQ(registrableDomain("www.bbc.co.uk"), "bbc.co.uk");
+    EXPECT_EQ(registrableDomain("a.b.c.d.example.com"), "example.com");
+    EXPECT_EQ(registrableDomain("localhost"), "localhost");
+    EXPECT_EQ(registrableDomain(".a.b"), "a.b");
+}

@@ -67,6 +67,12 @@ struct Job {
     bool script = false;         // a script's request (web only): method, headers, body
     std::string method;
     std::vector<std::string> headers;   // "Name: value", checked by the compositor
+    // A request with cookies is the site's whose process asked (the compositor saw to
+    // that): its redirects are followed here, one at a time, and a step to any other
+    // site goes without them. curl's own following would send that site's cookies too,
+    // and the page asking would read what it answered.
+    std::string cookie_site;
+    int hops = 0;
 };
 const bool g_trace = std::getenv("FBX_FETCH_TRACE") != nullptr;   // per-request timing to the log
 std::mutex              g_jobs_mu;
@@ -271,6 +277,29 @@ void writeCookies(bool now = false) {
     g_cookies_written = t;
 }
 
+constexpr int kMaxRedirects = 8;
+
+// What a redirect makes of a request, as browsers do it: a 303, and a 301 or 302 after
+// a POST, become a GET without the body (or what said what the body was).
+void redirected(Job& job, long code) {
+    const bool to_get = code == 303 || ((code == 301 || code == 302) && (job.post || job.method == "POST"));
+    if (!to_get) return;
+    if (job.post) {
+        job.post = false;
+        job.content_type.clear();
+        job.body.clear();
+    }
+    if (job.script && job.method != "HEAD" && job.method != "GET") {
+        job.method = "GET";
+        job.body.clear();
+        std::erase_if(job.headers, [](const std::string& h) {
+            std::string name = h.substr(0, h.find(':'));
+            for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            return name == "content-type" || name == "content-length" || name == "content-encoding" || name == "content-language";
+        });
+    }
+}
+
 // The network thread: takes queued requests, answers policy refusals and cache
 // hits at once, and runs everything else concurrently in one multi handle.
 void networkLoop() {
@@ -307,6 +336,7 @@ void networkLoop() {
                 auto* t = new Transfer{std::move(job), {{}, limit}, cacheable, now};
                 setOptions(c, t->job.url, &t->body);
                 if (t->job.web) setWebOptions(c);
+                if (!t->job.cookie_site.empty()) curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
                 if (t->job.web && t->job.cookies && g_cookies) {
                     curl_easy_setopt(c, CURLOPT_SHARE, g_cookies);
                     curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");   // the engine on, the jar shared
@@ -353,6 +383,30 @@ void networkLoop() {
             const CURLcode rc = msg->data.result;
             shared::FetchReply r{};
             r.http_status_ = static_cast<uint32_t>(code);
+            if (rc == CURLE_OK && !t->job.cookie_site.empty() && (code == 301 || code == 302 || code == 303 || code == 307 || code == 308)) {
+                char* location = nullptr;
+                curl_easy_getinfo(c, CURLINFO_REDIRECT_URL, &location);
+                if (location && xserver::fetch_policy::webUrlAllowed(location)) {
+                    if (t->job.cookies) g_cookies_dirty = true;   // a step's Set-Cookie
+                    if (t->job.hops >= kMaxRedirects) {
+                        r.status_ = static_cast<int32_t>(shared::FetchStatus::NetworkError);
+                        finish(t->job, r, {}, t->started);
+                    } else {
+                        Job next = std::move(t->job);
+                        next.url = location;
+                        ++next.hops;
+                        next.cookies = xserver::fetch_policy::webSite(next.url) == next.cookie_site;
+                        redirected(next, code);
+                        std::lock_guard<std::mutex> lk(g_jobs_mu);
+                        g_jobs.push_front(std::move(next));
+                    }
+                    curl_multi_remove_handle(multi, c);
+                    curl_easy_cleanup(c);
+                    if (t->headers) curl_slist_free_all(t->headers);
+                    delete t;
+                    continue;
+                }
+            }
             if (rc == CURLE_WRITE_ERROR || rc == CURLE_FILESIZE_EXCEEDED)
                 r.status_ = static_cast<int32_t>(shared::FetchStatus::TooLarge);
             else if (rc != CURLE_OK)
@@ -496,6 +550,7 @@ int main() {
         {
             std::lock_guard<std::mutex> lk(g_jobs_mu);
             job.url = std::move(url);
+            if (job.cookies) job.cookie_site = xserver::fetch_policy::webSite(job.url);
             g_jobs.push_back(std::move(job));
         }
         if (CURLM* multi = g_multi.load()) curl_multi_wakeup(multi);

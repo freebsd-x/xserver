@@ -14,6 +14,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <chrono>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <thread>
@@ -48,6 +50,26 @@ std::weak_ptr<IpcSocket>              g_provider;
 std::unordered_map<uint32_t, Pending> g_pending;   // keyed by the id we gave xfetch
 uint32_t                              g_next_id = 1;
 std::thread::id                       g_loop_thread;   // where replies are handled (set on registration)
+
+// Each browser process is one site's: the first it asks cookies for. A page's scripts
+// run in that process, so if one of them got hold of it, asking for another site's
+// address with cookies must not bring back what that site shows its user. Cookies for
+// any other site are left off; a link to another site opens in a new process.
+// (A sandboxed process can't open a second connection: this one is all it has.)
+struct WebClient {
+    std::weak_ptr<IpcSocket> socket;   // the key's own: a reused address is someone else
+    std::string              site;
+    bool                     handed_off = false;   // once: then it's on its way out
+};
+std::unordered_map<const IpcSocket*, WebClient> g_web_clients;
+
+WebClient& webClientLocked(const std::shared_ptr<IpcSocket>& c) {
+    if (g_web_clients.size() >= 256)
+        std::erase_if(g_web_clients, [](const auto& e) { return e.second.socket.expired(); });
+    WebClient& w = g_web_clients[c.get()];
+    if (w.socket.lock() != c) w = WebClient{c, {}};
+    return w;
+}
 
 void replyTo(const std::shared_ptr<IpcSocket>& c, uint32_t txn, const shared::FetchReply& r, int fd = -1) {
     shared::XBusMessage m{};
@@ -181,6 +203,42 @@ void handleConnect(const std::shared_ptr<IpcSocket>& client, const shared::XBusM
     }).detach();
 }
 
+// ── Handing browsing on to a new process ────────────────────────────────────
+// A link to another site: the browser asks for a new process to go there, and we have
+// the shell start one with a token only it is told (the shell launches; no app hears).
+struct Handoff {
+    std::string              state;   // the browser's own: where to go, its history
+    std::weak_ptr<IpcSocket> from;
+    uint32_t                 txn;     // answered once a new process has it
+    std::chrono::steady_clock::time_point made;
+};
+std::unordered_map<std::string, Handoff> g_handoffs;
+constexpr size_t kMaxHandoffs = 8;
+constexpr auto kHandoffLife = std::chrono::seconds(30);
+constexpr size_t kMaxHandoffState = 256 * 1024;
+std::function<bool(const shared::XBusMessage&)> g_launcher;   // to the shell
+std::function<void(const IpcSocket*, const IpcSocket*)> g_placer;
+
+void expireHandoffsLocked() {
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(g_handoffs, [now](const auto& e) {
+        if (now - e.second.made < kHandoffLife) return false;
+        if (auto c = e.second.from.lock()) fail(c, e.second.txn, shared::FetchStatus::Unavailable);
+        return true;
+    });
+}
+
+std::string newToken() {
+    uint8_t bytes[16];
+    arc4random_buf(bytes, sizeof(bytes));
+    std::string out;
+    for (uint8_t b : bytes) {
+        out += "0123456789abcdef"[b >> 4];
+        out += "0123456789abcdef"[b & 15];
+    }
+    return out;
+}
+
 uint32_t nextIdLocked() {
     uint32_t id = g_next_id++;
     return id ? id : g_next_id++;
@@ -189,6 +247,13 @@ uint32_t nextIdLocked() {
 }  // namespace
 
 void FetchBroker::allowTestPorts() noexcept { g_test_ports_allowed = true; }
+
+void FetchBroker::onHandoff(std::function<bool(const shared::XBusMessage&)> launcher,
+                            std::function<void(const IpcSocket* from, const IpcSocket* to)> placer) noexcept {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_launcher = std::move(launcher);
+    g_placer = std::move(placer);
+}
 
 namespace {
 
@@ -254,6 +319,67 @@ void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
         auto c = p.client.lock();
         if (!c) return;
         replyTo(c, p.txn, r, fd ? fd.get() : -1);
+        return;
+    }
+
+    case O::Handoff: {
+        if (!peer::isOneOf(client->fd(), {"xwebview", "browser"})) {
+            fail(client, msg.transaction_id_, shared::FetchStatus::Denied);
+            return;
+        }
+        expireHandoffsLocked();
+        WebClient& w = webClientLocked(client);
+        std::string state;
+        if (w.handed_off || g_handoffs.size() >= kMaxHandoffs || !readLongUrl(fd.get(), state, kMaxHandoffState)) {
+            fail(client, msg.transaction_id_, w.handed_off ? shared::FetchStatus::Denied : shared::FetchStatus::Unavailable);
+            return;
+        }
+        const std::string token = newToken();
+        shared::XBusMessage launch{};
+        launch.magic_ = shared::XBUS_MAGIC;
+        std::strncpy(launch.service_name_, "com.freebsdx.Shell", sizeof(launch.service_name_) - 1);
+        launch.opcode_ = static_cast<uint32_t>(shared::ShellOpcode::LaunchWithFile);
+        shared::ShellLaunchRequest req{};
+        std::strncpy(req.app_id_, "com.freebsdx.browser", sizeof(req.app_id_) - 1);
+        std::snprintf(req.file_path_, sizeof(req.file_path_), "xweb-handoff:%s", token.c_str());
+        std::memcpy(launch.payload_, &req, sizeof(req));
+        if (!g_launcher || !g_launcher(launch)) {
+            fail(client, msg.transaction_id_, shared::FetchStatus::Unavailable);
+            return;
+        }
+        w.handed_off = true;
+        g_handoffs[token] = {std::move(state), client, msg.transaction_id_, std::chrono::steady_clock::now()};
+        return;
+    }
+
+    case O::TakeHandoff: {
+        expireHandoffsLocked();
+        shared::FetchRequest req{};
+        std::memcpy(&req, msg.payload_, sizeof(req));
+        req.url_[sizeof(req.url_) - 1] = '\0';
+        auto it = g_handoffs.find(req.url_);
+        if (!peer::isOneOf(client->fd(), {"xwebview", "browser"}) || it == g_handoffs.end() || it->second.from.lock() == client) {
+            fail(client, msg.transaction_id_, shared::FetchStatus::Denied);
+            return;
+        }
+        Handoff h = std::move(it->second);
+        g_handoffs.erase(it);
+        UniqueFd state = textFd(h.state);
+        if (!state) {
+            fail(client, msg.transaction_id_, shared::FetchStatus::Unavailable);
+            if (auto from = h.from.lock()) fail(from, h.txn, shared::FetchStatus::Unavailable);
+            return;
+        }
+        shared::FetchReply r{};
+        r.status_ = static_cast<int32_t>(shared::FetchStatus::Ok);
+        r.size_ = h.state.size();
+        replyTo(client, msg.transaction_id_, r, state.get());
+        if (auto from = h.from.lock()) {
+            if (g_placer) g_placer(from.get(), client.get());
+            shared::FetchReply done{};
+            done.status_ = static_cast<int32_t>(shared::FetchStatus::Ok);
+            replyTo(from, h.txn, done);
+        }
         return;
     }
 
@@ -332,6 +458,15 @@ void FetchBroker::ProcessMessage(std::shared_ptr<IpcSocket> client,
             std::cerr << "[Fetch] DENIED: " << (app.empty() ? "unknown app" : app) << " → " << url.substr(0, 200) << "\n";
             fail(client, msg.transaction_id_, shared::FetchStatus::Denied);
             return;
+        }
+        if (web && (req.flags_ & shared::kFetchCookies)) {
+            const std::string site = fetch_policy::webSite(url);
+            WebClient& w = webClientLocked(client);
+            if (w.site.empty()) w.site = site;
+            if (site.empty() || site != w.site) {
+                std::cerr << "[Fetch] no cookies: " << site << " for a process of " << w.site << "\n";
+                req.flags_ &= ~shared::kFetchCookies;
+            }
         }
         auto provider = g_provider.lock();
         if (!provider) { fail(client, msg.transaction_id_, shared::FetchStatus::Unavailable); return; }

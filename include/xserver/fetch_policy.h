@@ -130,6 +130,57 @@ inline bool webUrlAllowed(std::string_view url) {
     return port == 80 || port == 443 || (port >= 1024 && port <= 65535);
 }
 
+// ── Sites ─────────────────────────────────────────────────────────────────────
+// Cookies are a site's: a host's registrable domain ("www.example.co.kr" and
+// "img.example.co.kr" are one). The same rule as our engine's registrableDomain()
+// (sdk/xweb/src/url.cc), which decides which requests ask for cookies: if the two
+// disagreed, a page would lose its own cookies. Keep them the same.
+inline std::string registrableDomain(std::string_view host_in) {
+    std::string host;
+    for (char c : host_in) host += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    while (!host.empty() && host.back() == '.') host.pop_back();
+    if (host.empty() || host.front() == '[' || host.find('.') == std::string::npos ||
+        std::all_of(host.begin(), host.end(), [](char c) { return (c >= '0' && c <= '9') || c == '.'; }))
+        return host;
+    // The labels from the right: the last three are all that's ever kept.
+    std::string_view labels[3];
+    size_t n = 0, end = host.size();
+    while (true) {
+        const size_t dot = host.rfind('.', end - 1);
+        const size_t start = dot == std::string::npos ? 0 : dot + 1;
+        if (n < 3) labels[n] = std::string_view(host).substr(start, end - start);
+        ++n;
+        if (dot == std::string::npos) break;
+        if (dot == 0) { ++n; break; }   // a leading dot: an empty label, as xweb counts it
+        end = dot;
+    }
+    size_t keep = 2;
+    static constexpr const char* kSecondLevel[] = {"co", "com", "net", "org", "gov", "ac", "or", "go", "ne", "edu", "gob", "mil", "ltd", "plc", "sch", "nhs"};
+    if (n >= 3 && labels[0].size() == 2 &&
+        std::any_of(std::begin(kSecondLevel), std::end(kSecondLevel), [&](const char* l) { return labels[1] == l; }))
+        keep = 3;
+    static constexpr const char* kShared[] = {"github.io", "gitlab.io", "pages.dev", "netlify.app", "vercel.app", "herokuapp.com", "blogspot.com", "appspot.com", "web.app", "firebaseapp.com", "azurewebsites.net", "cloudfront.net"};
+    const std::string last_two = std::string(labels[1]) + "." + std::string(labels[0]);
+    if (n >= 3 && std::any_of(std::begin(kShared), std::end(kShared), [&](const char* l) { return last_two == l; })) keep = 3;
+    if (n <= keep) return host;
+    size_t from = host.size();
+    for (size_t k = 0; k < keep; ++k) from = host.rfind('.', from - 1);
+    return host.substr(from + 1);
+}
+
+// The site of an http(s) address webUrlAllowed() let through; empty for anything else.
+inline std::string webSite(std::string_view url) {
+    size_t at = url.find("://");
+    if (at == std::string_view::npos) return {};
+    std::string scheme(url.substr(0, at));
+    for (char& c : scheme) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (scheme != "http" && scheme != "https") return {};
+    std::string_view authority = url.substr(at + 3);
+    authority = authority.substr(0, authority.find_first_of("/?#"));
+    if (authority.find_first_of("@[]") != std::string_view::npos) return {};
+    return registrableDomain(authority.substr(0, authority.find(':')));
+}
+
 // This machine, the local network, and addresses that aren't really anywhere: what a
 // page must never be able to reach, even by redirecting there.
 inline bool isPrivateAddress(const struct sockaddr* sa) {
