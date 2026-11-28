@@ -15,6 +15,11 @@
 #include <algorithm>
 #include <vector>
 #include <curl/curl.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#include <map>
 #include <fcntl.h>
 #include <sys/capsicum.h>
 #include <sys/mman.h>
@@ -150,7 +155,125 @@ curl_socket_t openPublicSocket(void*, curlsocktype, struct curl_sockaddr* addr) 
     return ::socket(addr->family, addr->socktype, addr->protocol);
 }
 
+// ── Missing intermediates ───────────────────────────────────────────────────────
+// A server that sends its certificate without the one that signed it (kakaobank.com):
+// browsers fetch that one from where the certificate says it's published (its Authority
+// Information Access "CA issuers" URL) and verify again. It only helps build the chain:
+// the chain must still end at a root we trust.
+constexpr size_t kMaxIssuerBytes = 64 * 1024;
+constexpr int kMaxIssuerHops = 3;
+
+size_t onIssuerData(char* p, size_t sz, size_t n, void* ud) {
+    auto* out = static_cast<std::string*>(ud);
+    if (out->size() + sz * n > kMaxIssuerBytes) return 0;
+    out->append(p, sz * n);
+    return sz * n;
+}
+
+// The certificate published at `url` (DER, or PEM), fetched once and remembered.
+X509* issuerAt(const std::string& url) {
+    static std::mutex mu;
+    static std::map<std::string, std::string> fetched;   // url -> its bytes ("" if none)
+    std::string bytes;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (const auto it = fetched.find(url); it != fetched.end()) bytes = it->second;
+        else bytes = "\x01";   // not yet
+    }
+    if (bytes == "\x01") {
+        bytes.clear();
+        if (CURL* c = curl_easy_init()) {
+            curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+            curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(c, CURLOPT_MAXREDIRS, 3L);
+            curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+            curl_easy_setopt(c, CURLOPT_OPENSOCKETFUNCTION, openPublicSocket);
+            curl_easy_setopt(c, CURLOPT_TIMEOUT, 5L);
+            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(c, CURLOPT_USERAGENT, kUserAgent);
+            curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, onIssuerData);
+            curl_easy_setopt(c, CURLOPT_WRITEDATA, &bytes);
+            long status = 0;
+            if (curl_easy_perform(c) != CURLE_OK || (curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status), status != 200)) bytes.clear();
+            curl_easy_cleanup(c);
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        fetched[url] = bytes;
+    }
+    if (bytes.empty()) return nullptr;
+    const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
+    if (X509* x = d2i_X509(nullptr, &p, static_cast<long>(bytes.size()))) return x;
+    BIO* bio = BIO_new_mem_buf(bytes.data(), static_cast<int>(bytes.size()));
+    X509* x = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
+    if (bio) BIO_free(bio);
+    return x;
+}
+
+// Where a certificate says the one that signed it is published (http or https only).
+std::string caIssuersUrl(X509* cert) {
+    std::string url;
+    auto* aia = static_cast<AUTHORITY_INFO_ACCESS*>(X509_get_ext_d2i(cert, NID_info_access, nullptr, nullptr));
+    if (!aia) return url;
+    for (int i = 0; i < sk_ACCESS_DESCRIPTION_num(aia) && url.empty(); ++i) {
+        const ACCESS_DESCRIPTION* ad = sk_ACCESS_DESCRIPTION_value(aia, i);
+        if (OBJ_obj2nid(ad->method) != NID_ad_ca_issuers || ad->location->type != GEN_URI) continue;
+        const ASN1_IA5STRING* s = ad->location->d.uniformResourceIdentifier;
+        std::string u(reinterpret_cast<const char*>(s->data), static_cast<size_t>(s->length));
+        if (u.rfind("http://", 0) == 0 || u.rfind("https://", 0) == 0) url = std::move(u);
+    }
+    AUTHORITY_INFO_ACCESS_free(aia);
+    return url;
+}
+
+int verifyFetchingIssuers(X509_STORE_CTX* ctx, void*) {
+    if (X509_verify_cert(ctx) == 1) return 1;
+    const auto missing = [](int e) { return e == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY || e == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT; };
+    if (!missing(X509_STORE_CTX_get_error(ctx))) return 0;
+    X509* leaf = X509_STORE_CTX_get0_cert(ctx);
+    STACK_OF(X509)* extra = sk_X509_new_null();
+    if (!extra) return 0;
+    if (const STACK_OF(X509)* sent = X509_STORE_CTX_get0_untrusted(ctx))
+        for (int i = 0; i < sk_X509_num(sent); ++i) {
+            X509_up_ref(sk_X509_value(sent, i));
+            sk_X509_push(extra, sk_X509_value(sent, i));
+        }
+    // The one whose signer is missing (a reference of our own, as each try's context goes).
+    X509* lacking = X509_STORE_CTX_get_current_cert(ctx);
+    if (!lacking) lacking = leaf;
+    X509_up_ref(lacking);
+    int ok = 0;
+    for (int hop = 0; hop < kMaxIssuerHops && lacking && !ok; ++hop) {
+        const std::string url = caIssuersUrl(lacking);
+        X509_free(lacking);
+        lacking = nullptr;
+        X509* issuer = url.empty() ? nullptr : issuerAt(url);
+        if (!issuer) break;
+        sk_X509_push(extra, issuer);
+        X509_STORE_CTX* again = X509_STORE_CTX_new();
+        if (!again) break;
+        if (X509_STORE_CTX_init(again, X509_STORE_CTX_get0_store(ctx), leaf, extra) == 1) {
+            X509_VERIFY_PARAM_set1(X509_STORE_CTX_get0_param(again), X509_STORE_CTX_get0_param(ctx));   // the host name too
+            ok = X509_verify_cert(again) == 1;
+            const int e = X509_STORE_CTX_get_error(again);
+            if (!ok) X509_STORE_CTX_set_error(ctx, e);
+            if (!ok && missing(e) && (lacking = X509_STORE_CTX_get_current_cert(again))) X509_up_ref(lacking);
+        }
+        X509_STORE_CTX_free(again);
+    }
+    if (lacking) X509_free(lacking);
+    sk_X509_pop_free(extra, X509_free);
+    if (ok) X509_STORE_CTX_set_error(ctx, X509_V_OK);
+    return ok;
+}
+
+CURLcode onSslContext(CURL*, void* ssl_ctx, void*) {
+    SSL_CTX_set_cert_verify_callback(static_cast<SSL_CTX*>(ssl_ctx), verifyFetchingIssuers, nullptr);
+    return CURLE_OK;
+}
+
 void setWebOptions(CURL* c) {
+    curl_easy_setopt(c, CURLOPT_SSL_CTX_FUNCTION, onSslContext);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
     curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
